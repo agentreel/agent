@@ -44,6 +44,10 @@ export async function linkCommand(rawKey: string | undefined, opts: LinkOpts): P
 
 export async function uninstallCommand(): Promise<void> {
   const { uninstallClaudeCodeHooks } = await import("../hooks/install.js");
+  const { stopCommand } = await import("./daemon.js");
+  // Stop first so we don't leave a daemon flushing into a half-uninstalled
+  // setup. stopCommand() is idempotent — silent when nothing is running.
+  stopCommand();
   const { backup } = uninstallClaudeCodeHooks();
   console.log(pc.green("✓") + " Removed AgentReel hooks from ~/.claude/settings.json");
   if (backup) console.log(pc.dim(`  (backup: ${backup})`));

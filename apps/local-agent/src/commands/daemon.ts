@@ -1,6 +1,17 @@
 import pc from "picocolors";
-import { existsSync, readFileSync, writeFileSync, unlinkSync } from "node:fs";
-import { DAEMON_PID_PATH, ensureAgentreelDir } from "../paths.js";
+import { spawn } from "node:child_process";
+import {
+  existsSync,
+  openSync,
+  readFileSync,
+  unlinkSync,
+  writeFileSync,
+} from "node:fs";
+import {
+  DAEMON_LOG_PATH,
+  DAEMON_PID_PATH,
+  ensureAgentreelDir,
+} from "../paths.js";
 import { pendingByteSize } from "../db.js";
 import { flushOnce, nextAttemptAt } from "../upload/flush.js";
 import { MAX_BATCH_BYTES } from "../upload/queue.js";
@@ -10,11 +21,20 @@ import { readConfig } from "../config.js";
 const TICK_INTERVAL_MS = 30_000;
 const EARLY_FLUSH_BYTES = MAX_BATCH_BYTES; // flush early once pending crosses 1 MB
 
-export async function daemonCommand(): Promise<void> {
+export interface DaemonOpts {
+  detach?: boolean;
+}
+
+export async function daemonCommand(opts: DaemonOpts = {}): Promise<void> {
   const cfg = readConfig();
   if (!cfg.apiKey) {
     console.error(pc.red("✗ Not linked. Run ") + pc.cyan("agentreel link <api-key>"));
     process.exit(1);
+  }
+
+  if (opts.detach) {
+    spawnDetached();
+    return;
   }
 
   if (!claimPidFile()) {
@@ -127,6 +147,73 @@ function sleepInterruptible(ms: number, shouldStop: () => boolean): Promise<void
       }
     }, 250);
   });
+}
+
+function spawnDetached(): void {
+  ensureAgentreelDir();
+  // If a live pid is already on disk, refuse — we'd just hit the same
+  // claimPidFile check from inside the child and lose stderr to the log.
+  if (existsSync(DAEMON_PID_PATH)) {
+    const raw = readFileSync(DAEMON_PID_PATH, "utf8").trim();
+    const pid = Number(raw);
+    if (Number.isFinite(pid) && pid > 0 && isAlive(pid)) {
+      console.error(pc.red(`✗ daemon already running (pid ${pid})`));
+      console.error(pc.dim("  use ") + pc.cyan("agentreel stop") + pc.dim(" first"));
+      process.exit(1);
+    }
+  }
+
+  // Open the log in append mode so child stdout/stderr persist across
+  // restarts. argv[0] is the same node binary; pass `daemon` (no
+  // --detach) so the child runs the foreground loop.
+  const out = openSync(DAEMON_LOG_PATH, "a");
+  const err = openSync(DAEMON_LOG_PATH, "a");
+  const child = spawn(process.execPath, [process.argv[1]!, "daemon"], {
+    detached: true,
+    stdio: ["ignore", out, err],
+    env: process.env,
+  });
+  // Don't keep the parent alive waiting on the child; let it become
+  // an orphan adopted by init. Releasing the IPC handle is necessary
+  // even though we passed `ignore` — defensive.
+  child.unref();
+  console.log(pc.green("●") + ` daemon started (pid ${child.pid})`);
+  console.log(pc.dim(`  log: ${DAEMON_LOG_PATH}`));
+  console.log(pc.dim(`  stop: agentreel stop`));
+}
+
+export function stopCommand(): void {
+  if (!existsSync(DAEMON_PID_PATH)) {
+    console.log(pc.dim("· daemon not running"));
+    return;
+  }
+  const raw = readFileSync(DAEMON_PID_PATH, "utf8").trim();
+  const pid = Number(raw);
+  if (!Number.isFinite(pid) || pid <= 0) {
+    try {
+      unlinkSync(DAEMON_PID_PATH);
+    } catch {
+      /* ignore */
+    }
+    console.log(pc.dim("· cleared stale pid file"));
+    return;
+  }
+  if (!isAlive(pid)) {
+    try {
+      unlinkSync(DAEMON_PID_PATH);
+    } catch {
+      /* ignore */
+    }
+    console.log(pc.dim(`· no live daemon for pid ${pid} — cleared stale pid file`));
+    return;
+  }
+  try {
+    process.kill(pid, "SIGTERM");
+    console.log(pc.green("✓") + ` sent SIGTERM to pid ${pid}`);
+  } catch (err) {
+    console.error(pc.red("✗ ") + (err as Error).message);
+    process.exit(1);
+  }
 }
 
 function waitForTickOrPressure(

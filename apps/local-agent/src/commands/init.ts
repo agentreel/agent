@@ -74,6 +74,27 @@ export async function initCommand(): Promise<void> {
     );
   }
   console.log();
-  console.log(pc.bold("Next:") + " open Claude Code and run a prompt.");
-  console.log("      then " + pc.cyan("agentreel status") + " to see captured events.\n");
+  if (!cfg.apiKey) {
+    console.log(pc.bold("Next steps:"));
+    console.log(
+      "  " + pc.dim("1.") + " " + pc.cyan("agentreel link <key>") +
+        pc.dim("   — get a key from https://agentreel.dev/dashboard/settings"),
+    );
+    console.log(
+      "  " + pc.dim("2.") + " " + pc.cyan("agentreel daemon --detach") +
+        pc.dim("  — start the background uploader"),
+    );
+    console.log(
+      "  " + pc.dim("3.") + " open Claude Code and work as normal.",
+    );
+  } else {
+    console.log(pc.bold("Next:"));
+    console.log(
+      "  " + pc.cyan("agentreel daemon --detach") +
+        pc.dim("  — start the background uploader (already linked)"),
+    );
+  }
+  console.log(
+    "\n" + pc.dim("Anything: ") + pc.cyan("agentreel status") + pc.dim(" shows queue, last sync, last error.\n"),
+  );
 }

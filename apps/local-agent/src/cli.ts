@@ -10,7 +10,7 @@ import { statusCommand } from "./commands/status.js";
 import { linkCommand, logoutCommand, uninstallCommand } from "./commands/auth.js";
 import { watchCommand } from "./commands/watch.js";
 import { pushCommand } from "./commands/push.js";
-import { daemonCommand } from "./commands/daemon.js";
+import { daemonCommand, stopCommand } from "./commands/daemon.js";
 import { runHook } from "./hooks/handler.js";
 
 const program = new Command();
@@ -59,8 +59,16 @@ program
 program
   .command("daemon")
   .description("run the background uploader (30s ticks, 1MB early-flush, exponential backoff)")
-  .action(async () => {
-    await daemonCommand();
+  .option("--detach", "fork into the background and return immediately; logs to ~/.agentreel/daemon.log")
+  .action(async (opts: { detach?: boolean }) => {
+    await daemonCommand({ detach: opts.detach });
+  });
+
+program
+  .command("stop")
+  .description("stop the running background uploader")
+  .action(() => {
+    stopCommand();
   });
 
 program
