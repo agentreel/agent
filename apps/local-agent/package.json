@@ -1,6 +1,6 @@
 {
   "name": "@agentreel/agent",
-  "version": "0.1.2",
+  "version": "0.1.3",
   "description": "Loom for AI coding sessions — captures every Claude Code and Cursor session locally and ships it to a scrubbable, shareable replay.",
   "keywords": [
     "claude-code",

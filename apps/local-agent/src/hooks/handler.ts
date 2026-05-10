@@ -4,6 +4,7 @@ import type { AgentEvent, ClaudeCodeHookInput, EventType } from "@agentreel/shar
 import { insertEvent, upsertSession } from "../db.js";
 import { LOG_PATH, ensureAgentreelDir } from "../paths.js";
 import { scrubAny } from "../redact/scrubber.js";
+import { recomputeSessionCost } from "../cost/transcript.js";
 
 const HOOK_EVENT_TO_TYPE: Record<string, EventType> = {
   SessionStart: "session_start",
@@ -89,6 +90,16 @@ export async function runHook(eventArg?: string): Promise<void> {
       payload: safePayload,
     };
     insertEvent(event);
+
+    // After every hook fire, walk the transcript tail and update the
+    // session's running cost / token totals. Incremental via offset
+    // cache, so this stays cheap even on long sessions.
+    try {
+      recomputeSessionCost(sessionId, input.transcript_path);
+    } catch (err) {
+      // Cost is best-effort — never let a parse glitch break capture.
+      logError(err);
+    }
   } catch (err) {
     logError(err);
   }
