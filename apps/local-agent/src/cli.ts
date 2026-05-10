@@ -1,8 +1,11 @@
 import { Command } from "commander";
-import { readFileSync } from "node:fs";
-import { fileURLToPath } from "node:url";
-import { dirname, join } from "node:path";
 import { initCommand } from "./commands/init.js";
+
+// Replaced at build time by tsup's `define`. Fallback covers running via
+// ts-node where the literal isn't substituted.
+declare const __AGENTREEL_VERSION__: string;
+const VERSION =
+  typeof __AGENTREEL_VERSION__ === "string" ? __AGENTREEL_VERSION__ : "dev";
 import { statusCommand } from "./commands/status.js";
 import { linkCommand, logoutCommand, uninstallCommand } from "./commands/auth.js";
 import { watchCommand } from "./commands/watch.js";
@@ -15,7 +18,7 @@ const program = new Command();
 program
   .name("agentreel")
   .description("AgentReel — capture Claude Code and Cursor sessions locally")
-  .version(readPkgVersion());
+  .version(VERSION);
 
 program
   .command("init")
@@ -80,17 +83,6 @@ program
   .action(async (event: string) => {
     await runHook(event);
   });
-
-function readPkgVersion(): string {
-  try {
-    // dist/cli.js → ../package.json after the tsup bundle ships.
-    const here = dirname(fileURLToPath(import.meta.url));
-    const pkg = JSON.parse(readFileSync(join(here, "..", "package.json"), "utf8"));
-    return typeof pkg.version === "string" ? pkg.version : "0.0.0";
-  } catch {
-    return "0.0.0";
-  }
-}
 
 program.parseAsync(process.argv).catch((err) => {
   // Top-level: if we got this far on a hook invocation, something is very wrong.
