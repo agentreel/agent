@@ -1,0 +1,68 @@
+{
+  "name": "@agentreel/agent",
+  "version": "0.1.0",
+  "description": "Loom for AI coding sessions — captures every Claude Code and Cursor session locally and ships it to a scrubbable, shareable replay.",
+  "keywords": [
+    "claude-code",
+    "cursor",
+    "ai",
+    "agent",
+    "observability",
+    "replay",
+    "timeline",
+    "developer-tools",
+    "agentreel"
+  ],
+  "homepage": "https://github.com/agentreel/agent#readme",
+  "bugs": {
+    "url": "https://github.com/agentreel/agent/issues"
+  },
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/agentreel/agent.git",
+    "directory": "apps/local-agent"
+  },
+  "license": "MIT",
+  "author": "AgentReel <hello@agentreel.dev>",
+  "type": "module",
+  "bin": {
+    "agentreel": "dist/cli.js"
+  },
+  "files": [
+    "dist",
+    "README.md",
+    "LICENSE"
+  ],
+  "scripts": {
+    "build": "tsup",
+    "dev": "tsup --watch",
+    "start": "node dist/cli.js",
+    "typecheck": "tsc --noEmit",
+    "prepublishOnly": "pnpm build"
+  },
+  "dependencies": {
+    "better-sqlite3": "^11.5.0",
+    "chokidar": "^4.0.1",
+    "commander": "^12.1.0",
+    "diff": "^7.0.0",
+    "diff-match-patch": "^1.0.5",
+    "ignore": "^6.0.2",
+    "nanoid": "^5.0.7",
+    "picocolors": "^1.1.1"
+  },
+  "devDependencies": {
+    "@agentreel/shared-types": "workspace:*",
+    "@types/better-sqlite3": "^7.6.11",
+    "@types/diff": "^7.0.0",
+    "@types/diff-match-patch": "^1.0.36",
+    "@types/node": "^20.16.5",
+    "tsup": "^8.3.0",
+    "typescript": "^5.6.2"
+  },
+  "engines": {
+    "node": ">=20"
+  },
+  "publishConfig": {
+    "access": "public"
+  }
+}

@@ -1,0 +1,21 @@
+{
+  "name": "agentreel-agent-monorepo",
+  "version": "0.0.0",
+  "private": true,
+  "description": "AgentReel local agent — captures Claude Code and Cursor sessions on your machine.",
+  "scripts": {
+    "build": "pnpm -r build",
+    "agent": "pnpm --filter @agentreel/agent",
+    "typecheck": "pnpm -r typecheck"
+  },
+  "engines": {
+    "node": ">=20"
+  },
+  "packageManager": "pnpm@10.18.3",
+  "pnpm": {
+    "onlyBuiltDependencies": [
+      "better-sqlite3",
+      "esbuild"
+    ]
+  }
+}
