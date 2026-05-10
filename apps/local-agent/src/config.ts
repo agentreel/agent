@@ -7,7 +7,30 @@ export interface AgentConfig {
   workspaceId?: string;
   installedAt?: number;
   hooksInstalled?: boolean;
+  /** When true, hooks + watcher no-op (don't capture). Toggled via
+   *  `agentreel pause` / `agentreel resume`. Kept here so the state
+   *  survives shell exits — pausing for an evening should hold until
+   *  the user resumes, not until reboot. */
+  paused?: boolean;
+  pausedAt?: number;
   schemaVersion: 1;
+}
+
+/**
+ * The user's explicit decision to skip capture for the current shell:
+ *   AGENTREEL_DISABLE=1 claude
+ * Or temporarily via:
+ *   AGENTREEL_DISABLE=1 npx @agentreel/agent push
+ * No state mutation — purely a process-level switch.
+ */
+export function isCaptureDisabledByEnv(): boolean {
+  const v = process.env.AGENTREEL_DISABLE;
+  return v === "1" || v === "true" || v === "yes";
+}
+
+/** True if capture should be skipped for ANY reason (env or persisted pause). */
+export function isCapturePaused(cfg: AgentConfig = readConfig()): boolean {
+  return isCaptureDisabledByEnv() || cfg.paused === true;
 }
 
 const DEFAULT: AgentConfig = {

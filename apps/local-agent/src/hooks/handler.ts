@@ -5,6 +5,7 @@ import { insertEvent, upsertSession } from "../db.js";
 import { LOG_PATH, ensureAgentreelDir } from "../paths.js";
 import { scrubAny } from "../redact/scrubber.js";
 import { recomputeSessionCost } from "../cost/transcript.js";
+import { isCapturePaused } from "../config.js";
 
 const HOOK_EVENT_TO_TYPE: Record<string, EventType> = {
   SessionStart: "session_start",
@@ -42,6 +43,16 @@ function logError(err: unknown): void {
 export async function runHook(eventArg?: string): Promise<void> {
   // Hooks must never block or fail Claude Code. Wrap everything.
   try {
+    // Honor explicit opt-outs before reading the payload — env var for
+    // single-shell suppression, persisted pause for "stop capturing
+    // until I resume." Either way: silently consume stdin (Claude Code
+    // streams hook input via pipe; not draining it could leave handles
+    // dangling) and return cleanly.
+    if (isCapturePaused()) {
+      await readStdin().catch(() => "");
+      return;
+    }
+
     const raw = await readStdin();
     if (!raw.trim()) return;
     const input = JSON.parse(raw) as ClaudeCodeHookInput;

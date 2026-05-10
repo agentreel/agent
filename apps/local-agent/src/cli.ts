@@ -11,6 +11,11 @@ import { linkCommand, logoutCommand, uninstallCommand } from "./commands/auth.js
 import { watchCommand } from "./commands/watch.js";
 import { pushCommand } from "./commands/push.js";
 import { daemonCommand, stopCommand } from "./commands/daemon.js";
+import {
+  forgetCommand,
+  pauseCommand,
+  resumeCommand,
+} from "./commands/privacy.js";
 import { runHook } from "./hooks/handler.js";
 
 const program = new Command();
@@ -69,6 +74,29 @@ program
   .description("stop the running background uploader")
   .action(() => {
     stopCommand();
+  });
+
+program
+  .command("pause")
+  .description("pause local capture — hooks and watcher no-op until `resume`")
+  .action(() => {
+    pauseCommand();
+  });
+
+program
+  .command("resume")
+  .description("resume local capture after `pause`")
+  .action(() => {
+    resumeCommand();
+  });
+
+program
+  .command("forget [session-ids...]")
+  .description("delete captured sessions from the local SQLite buffer")
+  .option("--all", "wipe every session (asks for confirmation)")
+  .option("--force", "skip the confirmation prompt (use with care)")
+  .action(async (ids: string[], opts: { all?: boolean; force?: boolean }) => {
+    await forgetCommand(ids ?? [], opts);
   });
 
 program

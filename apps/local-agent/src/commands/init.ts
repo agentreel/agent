@@ -95,6 +95,18 @@ export async function initCommand(): Promise<void> {
     );
   }
   console.log(
-    "\n" + pc.dim("Anything: ") + pc.cyan("agentreel status") + pc.dim(" shows queue, last sync, last error.\n"),
+    "\n" + pc.dim("Anything: ") + pc.cyan("agentreel status") + pc.dim(" shows queue, last sync, last error."),
+  );
+  console.log(
+    pc.dim("Privacy: ") +
+      pc.cyan("agentreel pause") +
+      pc.dim(" to stop capturing temporarily, ") +
+      pc.cyan("agentreel forget --all") +
+      pc.dim(" to wipe local sessions."),
+  );
+  console.log(
+    pc.dim("         Or set ") +
+      pc.cyan("AGENTREEL_DISABLE=1") +
+      pc.dim(" before launching Claude Code to skip a single session.\n"),
   );
 }

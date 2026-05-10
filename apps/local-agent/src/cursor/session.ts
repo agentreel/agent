@@ -1,5 +1,6 @@
 import { nanoid } from "nanoid";
 import { insertEvent, upsertSession } from "../db.js";
+import { isCapturePaused } from "../config.js";
 import type { AgentEvent } from "@agentreel/shared-types";
 import type { SnapshotEvent } from "./watcher.js";
 
@@ -17,6 +18,12 @@ export class CursorSessionManager {
   private open = new Map<string, OpenSession>();
 
   ingest(snapshot: SnapshotEvent): { sessionId: string; isNew: boolean } {
+    // Honor the global pause/disable flag the same way Claude Code hooks do.
+    // We still return a session id so the watcher's bookkeeping is happy,
+    // but skip the actual DB writes that would surface in upload.
+    if (isCapturePaused()) {
+      return { sessionId: "__paused__", isNew: false };
+    }
     const key = snapshot.workspace ?? GLOBAL_KEY;
     const ts = snapshot.timestamp;
     const cwd = snapshot.workspace ?? "";

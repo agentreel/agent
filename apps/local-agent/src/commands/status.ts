@@ -7,7 +7,7 @@ import {
   DAEMON_PID_PATH,
 } from "../paths.js";
 import { countEvents, getMeta, listRecentSessions, pendingByteSize } from "../db.js";
-import { readConfig } from "../config.js";
+import { isCaptureDisabledByEnv, readConfig } from "../config.js";
 import {
   META_LAST_ERROR_AT,
   META_LAST_ERROR_MSG,
@@ -58,6 +58,17 @@ export async function statusCommand(): Promise<void> {
   );
   console.log("  api base:      " + cfg.apiBaseUrl);
   console.log("  authenticated: " + (cfg.apiKey ? pc.green("yes") : pc.yellow("no")));
+
+  // Capture state — surfaced at the top so the privacy switch is impossible to miss.
+  if (cfg.paused) {
+    const since = cfg.pausedAt ? new Date(cfg.pausedAt).toLocaleString() : "?";
+    console.log("  capture:       " + pc.yellow(`paused (since ${since})`));
+    console.log(pc.dim("                 run `agentreel resume` to capture again"));
+  } else if (isCaptureDisabledByEnv()) {
+    console.log("  capture:       " + pc.yellow("disabled (AGENTREEL_DISABLE in env)"));
+  } else {
+    console.log("  capture:       " + pc.green("active"));
+  }
 
   const d = daemonStatus();
   console.log(
