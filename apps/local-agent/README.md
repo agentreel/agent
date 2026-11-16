@@ -33,6 +33,7 @@ agentreel watch                       # start the Cursor filesystem watcher
 agentreel status                      # what's captured, what's pending upload
 agentreel link <api-key>              # authenticate with agentreel.dev
 agentreel push                        # upload pending events to the cloud
+agentreel push --retry-held           # retry sessions refused for the plan limit (after upgrading)
 agentreel uninstall                   # remove hooks from ~/.claude/settings.json
 agentreel logout                      # clear local credentials
 ```

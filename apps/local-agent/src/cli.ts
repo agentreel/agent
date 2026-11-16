@@ -57,8 +57,9 @@ program
 program
   .command("push")
   .description("upload pending events to agentreel.dev")
-  .action(async () => {
-    await pushCommand();
+  .option("--retry-held", "retry sessions the server refused earlier (e.g. after upgrading your plan)")
+  .action(async (opts: { retryHeld?: boolean }) => {
+    await pushCommand(opts);
   });
 
 program

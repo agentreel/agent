@@ -6,13 +6,14 @@ import {
   CONFIG_PATH,
   DAEMON_PID_PATH,
 } from "../paths.js";
-import { countEvents, getMeta, listRecentSessions, pendingByteSize } from "../db.js";
+import { countEvents, getMeta, listHeldSessions, listRecentSessions, pendingByteSize } from "../db.js";
 import { isCaptureDisabledByEnv, readConfig } from "../config.js";
 import {
   META_LAST_ERROR_AT,
   META_LAST_ERROR_MSG,
   META_LAST_SYNC_AT,
   META_NEXT_ATTEMPT_AT,
+  META_LAST_LIMIT_MSG,
   consecutiveFailures,
 } from "../upload/flush.js";
 
@@ -82,10 +83,21 @@ export async function statusCommand(): Promise<void> {
     return;
   }
 
-  const { total, pending } = countEvents();
+  const { total, pending, held } = countEvents();
   const pendingBytes = pendingByteSize();
   console.log(`  events captured:  ${total}`);
-  console.log(`  pending upload:   ${pending}` + (pending > 0 ? pc.dim(` (${fmtBytes(pendingBytes)})`) : ""));
+  console.log(`  pending upload:   ${pending - held}` + (pending - held > 0 ? pc.dim(` (${fmtBytes(pendingBytes)})`) : ""));
+  if (held > 0) {
+    const sessionsHeld = listHeldSessions();
+    const limitMsg = getMeta(META_LAST_LIMIT_MSG);
+    console.log(
+      `  held (not sent):  ` +
+        pc.yellow(`${held} events in ${sessionsHeld.length} session(s)`) +
+        pc.dim(` · ${sessionsHeld[0]?.held_reason ?? "rejected"}`),
+    );
+    if (limitMsg) console.log(pc.dim(`    ${limitMsg}`));
+    console.log(pc.dim("    retried automatically; run `agentreel push --retry-held` after upgrading"));
+  }
 
   const lastSync = numMeta(META_LAST_SYNC_AT);
   const lastErr = numMeta(META_LAST_ERROR_AT);

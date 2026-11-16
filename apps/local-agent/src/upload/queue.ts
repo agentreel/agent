@@ -25,6 +25,8 @@ export interface PendingBatch {
   sessions: IngestSession[];
   events: IngestEvent[];
   eventIds: string[]; // for the post-write mark
+  /** Parallel to eventIds: which session each event belongs to. */
+  eventSessionIds: string[];
 }
 
 // Cloud cap is 5 MB; we stay well under that to leave room for JSON framing
@@ -35,19 +37,24 @@ export const MAX_BATCH_EVENTS = 500;
 export function takePendingBatch(
   maxEvents = MAX_BATCH_EVENTS,
   maxBytes = MAX_BATCH_BYTES,
+  now = Date.now(),
 ): PendingBatch {
   const db = getDb();
+  // Skip sessions the server parked (plan limit) until their hold expires,
+  // so one refused session can't block everything queued behind it.
   const candidateRows = db
     .prepare(
-      `SELECT id, session_id, tool, type, ts, cwd, payload
-       FROM events
-       WHERE uploaded_at IS NULL
-       ORDER BY ts ASC
+      `SELECT e.id, e.session_id, e.tool, e.type, e.ts, e.cwd, e.payload
+       FROM events e
+       LEFT JOIN sessions s ON s.id = e.session_id
+       WHERE e.uploaded_at IS NULL
+         AND (s.held_until IS NULL OR s.held_until <= ?)
+       ORDER BY e.ts ASC
        LIMIT ?`,
     )
-    .all(maxEvents) as DBEventRow[];
+    .all(now, maxEvents) as DBEventRow[];
 
-  if (candidateRows.length === 0) return { sessions: [], events: [], eventIds: [] };
+  if (candidateRows.length === 0) return { sessions: [], events: [], eventIds: [], eventSessionIds: [] };
 
   // Trim to byte budget. Always include at least one event so a single
   // oversized payload doesn't get stuck in the queue forever — the server
@@ -90,7 +97,12 @@ export function takePendingBatch(
     payload: safeParse(e.payload),
   }));
 
-  return { sessions, events, eventIds: eventRows.map((r) => r.id) };
+  return {
+    sessions,
+    events,
+    eventIds: eventRows.map((r) => r.id),
+    eventSessionIds: eventRows.map((r) => r.session_id),
+  };
 }
 
 export function markUploaded(eventIds: string[]): void {

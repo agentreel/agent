@@ -55,6 +55,7 @@ exponential backoff (1 s → 5 min, with jitter) on transient failures.
 | `agentreel watch` | Watch Cursor's history dir |
 | `agentreel daemon` | Run the background uploader |
 | `agentreel push` | Drain the queue once and exit |
+| `agentreel push --retry-held` | Retry sessions the server refused for the plan limit (kept locally until then) |
 | `agentreel status` | Show capture state, queue depth, last sync, last error |
 | `agentreel logout` | Clear local credentials |
 | `agentreel uninstall` | Remove Claude Code hooks |
