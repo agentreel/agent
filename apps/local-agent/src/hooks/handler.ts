@@ -6,6 +6,7 @@ import { LOG_PATH, ensureAgentreelDir } from "../paths.js";
 import { scrubAny } from "../redact/scrubber.js";
 import { recomputeSessionCost } from "../cost/transcript.js";
 import { isCapturePaused } from "../config.js";
+import { applyIgnoreRules } from "./ignore-payload.js";
 
 const HOOK_EVENT_TO_TYPE: Record<string, EventType> = {
   SessionStart: "session_start",
@@ -90,7 +91,8 @@ export async function runHook(eventArg?: string): Promise<void> {
     // Scrub the entire payload before persistence — never let raw secrets
     // touch SQLite, even briefly. scrubAny handles strings recursively and
     // also redacts values whose KEY name looks sensitive.
-    const safePayload = scrubAny(input);
+    // .agentreelignore first (drops contents of ignored files), then scrub.
+    const safePayload = scrubAny(applyIgnoreRules(input as never) as typeof input);
     const event: AgentEvent = {
       id: nanoid(),
       sessionId,
