@@ -6,6 +6,7 @@ import { startCursorWatcher } from "../cursor/watcher.js";
 import { CursorSessionManager } from "../cursor/session.js";
 import { ensureAgentreelDir } from "../paths.js";
 import { getDb } from "../db.js";
+import { nativeCursorHooksInstalled } from "../cursor/hook-runner.js";
 
 export async function watchCommand(): Promise<void> {
   ensureAgentreelDir();
@@ -27,8 +28,14 @@ export async function watchCommand(): Promise<void> {
   console.log(pc.dim("  press Ctrl+C to stop\n"));
 
   const sessions = new CursorSessionManager();
+  // With the Cursor hooks installed, agent edits already arrive with their
+  // session, commands and tool calls. The watcher then only records manual
+  // edits, so nothing is captured twice.
+  const hooks = nativeCursorHooksInstalled();
+  if (hooks) console.log(pc.dim("  Cursor hooks installed: recording manual edits only\n"));
 
   const watcher = startCursorWatcher(dir, async (snap) => {
+    if (hooks && snap.source === "cursor-ai") return;
     const { sessionId, isNew } = sessions.ingest(snap);
     const ts = new Date(snap.timestamp).toLocaleTimeString();
     const ws = snap.workspace ? basename(snap.workspace) : pc.dim("no-workspace");

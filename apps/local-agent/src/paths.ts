@@ -14,6 +14,9 @@ export const DAEMON_LOG_PATH = join(AGENTREEL_DIR, "daemon.log");
 export const CLAUDE_DIR = join(HOME, ".claude");
 export const CLAUDE_SETTINGS_PATH = join(CLAUDE_DIR, "settings.json");
 
+export const CURSOR_DIR = join(HOME, ".cursor");
+export const CURSOR_HOOKS_PATH = join(CURSOR_DIR, "hooks.json");
+
 export function ensureAgentreelDir(): void {
   mkdirSync(AGENTREEL_DIR, { recursive: true });
   mkdirSync(QUEUE_DIR, { recursive: true });

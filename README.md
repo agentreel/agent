@@ -11,8 +11,13 @@ sharing, and MP4 export pipeline are not part of this repo.
 - Hooks into Claude Code's lifecycle events (`PreToolUse`, `PostToolUse`,
   `UserPromptSubmit`, `SessionStart`, `SessionEnd`) and writes them to a local
   SQLite buffer at `~/.agentreel/sessions.db`.
-- Watches Cursor's local history directory and captures before/after edits as
-  compact diff-match-patch deltas.
+- Installs observe-only Cursor hooks (`~/.cursor/hooks.json`) for the agent's
+  shell commands (output, exit code, duration), MCP and tool calls, file reads
+  and edits, and prompts. An optional watcher (`agentreel watch`) adds manual
+  edits from Cursor's local history.
+- Records who and where ran the agent: OS user, hostname (or a salted hash, or
+  nothing: `agentreel config hostname hash|omit`), git user, repo remote with
+  credentials stripped, branch and commit at start and end, agent versions.
 - Scrubs PII (AWS / GitHub / OpenAI / Anthropic / Stripe / Slack / Google / npm
   tokens, JWTs, PEM keys, dotenv `KEY=VAL`, emails, IPv4 addresses) **before**
   any data leaves the machine.
@@ -26,7 +31,8 @@ sharing, and MP4 export pipeline are not part of this repo.
 npx @agentreel/agent init
 ```
 
-That writes the Claude Code hooks into `~/.claude/settings.json` and creates
+That writes the Claude Code hooks into `~/.claude/settings.json`, the Cursor
+hooks into `~/.cursor/hooks.json`, and creates
 the local SQLite buffer. Then link the agent to your account:
 
 ```bash
@@ -50,7 +56,8 @@ exponential backoff (1 s → 5 min, with jitter) on transient failures.
 
 | Command | Description |
 |---|---|
-| `agentreel init` | Install Claude Code hooks + create local DB |
+| `agentreel init` | Install Claude Code + Cursor hooks, create local DB (`--no-claude`, `--no-cursor`) |
+| `agentreel config [key] [value]` | `hostname plain\|hash\|omit`, `attribution on\|off` |
 | `agentreel link <key>` | Authenticate with agentreel.dev |
 | `agentreel watch` | Watch Cursor's history dir |
 | `agentreel daemon` | Run the background uploader |
@@ -58,7 +65,7 @@ exponential backoff (1 s → 5 min, with jitter) on transient failures.
 | `agentreel push --retry-held` | Retry sessions the server refused for the plan limit (kept locally until then) |
 | `agentreel status` | Show capture state, queue depth, last sync, last error |
 | `agentreel logout` | Clear local credentials |
-| `agentreel uninstall` | Remove Claude Code hooks |
+| `agentreel uninstall` | Remove Claude Code and Cursor hooks |
 
 ## Privacy
 

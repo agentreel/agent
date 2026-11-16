@@ -2,12 +2,15 @@ import pc from "picocolors";
 import { existsSync, readFileSync } from "node:fs";
 import {
   CLAUDE_SETTINGS_PATH,
+  CURSOR_HOOKS_PATH,
   DB_PATH,
   CONFIG_PATH,
   DAEMON_PID_PATH,
 } from "../paths.js";
 import { countEvents, getMeta, listHeldSessions, listRecentSessions, pendingByteSize } from "../db.js";
 import { isCaptureDisabledByEnv, readConfig } from "../config.js";
+import { nativeCursorHooksInstalled } from "../cursor/hook-runner.js";
+import { resolveHostnameMode } from "../attribution.js";
 import {
   META_LAST_ERROR_AT,
   META_LAST_ERROR_MSG,
@@ -56,6 +59,14 @@ export async function statusCommand(): Promise<void> {
   console.log(
     "  claude hooks:  " +
       (existsSync(CLAUDE_SETTINGS_PATH) ? CLAUDE_SETTINGS_PATH : pc.red("not installed")),
+  );
+  console.log(
+    "  cursor hooks:  " +
+      (nativeCursorHooksInstalled() ? CURSOR_HOOKS_PATH : pc.yellow("not installed (run `agentreel init`)")),
+  );
+  console.log(
+    "  attribution:   " +
+      (cfg.attribution === false ? pc.yellow("off") : `on, hostname ${resolveHostnameMode(cfg)}`),
   );
   console.log("  api base:      " + cfg.apiBaseUrl);
   console.log("  authenticated: " + (cfg.apiKey ? pc.green("yes") : pc.yellow("no")));

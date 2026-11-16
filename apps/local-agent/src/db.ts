@@ -51,6 +51,8 @@ function migrate(db: DB): void {
   );
   if (!cols.has("held_until")) db.exec(`ALTER TABLE sessions ADD COLUMN held_until INTEGER`);
   if (!cols.has("held_reason")) db.exec(`ALTER TABLE sessions ADD COLUMN held_reason TEXT`);
+  // v0.1.7: who/where ran the agent (JSON, see attribution.ts).
+  if (!cols.has("attribution")) db.exec(`ALTER TABLE sessions ADD COLUMN attribution TEXT`);
 }
 
 /** For tests: close and forget the cached handle. */
@@ -183,4 +185,25 @@ export function listRecentSessions(limit = 10): Array<{
     ended_at: number | null;
     cwd: string | null;
   }>;
+}
+
+export function getSessionAttribution<T = unknown>(id: string): T | null {
+  const db = getDb();
+  const row = db.prepare(`SELECT attribution FROM sessions WHERE id = ?`).get(id) as
+    | { attribution: string | null }
+    | undefined;
+  if (!row?.attribution) return null;
+  try {
+    return JSON.parse(row.attribution) as T;
+  } catch {
+    return null;
+  }
+}
+
+export function setSessionAttribution(id: string, value: unknown): void {
+  const db = getDb();
+  db.prepare(`UPDATE sessions SET attribution = ? WHERE id = ?`).run(
+    value == null ? null : JSON.stringify(value),
+    id,
+  );
 }

@@ -8,6 +8,8 @@ export interface IngestSession {
   cwd?: string | null;
   total_cost_cents?: number | null;
   total_tokens?: number | null;
+  /** Who/where ran the agent (agent >= 0.1.7). Older servers ignore it. */
+  attribution?: unknown;
 }
 
 export interface IngestEvent {

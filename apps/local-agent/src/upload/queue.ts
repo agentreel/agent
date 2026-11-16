@@ -9,6 +9,7 @@ interface DBSessionRow {
   cwd: string | null;
   total_cost_cents: number | null;
   total_tokens: number | null;
+  attribution: string | null;
 }
 
 interface DBEventRow {
@@ -72,7 +73,7 @@ export function takePendingBatch(
   const placeholders = sessionIds.map(() => "?").join(",");
   const sessionRows = db
     .prepare(
-      `SELECT id, tool, started_at, ended_at, cwd, total_cost_cents, total_tokens
+      `SELECT id, tool, started_at, ended_at, cwd, total_cost_cents, total_tokens, attribution
        FROM sessions WHERE id IN (${placeholders})`,
     )
     .all(...sessionIds) as DBSessionRow[];
@@ -85,6 +86,7 @@ export function takePendingBatch(
     cwd: s.cwd,
     total_cost_cents: s.total_cost_cents,
     total_tokens: s.total_tokens,
+    ...(s.attribution ? { attribution: safeParse(s.attribution) } : {}),
   }));
 
   const events: IngestEvent[] = eventRows.map((e) => ({

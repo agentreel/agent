@@ -7,6 +7,10 @@ import { scrubAny } from "../redact/scrubber.js";
 import { recomputeSessionCost } from "../cost/transcript.js";
 import { isCapturePaused } from "../config.js";
 import { applyIgnoreRules } from "./ignore-payload.js";
+import { readStdin } from "../util/stdin.js";
+import { claudeVersionFromTranscript } from "../attribution.js";
+import { ensureSessionAttribution, recordSessionEndGit } from "../session-attribution.js";
+import { isCursorPayload, nativeCursorHooksInstalled, recordCursorHook } from "../cursor/hook-runner.js";
 
 const HOOK_EVENT_TO_TYPE: Record<string, EventType> = {
   SessionStart: "session_start",
@@ -19,15 +23,6 @@ const HOOK_EVENT_TO_TYPE: Record<string, EventType> = {
   SubagentStop: "subagent_stop",
   PreCompact: "pre_compact",
 };
-
-async function readStdin(): Promise<string> {
-  if (process.stdin.isTTY) return "";
-  const chunks: Buffer[] = [];
-  for await (const chunk of process.stdin) {
-    chunks.push(chunk as Buffer);
-  }
-  return Buffer.concat(chunks).toString("utf8");
-}
 
 function logError(err: unknown): void {
   try {
@@ -58,6 +53,15 @@ export async function runHook(eventArg?: string): Promise<void> {
     if (!raw.trim()) return;
     const input = JSON.parse(raw) as ClaudeCodeHookInput;
 
+    // Cursor runs Claude Code hooks from ~/.claude/settings.json too
+    // ("Third-party imports", on by default). Those payloads carry
+    // cursor_version. Record them as Cursor, or skip them when the native
+    // Cursor hooks are installed so nothing is captured twice.
+    if (isCursorPayload(input)) {
+      if (!nativeCursorHooksInstalled()) recordCursorHook(eventArg, input as never);
+      return;
+    }
+
     const hookEventName = input.hook_event_name ?? eventArg ?? "Unknown";
     const type: EventType = HOOK_EVENT_TO_TYPE[hookEventName] ?? "unknown";
     const ts = Date.now();
@@ -86,6 +90,17 @@ export async function runHook(eventArg?: string): Promise<void> {
         startedAt: ts,
         cwd: input.cwd,
       });
+    }
+
+    try {
+      ensureSessionAttribution(sessionId, {
+        cwd: input.cwd,
+        tool: "claude-code",
+        toolVersion: () => claudeVersionFromTranscript(input.transcript_path),
+      });
+      if (type === "stop" || type === "session_end") recordSessionEndGit(sessionId, input.cwd);
+    } catch (err) {
+      logError(err);
     }
 
     // Scrub the entire payload before persistence — never let raw secrets
