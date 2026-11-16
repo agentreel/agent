@@ -66,6 +66,8 @@ export class CursorSessionManager {
         binary: snapshot.binary,
         source: snapshot.source,
         patch: snapshot.patch,
+        ...(snapshot.hunks ? { hunks: snapshot.hunks } : {}),
+        ...(snapshot.hunksTruncated ? { hunks_truncated: true } : {}),
       },
     };
     insertEvent(event);

@@ -3,6 +3,7 @@ import { fileURLToPath } from "node:url";
 import { sep } from "node:path";
 import pc from "picocolors";
 import { installClaudeCodeHooks, quotePath } from "../hooks/install.js";
+import { installCursorHooks } from "../cursor/hooks-install.js";
 import { readConfig, writeConfig } from "../config.js";
 import { getDb } from "../db.js";
 import { ensureAgentreelDir } from "../paths.js";
@@ -36,7 +37,13 @@ function chooseHookPrefix(bin: ResolvedBinary): { prefix: string; mode: "absolut
   return { prefix: quotePath(bin.absolutePath), mode: "absolute" };
 }
 
-export async function initCommand(): Promise<void> {
+export interface InitOptions {
+  /** commander maps --no-claude / --no-cursor to claude:false / cursor:false */
+  claude?: boolean;
+  cursor?: boolean;
+}
+
+export async function initCommand(opts: InitOptions = {}): Promise<void> {
   ensureAgentreelDir();
 
   // Touch the DB so the file exists and migrations run.
@@ -49,20 +56,29 @@ export async function initCommand(): Promise<void> {
 
   const binary = resolveAgentBinary();
   const { prefix, mode } = chooseHookPrefix(binary);
-  const result = installClaudeCodeHooks(prefix);
+  const result = opts.claude === false ? null : installClaudeCodeHooks(prefix);
+  const cursor = opts.cursor === false ? null : installCursorHooks(prefix);
 
   console.log(pc.bold(pc.cyan("\n  AgentReel  ")) + pc.dim("Loom for AI coding sessions\n"));
   console.log(pc.green("✓") + " Created ~/.agentreel/sessions.db");
   console.log(pc.green("✓") + " Wrote ~/.agentreel/config.json");
-  console.log(
-    pc.green("✓") +
-      ` Installed ${result.installedEvents.length} Claude Code hooks → ~/.claude/settings.json`,
-  );
-  if (result.backup) {
-    console.log(pc.dim(`  (backup: ${result.backup})`));
+  if (result) {
+    console.log(
+      pc.green("✓") +
+        ` Installed ${result.installedEvents.length} Claude Code hooks → ~/.claude/settings.json`,
+    );
+    if (result.backup) console.log(pc.dim(`  (backup: ${result.backup})`));
+  }
+  if (cursor) {
+    console.log(
+      pc.green("✓") +
+        ` Installed ${cursor.installedEvents.length} Cursor hooks → ~/.cursor/hooks.json` +
+        pc.dim(" (commands, tool calls, MCP, edits, prompts)"),
+    );
+    if (cursor.backup) console.log(pc.dim(`  (backup: ${cursor.backup})`));
   }
   console.log();
-  console.log(pc.dim("  Hook command: ") + pc.dim(`${prefix} hook <Event>`));
+  console.log(pc.dim("  Hook commands: ") + pc.dim(`${prefix} hook <Event>` + (cursor ? `, ${prefix} cursor-hook <event>` : "")));
   if (mode === "npx") {
     console.log(
       pc.dim("  ") +
@@ -85,7 +101,7 @@ export async function initCommand(): Promise<void> {
         pc.dim("  — start the background uploader"),
     );
     console.log(
-      "  " + pc.dim("3.") + " open Claude Code and work as normal.",
+      "  " + pc.dim("3.") + " open Claude Code or Cursor and work as normal.",
     );
   } else {
     console.log(pc.bold("Next:"));

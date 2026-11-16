@@ -6,7 +6,8 @@
   "scripts": {
     "build": "pnpm -r build",
     "agent": "pnpm --filter @agentreel/agent",
-    "typecheck": "pnpm -r typecheck"
+    "typecheck": "pnpm -r typecheck",
+    "test": "pnpm -r --if-present test"
   },
   "engines": {
     "node": ">=20"

@@ -1,6 +1,6 @@
 {
   "name": "@agentreel/agent",
-  "version": "0.1.5",
+  "version": "0.1.7",
   "description": "Loom for AI coding sessions — captures every Claude Code and Cursor session locally and ships it to a scrubbable, shareable replay.",
   "keywords": [
     "claude-code",
@@ -38,10 +38,11 @@
     "dev": "tsup --watch",
     "start": "node dist/cli.js",
     "typecheck": "tsc --noEmit",
-    "prepublishOnly": "pnpm build"
+    "prepublishOnly": "pnpm build",
+    "test": "vitest run"
   },
   "dependencies": {
-    "better-sqlite3": "^11.5.0",
+    "better-sqlite3": "^12.11.1",
     "chokidar": "^4.0.1",
     "commander": "^12.1.0",
     "diff": "^7.0.0",
@@ -57,7 +58,8 @@
     "@types/diff-match-patch": "^1.0.36",
     "@types/node": "^20.16.5",
     "tsup": "^8.3.0",
-    "typescript": "^5.6.2"
+    "typescript": "^5.6.2",
+    "vitest": "^3.2.7"
   },
   "engines": {
     "node": ">=20"

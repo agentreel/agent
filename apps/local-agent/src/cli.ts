@@ -17,19 +17,23 @@ import {
   resumeCommand,
 } from "./commands/privacy.js";
 import { runHook } from "./hooks/handler.js";
+import { runCursorHook } from "./cursor/hook-runner.js";
+import { configCommand } from "./commands/config.js";
 
 const program = new Command();
 
 program
   .name("agentreel")
-  .description("AgentReel — capture Claude Code and Cursor sessions locally")
+  .description("AgentReel: capture Claude Code and Cursor sessions locally")
   .version(VERSION);
 
 program
   .command("init")
-  .description("install Claude Code hooks and create the local SQLite buffer")
-  .action(async () => {
-    await initCommand();
+  .description("install Claude Code and Cursor hooks and create the local SQLite buffer")
+  .option("--no-claude", "skip the Claude Code hooks")
+  .option("--no-cursor", "skip the Cursor hooks (~/.cursor/hooks.json)")
+  .action(async (opts: { claude?: boolean; cursor?: boolean }) => {
+    await initCommand(opts);
   });
 
 program
@@ -57,8 +61,9 @@ program
 program
   .command("push")
   .description("upload pending events to agentreel.dev")
-  .action(async () => {
-    await pushCommand();
+  .option("--retry-held", "retry sessions the server refused earlier (e.g. after upgrading your plan)")
+  .action(async (opts: { retryHeld?: boolean }) => {
+    await pushCommand(opts);
   });
 
 program
@@ -108,7 +113,7 @@ program
 
 program
   .command("uninstall")
-  .description("remove AgentReel hooks from ~/.claude/settings.json")
+  .description("remove AgentReel hooks from ~/.claude/settings.json and ~/.cursor/hooks.json")
   .action(async () => {
     await uninstallCommand();
   });
@@ -120,11 +125,25 @@ program
     await runHook(event);
   });
 
+program
+  .command("cursor-hook <event>")
+  .description("internal: hook handler invoked by Cursor (reads JSON from stdin)")
+  .action(async (event: string) => {
+    await runCursorHook(event);
+  });
+
+program
+  .command("config [key] [value]")
+  .description("show or change settings: hostname <plain|hash|omit>, attribution <on|off>")
+  .action((key?: string, value?: string) => {
+    configCommand(key, value);
+  });
+
 program.parseAsync(process.argv).catch((err) => {
   // Top-level: if we got this far on a hook invocation, something is very wrong.
   // For all other commands, print and exit non-zero.
   const cmd = process.argv[2];
-  if (cmd === "hook") {
+  if (cmd === "hook" || cmd === "cursor-hook") {
     process.exit(0);
   }
   console.error(err);

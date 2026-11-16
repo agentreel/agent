@@ -20,7 +20,9 @@ agentreel init
 ## What it does
 
 - **Claude Code** — installs hooks for every lifecycle event (`PreToolUse`, `PostToolUse`, `UserPromptSubmit`, `SessionStart`, `SessionEnd`, plus the rest). Each event is normalized and persisted locally.
-- **Cursor** — watches `~/Library/Application Support/Cursor/User/History/` and turns every saved snapshot into a unified diff against the previous version. Distinguishes AI-driven (Composer) edits from manual ones.
+- **Cursor (hooks)**: `agentreel init` adds observe-only hooks to `~/.cursor/hooks.json` (`sessionStart`, `sessionEnd`, `beforeSubmitPrompt`, `postToolUse`, `postToolUseFailure`, `afterShellExecution`, `afterMCPExecution`, `afterFileEdit`, `subagentStop`, `stop`). That records the agent's shell commands with output, exit code and duration, MCP and other tool calls, file reads and edits, and prompts. None of these hooks can approve or block anything.
+- **Cursor (watcher, optional)**: `agentreel watch` follows Cursor's local history and turns saved snapshots into diffs. With the hooks installed it records manual edits only.
+- **Who and where**: each session records the OS user, hostname, git user, repo remote (credentials stripped), branch and commit at start and end, and the agent and agentreel versions. `agentreel config hostname hash` stores a salted hash instead of the machine name, `omit` leaves it out, and `agentreel config attribution off` turns all of it off.
 - **PII scrubbing, default-on** — AWS / GitHub / OpenAI / Anthropic / Stripe / Slack / Google / npm tokens, JWTs, PEM private keys, dotenv `KEY=VAL` lines, emails, IPv4. Scrubs *before* anything is persisted, never after.
 - **`.agentreelignore`** — gitignore-syntax exclusions per workspace.
 - **Local first** — works offline. Sign in only when you want to share.
@@ -28,12 +30,16 @@ agentreel init
 ## Usage
 
 ```sh
-agentreel init                        # install Claude Code hooks + create local DB
-agentreel watch                       # start the Cursor filesystem watcher
+agentreel init                        # install Claude Code + Cursor hooks, create local DB
+agentreel init --no-cursor            # Claude Code only (or --no-claude)
+agentreel watch                       # optional: Cursor history watcher (manual edits)
+agentreel config hostname hash        # plain | hash | omit
+agentreel config attribution off      # stop recording user/host/git
 agentreel status                      # what's captured, what's pending upload
 agentreel link <api-key>              # authenticate with agentreel.dev
 agentreel push                        # upload pending events to the cloud
-agentreel uninstall                   # remove hooks from ~/.claude/settings.json
+agentreel push --retry-held           # retry sessions refused for the plan limit (after upgrading)
+agentreel uninstall                   # remove hooks from ~/.claude/settings.json and ~/.cursor/hooks.json
 agentreel logout                      # clear local credentials
 ```
 
@@ -47,6 +53,7 @@ Get an API key at [agentreel.dev/dashboard/settings](https://agentreel.dev/dashb
 | `~/.agentreel/config.json`| API key (if linked), API base URL                 |
 | `~/.agentreel/agent.log`  | Hook-handler error log                            |
 | `~/.claude/settings.json` | Claude Code hooks (added by `agentreel init`)     |
+| `~/.cursor/hooks.json`    | Cursor hooks (added by `agentreel init`)          |
 | `<workspace>/.agentreelignore` | Per-project exclusions, gitignore syntax     |
 
 ## Privacy

@@ -8,6 +8,8 @@ export interface IngestSession {
   cwd?: string | null;
   total_cost_cents?: number | null;
   total_tokens?: number | null;
+  /** Who/where ran the agent (agent >= 0.1.7). Older servers ignore it. */
+  attribution?: unknown;
 }
 
 export interface IngestEvent {
@@ -26,6 +28,16 @@ export interface IngestResponse {
   events_written?: number;
   error?: string;
   reason?: string;
+  message?: string;
+  /** Sessions the server refused (e.g. over the plan's active-session limit). */
+  rejected_sessions?: Array<{ id: string; reason: string }>;
+  plan_limit?: {
+    plan: string;
+    limit: number;
+    active_sessions: number;
+    retry_after_seconds?: number;
+    message: string;
+  };
 }
 
 export class IngestError extends Error {
@@ -56,6 +68,9 @@ export async function postIngest(
     headers: {
       "content-type": "application/json",
       authorization: `Bearer ${cfg.apiKey}`,
+      // Tells the server we understand per-session rejections, so it can
+      // accept the rest of the batch with a 200 instead of a 402.
+      "x-agentreel-partial": "1",
     },
     body: JSON.stringify(body),
   });

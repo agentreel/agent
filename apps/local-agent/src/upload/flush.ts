@@ -1,6 +1,6 @@
-import { getMeta, setMeta } from "../db.js";
+import { getMeta, holdSessions, setMeta } from "../db.js";
 import { readConfig } from "../config.js";
-import { IngestError, postIngest } from "./client.js";
+import { IngestError, postIngest, type IngestResponse } from "./client.js";
 import { MAX_BATCH_BYTES, MAX_BATCH_EVENTS, markUploaded, takePendingBatch } from "./queue.js";
 
 export const META_LAST_SYNC_AT = "last_sync_at";
@@ -8,6 +8,11 @@ export const META_LAST_ERROR_AT = "last_error_at";
 export const META_LAST_ERROR_MSG = "last_error_msg";
 export const META_CONSECUTIVE_FAILS = "consecutive_failures";
 export const META_NEXT_ATTEMPT_AT = "next_attempt_at";
+export const META_LAST_LIMIT_MSG = "last_limit_msg";
+export const META_LAST_LIMIT_AT = "last_limit_at";
+
+/** How long a session refused for the plan limit waits before we try again. */
+export const DEFAULT_HOLD_MS = 6 * 60 * 60_000;
 
 const BACKOFF_BASE_MS = 1_000;
 const BACKOFF_MAX_MS = 5 * 60_000;
@@ -15,6 +20,10 @@ const BACKOFF_MAX_MS = 5 * 60_000;
 export interface FlushResult {
   uploadedEvents: number;
   uploadedSessions: number;
+  /** Sessions the server refused this round (parked locally, not retried in a loop). */
+  heldSessions: string[];
+  /** Server's explanation when sessions were refused. */
+  limitMessage?: string;
   /** True if there are still events pending after this flush (hit batch cap, more to do). */
   moreAvailable: boolean;
 }
@@ -59,6 +68,29 @@ function recordFailure(err: Error, permanent: boolean) {
   setMeta(META_NEXT_ATTEMPT_AT, String(now + exp + jitter));
 }
 
+/**
+ * Mark accepted events as uploaded and park sessions the server refused.
+ * Refused sessions keep their events locally (nothing is lost) and are
+ * retried after the hold, or immediately with `agentreel push --retry-held`.
+ * Returns the ids of the sessions that were parked.
+ */
+export function applyIngestResponse(
+  batch: { eventIds: string[]; eventSessionIds: string[] },
+  res: IngestResponse,
+  now = Date.now(),
+): string[] {
+  const rejected = new Set((res.rejected_sessions ?? []).map((r) => r.id));
+  const accepted = batch.eventIds.filter((_, i) => !rejected.has(batch.eventSessionIds[i] ?? ""));
+  markUploaded(accepted);
+  if (rejected.size === 0) return [];
+  const retryMs = (res.plan_limit?.retry_after_seconds ?? DEFAULT_HOLD_MS / 1000) * 1000;
+  const reason = res.rejected_sessions?.[0]?.reason ?? "rejected";
+  holdSessions([...rejected], now + retryMs, reason);
+  setMeta(META_LAST_LIMIT_AT, String(now));
+  setMeta(META_LAST_LIMIT_MSG, truncate(res.plan_limit?.message ?? res.message ?? reason, 500));
+  return [...rejected];
+}
+
 function truncate(s: string, n: number) {
   return s.length > n ? s.slice(0, n - 1) + "…" : s;
 }
@@ -77,16 +109,20 @@ export async function flushOnce(): Promise<FlushResult> {
   if (batch.events.length === 0) {
     // Nothing to do isn't an error — but don't stamp last_sync, since
     // we didn't actually round-trip anything.
-    return { uploadedEvents: 0, uploadedSessions: 0, moreAvailable: false };
+    return { uploadedEvents: 0, uploadedSessions: 0, heldSessions: [], moreAvailable: false };
   }
   try {
     const res = await postIngest(cfg, { sessions: batch.sessions, events: batch.events });
-    markUploaded(batch.eventIds);
+    const held = applyIngestResponse(batch, res);
     recordSuccess();
     return {
       uploadedEvents: res.events_written ?? 0,
       uploadedSessions: res.sessions_written ?? 0,
-      moreAvailable: batch.events.length === MAX_BATCH_EVENTS,
+      heldSessions: held,
+      limitMessage: held.length > 0 ? res.plan_limit?.message ?? res.message : undefined,
+      // If we parked sessions, there may be other sessions' events waiting
+      // behind them in the queue; let the caller drain those now.
+      moreAvailable: batch.events.length === MAX_BATCH_EVENTS || held.length > 0,
     };
   } catch (err) {
     const permanent = err instanceof IngestError && err.isPermanent;

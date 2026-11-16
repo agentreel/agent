@@ -10,8 +10,72 @@ export const PATTERNS: RedactionRule[] = [
   // PEM-encoded private keys (multiline, must run early)
   {
     name: "pem-private-key",
-    re: /-----BEGIN [A-Z0-9 ]*PRIVATE KEY-----[\s\S]+?-----END [A-Z0-9 ]*PRIVATE KEY-----/g,
+    re: /-----BEGIN [A-Z0-9 ]*PRIVATE KEY(?: BLOCK)?-----[\s\S]+?-----END [A-Z0-9 ]*PRIVATE KEY(?: BLOCK)?-----/g,
     replacement: "[REDACTED:private-key]",
+  },
+
+  // Credentials inside URLs: postgres://user:pass@host, mongodb+srv://...,
+  // redis://:pass@host, amqp://, https://user:token@github.com/... Keeps
+  // the scheme, user and host so the replay still says where it connected.
+  {
+    name: "url-credentials",
+    re: /\b([a-z][a-z0-9+.\-]{1,30}:\/\/)([^\s:@\/"'`]*):([^\s@\/"'`]+)@/gi,
+    replacement: (m: string) => {
+      const inner = /^([a-z][a-z0-9+.\-]{1,30}:\/\/)([^\s:@\/"'`]*):([^\s@\/"'`]+)@$/i.exec(m);
+      if (!inner) return "[REDACTED:url-credentials]@";
+      const [, scheme, user, pass] = inner;
+      if (pass === "[REDACTED:password]") return m;
+      return `${scheme}${user}:[REDACTED:password]@`;
+    },
+  },
+
+  // Authorization: Bearer <token> / Basic <base64> (headers, curl -H, code)
+  {
+    name: "auth-scheme",
+    re: /\b(Bearer|Basic|Token|Bot)(\s+)(?!\[REDACTED)[A-Za-z0-9._~+\/=\-]{8,}/g,
+    replacement: (m: string) => {
+      const inner = /^(\w+)(\s+)/.exec(m);
+      return `${inner?.[1] ?? "Bearer"}${inner?.[2] ?? " "}[REDACTED:auth-token]`;
+    },
+  },
+  // Other auth headers with a bare value: "X-Api-Key: abc", "Authorization: abc"
+  {
+    name: "auth-header",
+    re: /\b((?:Proxy-)?Authorization|X-Api-Key|Api-Key|X-Auth-Token|X-Access-Token|Private-Token|X-Goog-Api-Key)(["']?\s*[:=]\s*["']?)(?!\[REDACTED|Bearer\b|Basic\b|Token\b|Bot\b)([^\s"',;]{8,})/gi,
+    replacement: (m: string) => {
+      const inner = /^([A-Za-z-]+)(["']?\s*[:=]\s*["']?)/.exec(m);
+      return `${inner?.[1] ?? ""}${inner?.[2] ?? ": "}[REDACTED:auth-header]`;
+    },
+  },
+
+  // AWS secret access key next to its name (env, ~/.aws/credentials, JSON, YAML)
+  {
+    name: "aws-secret-access-key",
+    re: /\b(aws_secret_access_key|AWS_SECRET_ACCESS_KEY|SecretAccessKey|secretAccessKey|aws_secret_key)(["']?\s*[:=]\s*["']?)([A-Za-z0-9\/+=]{40})\b/g,
+    replacement: (m: string) => {
+      const inner = /^(\w+)(["']?\s*[:=]\s*["']?)/.exec(m);
+      return `${inner?.[1] ?? ""}${inner?.[2] ?? "="}[REDACTED:aws-secret]`;
+    },
+  },
+
+  // password=..., "password": "...", --password ... (lowercase / config forms
+  // the uppercase dotenv rule below doesn't see). Requires = or a quoted
+  // value so TypeScript like `password: string` is left alone.
+  {
+    name: "password-assignment",
+    re: /\b(password|passwd|pwd|secret|client_secret)(\s*=\s*["']?|["']?\s*:\s*["'])(?!\[REDACTED)([^\s"'&;,]{3,})/gi,
+    replacement: (m: string) => {
+      const inner = /^(\w+)(\s*=\s*["']?|["']?\s*:\s*["'])/i.exec(m);
+      return `${inner?.[1] ?? ""}${inner?.[2] ?? "="}[REDACTED:password]`;
+    },
+  },
+  {
+    name: "password-flag",
+    re: /(--password|--passwd|--token|--api-key|--secret)(=|\s+)(?!\[REDACTED)([^\s"']{3,})/gi,
+    replacement: (m: string) => {
+      const inner = /^(--[\w-]+)(=|\s+)/.exec(m);
+      return `${inner?.[1] ?? ""}${inner?.[2] ?? "="}[REDACTED:password]`;
+    },
   },
 
   // JWT (header.payload.signature) — eyJ-prefixed base64url segments
@@ -77,11 +141,21 @@ export const PATTERNS: RedactionRule[] = [
     replacement: "[REDACTED:aws-key-id]",
   },
 
-  // Slack tokens
+  // Slack tokens (bot, user, app-level, config) and incoming webhooks
   {
     name: "slack-token",
-    re: /\bxox[baprs]-[A-Za-z0-9-]{10,}\b/g,
+    re: /\bxox[baprse]-[A-Za-z0-9-]{10,}\b/g,
     replacement: "[REDACTED:slack-token]",
+  },
+  {
+    name: "slack-app-token",
+    re: /\bxapp-\d-[A-Za-z0-9-]{10,}\b/g,
+    replacement: "[REDACTED:slack-token]",
+  },
+  {
+    name: "slack-webhook",
+    re: /https:\/\/hooks\.slack\.com\/(?:services|workflows|triggers)\/[A-Za-z0-9_\/-]{20,}/g,
+    replacement: "https://hooks.slack.com/[REDACTED:slack-webhook]",
   },
 
   // Google API keys

@@ -92,6 +92,14 @@ export async function daemonCommand(opts: DaemonOpts = {}): Promise<void> {
               ` ${res.uploadedEvents} events · ${res.uploadedSessions} sessions`,
           );
         }
+        if (res.heldSessions.length > 0) {
+          console.log(
+            pc.dim(`  [${ts()}]`) +
+              pc.yellow(" · ") +
+              `${res.heldSessions.length} new session(s) not uploaded: ${res.limitMessage ?? "plan limit"}` +
+              pc.dim(" (kept locally, retried later)"),
+          );
+        }
         if (!res.moreAvailable) break;
       }
     } catch (err) {

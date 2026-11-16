@@ -9,7 +9,7 @@ import {
   resourceToPath,
   type HistoryEntry,
 } from "./entries.js";
-import { computeDiff } from "./diff.js";
+import { computeDiff, type DiffHunk } from "./diff.js";
 import { isIgnored } from "../redact/ignore.js";
 import { scrubString } from "../redact/scrubber.js";
 
@@ -22,6 +22,8 @@ export interface SnapshotEvent {
   added: number;
   removed: number;
   binary: boolean;
+  hunks?: DiffHunk[];
+  hunksTruncated?: boolean;
 }
 
 export type SnapshotHandler = (e: SnapshotEvent) => void | Promise<void>;
@@ -138,6 +140,8 @@ async function processSnapshot(
   let patch = "";
   let added = 0;
   let removed = 0;
+  let hunks: DiffHunk[] | undefined;
+  let hunksTruncated = false;
   if (!binary) {
     // Scrub BEFORE diffing so secrets never enter the patch text. We diff
     // the redacted versions instead — the dashboard will still show the
@@ -148,6 +152,8 @@ async function processSnapshot(
     patch = result.patch;
     added = result.added;
     removed = result.removed;
+    hunks = result.hunks;
+    hunksTruncated = result.hunksTruncated;
   }
 
   const source = classifySource(ctx.current.source);
@@ -160,6 +166,8 @@ async function processSnapshot(
     added,
     removed,
     binary,
+    hunks,
+    hunksTruncated,
   });
 }
 

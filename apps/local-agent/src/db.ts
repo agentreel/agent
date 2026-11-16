@@ -44,6 +44,21 @@ function migrate(db: DB): void {
       value TEXT
     );
   `);
+  // v0.1.6: sessions the server refused (plan limit) are parked until
+  // held_until so they don't block the queue or cause a retry loop.
+  const cols = new Set(
+    (db.prepare(`PRAGMA table_info(sessions)`).all() as Array<{ name: string }>).map((c) => c.name),
+  );
+  if (!cols.has("held_until")) db.exec(`ALTER TABLE sessions ADD COLUMN held_until INTEGER`);
+  if (!cols.has("held_reason")) db.exec(`ALTER TABLE sessions ADD COLUMN held_reason TEXT`);
+  // v0.1.7: who/where ran the agent (JSON, see attribution.ts).
+  if (!cols.has("attribution")) db.exec(`ALTER TABLE sessions ADD COLUMN attribution TEXT`);
+}
+
+/** For tests: close and forget the cached handle. */
+export function closeDb(): void {
+  _db?.close();
+  _db = null;
 }
 
 export function getMeta(key: string): string | null {
@@ -66,14 +81,16 @@ export function setMeta(key: string, value: string | null): void {
   ).run(key, value);
 }
 
-export function pendingByteSize(): number {
+/** Bytes waiting to upload, excluding sessions parked by the server. */
+export function pendingByteSize(now = Date.now()): number {
   const db = getDb();
   const row = db
     .prepare(
-      `SELECT COALESCE(SUM(LENGTH(payload)), 0) AS bytes
-       FROM events WHERE uploaded_at IS NULL`,
+      `SELECT COALESCE(SUM(LENGTH(e.payload)), 0) AS bytes
+       FROM events e LEFT JOIN sessions s ON s.id = e.session_id
+       WHERE e.uploaded_at IS NULL AND (s.held_until IS NULL OR s.held_until <= ?)`,
     )
-    .get() as { bytes: number };
+    .get(now) as { bytes: number };
   return row.bytes;
 }
 
@@ -106,13 +123,46 @@ export function insertEvent(e: AgentEvent): void {
   ).run(e.id, e.sessionId, e.tool, e.type, e.ts, e.cwd ?? null, JSON.stringify(e.payload ?? {}));
 }
 
-export function countEvents(): { total: number; pending: number } {
+export function countEvents(now = Date.now()): { total: number; pending: number; held: number } {
   const db = getDb();
   const total = db.prepare(`SELECT COUNT(*) AS c FROM events`).get() as { c: number };
   const pending = db
     .prepare(`SELECT COUNT(*) AS c FROM events WHERE uploaded_at IS NULL`)
     .get() as { c: number };
-  return { total: total.c, pending: pending.c };
+  const held = db
+    .prepare(
+      `SELECT COUNT(*) AS c FROM events e JOIN sessions s ON s.id = e.session_id
+       WHERE e.uploaded_at IS NULL AND s.held_until IS NOT NULL AND s.held_until > ?`,
+    )
+    .get(now) as { c: number };
+  return { total: total.c, pending: pending.c, held: held.c };
+}
+
+/** Park sessions the server rejected; their events are skipped until `until`. */
+export function holdSessions(ids: string[], until: number, reason: string): void {
+  if (ids.length === 0) return;
+  const db = getDb();
+  const stmt = db.prepare(`UPDATE sessions SET held_until = ?, held_reason = ? WHERE id = ?`);
+  db.transaction((xs: string[]) => {
+    for (const id of xs) stmt.run(until, reason, id);
+  })(ids);
+}
+
+/** Make every held session eligible for upload again (e.g. after upgrading). */
+export function releaseHeldSessions(): number {
+  const db = getDb();
+  return db.prepare(`UPDATE sessions SET held_until = NULL, held_reason = NULL WHERE held_until IS NOT NULL`).run()
+    .changes;
+}
+
+export function listHeldSessions(now = Date.now()): Array<{ id: string; held_until: number; held_reason: string | null }> {
+  const db = getDb();
+  return db
+    .prepare(
+      `SELECT id, held_until, held_reason FROM sessions
+       WHERE held_until IS NOT NULL AND held_until > ? ORDER BY started_at`,
+    )
+    .all(now) as Array<{ id: string; held_until: number; held_reason: string | null }>;
 }
 
 export function listRecentSessions(limit = 10): Array<{
@@ -135,4 +185,25 @@ export function listRecentSessions(limit = 10): Array<{
     ended_at: number | null;
     cwd: string | null;
   }>;
+}
+
+export function getSessionAttribution<T = unknown>(id: string): T | null {
+  const db = getDb();
+  const row = db.prepare(`SELECT attribution FROM sessions WHERE id = ?`).get(id) as
+    | { attribution: string | null }
+    | undefined;
+  if (!row?.attribution) return null;
+  try {
+    return JSON.parse(row.attribution) as T;
+  } catch {
+    return null;
+  }
+}
+
+export function setSessionAttribution(id: string, value: unknown): void {
+  const db = getDb();
+  db.prepare(`UPDATE sessions SET attribution = ? WHERE id = ?`).run(
+    value == null ? null : JSON.stringify(value),
+    id,
+  );
 }

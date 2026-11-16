@@ -1,6 +1,8 @@
 import { readFileSync, writeFileSync, existsSync, chmodSync } from "node:fs";
 import { CONFIG_PATH, ensureAgentreelDir } from "./paths.js";
 
+export type HostnameMode = "plain" | "hash" | "omit";
+
 export interface AgentConfig {
   apiKey?: string;
   apiBaseUrl: string;
@@ -13,6 +15,13 @@ export interface AgentConfig {
    *  the user resumes, not until reboot. */
   paused?: boolean;
   pausedAt?: number;
+  /** How the machine name is recorded on sessions: "plain" (default),
+   *  "hash" (salted SHA-256, stable per install) or "omit". */
+  hostnameMode?: HostnameMode;
+  /** Set false to stop recording who/where (user, host, git) entirely. */
+  attribution?: boolean;
+  /** Random per-install salt used when hostnameMode is "hash". */
+  installSalt?: string;
   schemaVersion: 1;
 }
 
