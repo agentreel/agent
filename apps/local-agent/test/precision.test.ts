@@ -5,6 +5,15 @@
  * based on documented incident patterns, not by independent human review. Results are not
  * suitable for public claims about detection accuracy. Use only for regression testing and
  * internal development guidance.
+ * 
+ * TRUE NEGATIVES COMPUTATION:
+ * Each of the 26 test cases is evaluated against all 30 rules = 780 total rule evaluations.
+ * True Negatives (TN) = Total evaluations - True Positives - False Positives - False Negatives
+ * TN = 780 - 16 - 1 - 1 = 762
+ * 
+ * The 12 test fixtures in guard.test.ts for SECRET003 are NOT in this precision corpus
+ * (they test the rule in isolation, not end-to-end precision). This corpus contains only
+ * the 26 representative real-world scenarios for measuring overall precision/recall.
  */
 
 import { describe, it, expect } from "vitest";
