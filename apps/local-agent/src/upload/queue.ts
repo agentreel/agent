@@ -1,5 +1,8 @@
 import { getDb } from "../db.js";
 import type { IngestEvent, IngestSession } from "./client.js";
+import type { AgentEvent } from "@agentreel/shared-types";
+import { scanSession } from "../guard/scanner.js";
+import { readGuardConfig } from "../guard/config.js";
 
 interface DBSessionRow {
   id: string;
@@ -78,16 +81,52 @@ export function takePendingBatch(
     )
     .all(...sessionIds) as DBSessionRow[];
 
-  const sessions: IngestSession[] = sessionRows.map((s) => ({
-    id: s.id,
-    tool: s.tool,
-    started_at: s.started_at,
-    ended_at: s.ended_at,
-    cwd: s.cwd,
-    total_cost_cents: s.total_cost_cents,
-    total_tokens: s.total_tokens,
-    ...(s.attribution ? { attribution: safeParse(s.attribution) } : {}),
-  }));
+  const guardConfig = readGuardConfig();
+  const shouldScan = guardConfig.enabled;
+
+  const sessions: IngestSession[] = sessionRows.map((s) => {
+    const base: IngestSession = {
+      id: s.id,
+      tool: s.tool,
+      started_at: s.started_at,
+      ended_at: s.ended_at,
+      cwd: s.cwd,
+      total_cost_cents: s.total_cost_cents,
+      total_tokens: s.total_tokens,
+      ...(s.attribution ? { attribution: safeParse(s.attribution) } : {}),
+    };
+
+    if (shouldScan) {
+      const sessionEvents = eventRows.filter((e) => e.session_id === s.id);
+      if (sessionEvents.length > 0) {
+        const parsedEvents: AgentEvent[] = sessionEvents.map((e) => ({
+          id: e.id,
+          sessionId: e.session_id,
+          tool: e.tool as "claude-code" | "cursor",
+          type: e.type as AgentEvent["type"],
+          ts: e.ts,
+          cwd: e.cwd || undefined,
+          payload: safeParse(e.payload),
+        }));
+
+        const summary = scanSession(s.id, parsedEvents);
+
+        base.guard_findings = {
+          version: 1,
+          risk_score: summary.riskScore,
+          findings: summary.findings.map((f) => ({
+            rule_id: f.ruleId,
+            severity: f.severity,
+            category: f.category,
+            timestamp: f.timestamp,
+            evidence: f.evidence,
+          })),
+        };
+      }
+    }
+
+    return base;
+  });
 
   const events: IngestEvent[] = eventRows.map((e) => ({
     id: e.id,

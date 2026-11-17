@@ -19,6 +19,7 @@ import {
 import { runHook } from "./hooks/handler.js";
 import { runCursorHook } from "./cursor/hook-runner.js";
 import { configCommand } from "./commands/config.js";
+import { scanCommand } from "./commands/scan.js";
 
 const program = new Command();
 
@@ -137,6 +138,13 @@ program
   .description("show or change settings: hostname <plain|hash|omit>, attribution <on|off>")
   .action((key?: string, value?: string) => {
     configCommand(key, value);
+  });
+
+program
+  .command("scan [session-id]")
+  .description("scan a session for risky agent behavior patterns (local, no network calls)")
+  .action(async (sessionId?: string) => {
+    await scanCommand(sessionId ? [sessionId] : []);
   });
 
 program.parseAsync(process.argv).catch((err) => {
