@@ -14,6 +14,13 @@ export const PATTERNS: RedactionRule[] = [
     replacement: "[REDACTED:private-key]",
   },
 
+  // Secret file paths in commands (SSH keys, AWS credentials, .env files)
+  {
+    name: "secret-file-path",
+    re: /[~\/][^\s]*\.(ssh\/(?:id_[a-z]+|identity|config|known_hosts)|aws\/credentials|env|gnupg\/[^\s]*|pem|ppk|key)\b/gi,
+    replacement: "[REDACTED:secret-file]",
+  },
+
   // Credentials inside URLs: postgres://user:pass@host, mongodb+srv://...,
   // redis://:pass@host, amqp://, https://user:token@github.com/... Keeps
   // the scheme, user and host so the replay still says where it connected.

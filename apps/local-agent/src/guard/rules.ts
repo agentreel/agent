@@ -449,6 +449,51 @@ export const RULES: Rule[] = [
   },
 
   {
+    id: "SECRET003",
+    version: 1,
+    severity: "high",
+    category: "secret-exfiltration",
+    name: "Secret exfiltration via network tools",
+    description:
+      "Detects curl/wget/scp/ssh uploading or sending secret files or secret-like values to remote hosts",
+    rationale:
+      "Common exfiltration pattern: sending SSH keys, .env files, AWS credentials, or secret values via curl -d/--data/-F/-T, wget --post-data, scp, or ssh to remote hosts",
+    enabled: true,
+    matcher: {
+      type: "command",
+      customMatcher: (ctx) => {
+        const cmd = ctx.command || "";
+        
+        // Exclude localhost/local network
+        if (/(localhost|127\.0\.0\.1|::1|\.local\b)/i.test(cmd)) return false;
+        
+        // curl/wget with secret files or values
+        const curlWgetWithSecrets =
+          /\b(curl|wget)\b/i.test(cmd) &&
+            ((/(-d|--data|-F|--form|-T|--upload-file)\b/i.test(cmd) &&
+              (/\@[~\/]*\.ssh\/(id_[a-z]+|identity|config)/i.test(cmd) ||
+               /\@[~\/]?\.env/i.test(cmd) ||
+               /\@[~\/]*\.aws\/credentials/i.test(cmd) ||
+               /\@[~\/]*\.gnupg\//i.test(cmd))) ||
+             (/(-d|--data)\b/i.test(cmd) &&
+              /(password|token|secret)[:=]/i.test(cmd) &&
+              /https?:\/\//i.test(cmd)));
+        
+        // scp/ssh sending secret files to remote
+        const scpSshSecrets =
+          /\b(scp|ssh)\b/i.test(cmd) &&
+            !/(localhost|127\.0\.0\.1)/i.test(cmd) &&
+            (/\.ssh\/(id_[a-z]+|identity)/i.test(cmd) ||
+             /\.env\b/i.test(cmd) ||
+             /\.aws\/credentials/i.test(cmd) ||
+             /\.(pem|ppk|key)\b/i.test(cmd));
+        
+        return curlWgetWithSecrets || scpSshSecrets;
+      },
+    },
+  },
+
+  {
     id: "GIT001",
     version: 1,
     severity: "high",

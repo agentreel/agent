@@ -1,6 +1,7 @@
-64436acc7803dbf1c4cd541040419f394892386b:apps/local-agent/test/attribution.test.ts:github-pat:21
-64436acc7803dbf1c4cd541040419f394892386b:apps/local-agent/test/attribution.test.ts:github-pat:29
-c32140481345a34dfc37d01b3ab41da401aa2c6a:apps/local-agent/test/scrubber.test.ts:private-key:86
-c32140481345a34dfc37d01b3ab41da401aa2c6a:apps/local-agent/test/scrubber.test.ts:private-key:88
+# Test fixture secrets (fake credentials for detection rule testing)
+# Gitleaks 8.30.1 does not flag the fake ghp_abcdefghijklmnopqrstuvwxyz0123456789 tokens
+# in test/attribution.test.ts:21 and :29. If gitleaks rules change, add those fingerprints.
+
 a0e3bc4e9bca75fd4ab5344bef3a177193998f73:apps/local-agent/test/guard.test.ts:generic-api-key:626
 a0e3bc4e9bca75fd4ab5344bef3a177193998f73:apps/local-agent/test/guard.test.ts:generic-api-key:641
+c32140481345a34dfc37d01b3ab41da401aa2c6a:apps/local-agent/test/scrubber.test.ts:private-key:86
