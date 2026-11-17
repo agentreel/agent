@@ -1,0 +1,104 @@
+# Publishes @agentreel/agent to npm with provenance.
+# Auth is npm trusted publishing (OIDC). There is no NODE_AUTH_TOKEN secret.
+# The trusted publisher on npmjs.com must point at agentreel/agent and this file (publish.yml).
+name: publish
+
+on:
+  push:
+    tags:
+      - "v*"
+  workflow_dispatch:
+
+permissions:
+  contents: read
+  id-token: write
+
+concurrency:
+  group: publish
+  cancel-in-progress: false
+
+jobs:
+  publish:
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    steps:
+      - name: Checkout
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          fetch-depth: 0
+          persist-credentials: false
+
+      - name: Setup pnpm
+        uses: pnpm/action-setup@b906affcce14559ad1aafd4ab0e942779e9f58b1 # v4 (uses packageManager from package.json)
+
+      - name: Setup Node
+        uses: actions/setup-node@949feb2413d6458794dcd2491c4babbbce0c15c1 # v7.1.0
+        with:
+          node-version: 22
+          registry-url: https://registry.npmjs.org
+          package-manager-cache: false
+
+      - name: Upgrade npm (trusted publishing needs npm 11.5.1 or newer)
+        run: |
+          npm install -g npm@11
+          npm --version
+
+      - name: Check tag matches package version
+        working-directory: apps/local-agent
+        run: |
+          PKG_VERSION="$(node -p "require('./package.json').version")"
+          echo "package.json version: ${PKG_VERSION}"
+          if [ "${GITHUB_REF_TYPE}" = "tag" ]; then
+            if [ "${GITHUB_REF_NAME}" != "v${PKG_VERSION}" ]; then
+              echo "Tag ${GITHUB_REF_NAME} does not match package version v${PKG_VERSION}" >&2
+              exit 1
+            fi
+          else
+            git fetch --tags --force origin
+            if ! git tag --points-at HEAD | grep -qx "v${PKG_VERSION}"; then
+              echo "Manual runs must be on a commit tagged v${PKG_VERSION}" >&2
+              exit 1
+            fi
+          fi
+          if npm view "@agentreel/agent@${PKG_VERSION}" version >/dev/null 2>&1; then
+            echo "@agentreel/agent@${PKG_VERSION} is already on npm" >&2
+            exit 1
+          fi
+
+      - name: Check commit is on main
+        run: |
+          git fetch origin main
+          if ! git merge-base --is-ancestor HEAD origin/main; then
+            echo "Commit is not on main" >&2
+            exit 1
+          fi
+
+      - name: Install
+        run: pnpm install --frozen-lockfile
+
+      - name: Typecheck
+        run: pnpm typecheck
+
+      - name: Test
+        run: pnpm test
+
+      - name: Build
+        run: pnpm build
+
+      - name: Gitleaks
+        env:
+          GITLEAKS_VERSION: 8.30.1
+          GITLEAKS_SHA256: 551f6fc83ea457d62a0d98237cbad105af8d557003051f41f3e7ca7b3f2470eb
+        run: |
+          curl -sSfL -o /tmp/gitleaks.tar.gz "https://github.com/gitleaks/gitleaks/releases/download/v${GITLEAKS_VERSION}/gitleaks_${GITLEAKS_VERSION}_linux_x64.tar.gz"
+          echo "${GITLEAKS_SHA256}  /tmp/gitleaks.tar.gz" | sha256sum -c -
+          tar -xzf /tmp/gitleaks.tar.gz -C /tmp gitleaks
+          /tmp/gitleaks git --redact --log-opts=--all .
+
+      - name: Pack dry run
+        working-directory: apps/local-agent
+        run: npm pack --dry-run
+
+      - name: Publish with provenance
+        working-directory: apps/local-agent
+        run: npm publish --provenance --access public
