@@ -48,6 +48,24 @@ npx @agentreel/agent link <your-api-key>
 Generate the key from your dashboard at
 [agentreel.dev](https://agentreel.dev/dashboard/settings).
 
+
+## Secret scanning (gitleaks)
+
+There is no CI, so run gitleaks locally before you push. The repo config is `.gitleaks.toml`: the default rules, plus one allowlist for the fake secrets in `apps/local-agent/test/*.test.ts`, limited to the `generic-api-key` and `private-key` rules.
+
+```bash
+# full history, all branches
+gitleaks git --log-opts=--all --redact .
+
+# working tree, including untracked files
+gitleaks dir --redact .
+
+# only the commits you are about to push
+gitleaks git --log-opts="origin/main..HEAD" --redact .
+```
+
+Each command should end with "no leaks found". If one finds a real secret, rotate it first, then remove it. Never widen the allowlist to hide a real secret.
+
 ## Run the background uploader
 
 ```bash

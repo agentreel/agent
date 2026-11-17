@@ -9,7 +9,7 @@ export const RULES: Rule[] = [
     name: "Recursive home directory deletion",
     description: "Detects rm -rf or equivalent targeting home directory or root filesystem",
     rationale:
-      "Irreversible deletion of entire home directory or filesystem. Documented in multiple incidents including Claude Code Mac wipe (Dec 2025) and WSL2 incident (Oct 2025).",
+      "Irreversible deletion of an entire home directory or filesystem.",
     enabled: true,
     matcher: {
       type: "command",
@@ -40,7 +40,7 @@ export const RULES: Rule[] = [
     name: "Recursive directory deletion",
     description: "Detects recursive deletion of directories",
     rationale:
-      "Can cause permanent data loss. Seen in Claude Code 50GB image deletion (Apr 2026) and 2,229 file deletion incidents.",
+      "Can cause permanent data loss.",
     enabled: true,
     matcher: {
       type: "command",
@@ -103,7 +103,7 @@ export const RULES: Rule[] = [
     name: "DROP TABLE or DATABASE",
     description: "Detects SQL DROP TABLE or DROP DATABASE commands",
     rationale:
-      "Permanent data loss. Replit agent deleted 1,206 executive records (Jul 2025). Claude Code wiped Supabase database (Jul 2026).",
+      "Permanent data loss. Dropped tables or databases usually cannot be recovered without a backup.",
     enabled: true,
     matcher: {
       type: "db-operation",
@@ -124,7 +124,7 @@ export const RULES: Rule[] = [
     name: "DELETE without WHERE",
     description: "Detects DELETE statements without WHERE clause",
     rationale:
-      "Deletes all rows from a table. Common pattern in production database incidents.",
+      "Deletes all rows from a table.",
     enabled: true,
     matcher: {
       type: "db-operation",
@@ -192,7 +192,7 @@ export const RULES: Rule[] = [
     name: "Terraform destroy",
     description: "Detects terraform destroy commands",
     rationale:
-      "Destroys cloud infrastructure. Can take down production services like Kiro AWS incident (Dec 2025).",
+      "Destroys cloud infrastructure and can take down production services.",
     enabled: true,
     matcher: {
       type: "command",
@@ -209,7 +209,7 @@ export const RULES: Rule[] = [
     description:
       "Detects AWS CLI commands that delete resources (ec2 terminate, s3 rb, rds delete, etc.)",
     rationale:
-      "Permanent cloud resource deletion. Kiro incident took down Cost Explorer for 13 hours.",
+      "Permanent cloud resource deletion.",
     enabled: true,
     matcher: {
       type: "command",
@@ -290,7 +290,7 @@ export const RULES: Rule[] = [
     description:
       "Detects database connections to production hosts (non-localhost, containing 'prod')",
     rationale:
-      "Agent should not operate directly on production databases. Replit incident occurred when dev and prod databases were not separated.",
+      "Agent should not operate directly on production databases. Replit has described a case where, before it separated development and production databases, changes made during development could impact a user's production application (https://replit.com/blog/doubling-down-on-our-commitment-to-secure-vibe-coding).",
     enabled: true,
     matcher: {
       type: "url-pattern",
@@ -387,7 +387,7 @@ export const RULES: Rule[] = [
     description:
       "Detects reading of credential files followed by network operations within a short window",
     rationale:
-      "Nx s1ngularity attack (Aug 2025) exfiltrated secrets by reading credential files then uploading to GitHub.",
+      "Reading credential files and then making a network request is a common exfiltration pattern. Nx's postmortem describes malicious packages that scanned systems for sensitive data and uploaded the results to a public GitHub repo (https://nx.dev/blog/s1ngularity-postmortem).",
     enabled: true,
     matcher: {
       type: "sequence",
@@ -431,7 +431,7 @@ export const RULES: Rule[] = [
     description:
       "Detects copying or staging of credential files to /tmp or other staging locations",
     rationale:
-      "Nx attack staged secrets in /tmp/inventory.txt before exfiltration",
+      "Copying credential files to a staging location such as /tmp can precede exfiltration.",
     enabled: true,
     matcher: {
       type: "command",
@@ -560,7 +560,7 @@ export const RULES: Rule[] = [
     description:
       "Detects AI CLI tools invoked with permission bypass flags (--dangerously-skip-permissions, --yolo, --trust-all-tools)",
     rationale:
-      "Nx s1ngularity attack weaponized Claude/Gemini/Q CLIs with these flags to hunt for secrets. Never legitimate in captured sessions.",
+      "These flags let an AI CLI run tools without asking for permission. Nx's postmortem describes malicious packages that attempted to use local AI tools such as Claude and Gemini (https://nx.dev/blog/s1ngularity-postmortem).",
     enabled: true,
     matcher: {
       type: "command",
@@ -685,7 +685,7 @@ export const RULES: Rule[] = [
     description:
       "Detects fetched content (web, issue, file) containing agent-override instructions",
     rationale:
-      "GitHub MCP attack (May 2025) used malicious issue text to inject instructions. Amazon Q attack (Jul 2025) shipped injection code.",
+      "Fetched content can carry instructions meant to hijack an agent. Invariant Labs demonstrated this with a malicious GitHub issue read through the GitHub MCP server (https://invariantlabs.ai/blog/mcp-github-vulnerability).",
     enabled: true,
     matcher: {
       type: "content-pattern",
@@ -740,7 +740,7 @@ export const RULES: Rule[] = [
     description:
       "Detects three-step sequence: injection content, then sensitive file access, then network upload",
     rationale:
-      "GitHub MCP attack pattern: malicious issue → private file read → public PR. Composite attack signature.",
+      "Composite pattern: injected instructions, then a sensitive read, then an upload. It matches the flow Invariant Labs demonstrated with the GitHub MCP server, where a malicious issue led to private repository data in a public pull request (https://invariantlabs.ai/blog/mcp-github-vulnerability).",
     enabled: true,
     matcher: {
       type: "sequence",
