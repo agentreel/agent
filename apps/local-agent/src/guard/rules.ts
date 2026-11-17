@@ -14,10 +14,11 @@ export const RULES: Rule[] = [
     matcher: {
       type: "command",
       customMatcher: (ctx) => {
-        const cmd = ctx.command?.toLowerCase() || "";
+        const cmd = ctx.command || "";
+        const cmdLower = cmd.toLowerCase();
         const hasRecursiveDelete =
-          /\brm\s+[^|&;]*-[^|&;]*r[^|&;]*f\b/.test(cmd) ||
-          /\brm\s+[^|&;]*-[^|&;]*f[^|&;]*r\b/.test(cmd) ||
+          /\brm\s+[^|&;]*-[^|&;]*r[^|&;]*f\b/.test(cmdLower) ||
+          /\brm\s+[^|&;]*-[^|&;]*f[^|&;]*r\b/.test(cmdLower) ||
           /\brmdir\s+\/s\s+\/q\b/i.test(cmd) ||
           /Remove-Item\s+[^|&;]*-Force[^|&;]*-Recurse/i.test(cmd) ||
           /Remove-Item\s+[^|&;]*-Recurse[^|&;]*-Force/i.test(cmd);
@@ -25,7 +26,7 @@ export const RULES: Rule[] = [
         if (!hasRecursiveDelete) return false;
 
         const dangerousPaths =
-          /(\~\/|\/home\/[^\/\s]+\/?(?:\s|$)|\/Users\/[^\/\s]+\/?(?:\s|$)|\$HOME|\/(?:\s|$)|[A-Z]:\\)/;
+          /(\~\/|\/home\/[^\/\s]+\/?|\/Users\/[^\/\s]+\/?|\$HOME|\/\s|[A-Z]:\\\s|[A-Z]:\\$)/;
         return dangerousPaths.test(cmd);
       },
     },
@@ -45,15 +46,22 @@ export const RULES: Rule[] = [
       type: "command",
       customMatcher: (ctx) => {
         const cmd = ctx.command || "";
-        const hasRecursiveDelete =
-          /\brm\s+[^|&;\n]*-[^|&;\n]*r/.test(cmd) ||
-          /\brmdir\s+\/s/i.test(cmd) ||
-          /Remove-Item\s+[^|&;\n]*-Recurse/i.test(cmd);
+        const hasRmRf =
+          /\brm\s+-[a-z]*rf[a-z]*\b/i.test(cmd) ||
+          /\brm\s+-[a-z]*fr[a-z]*\b/i.test(cmd);
+        
+        const hasRmdirForce = /\brmdir\s+\/s/i.test(cmd);
+        
+        const hasRemoveItemForce =
+          /Remove-Item\s+[^|&;\n]*-Recurse[^|&;\n]*-Force/i.test(cmd) ||
+          /Remove-Item\s+[^|&;\n]*-Force[^|&;\n]*-Recurse/i.test(cmd);
 
-        if (!hasRecursiveDelete) return false;
-        const hasForce =
-          /-f/.test(cmd) || /\/q\b/i.test(cmd) || /-Force\b/i.test(cmd);
-        return hasForce;
+        const isDestructive = hasRmRf || hasRmdirForce || hasRemoveItemForce;
+        if (!isDestructive) return false;
+        
+        const safePaths =
+          /\b(node_modules|\.next|dist|build|target|out|\.cache|coverage|\.nuxt|\.output|vendor)\b/i;
+        return !safePaths.test(cmd);
       },
     },
   },
@@ -288,21 +296,33 @@ export const RULES: Rule[] = [
       type: "url-pattern",
       customMatcher: (ctx) => {
         const cmd = ctx.command || "";
-        const payload = JSON.stringify(ctx.payload || {});
-        const text = cmd + " " + payload;
-        const dbUrlMatch =
-          /(postgres|mysql|mongodb|redis):\/\/[^@\s]+@([^:\s\/]+)/gi.exec(text);
-        if (!dbUrlMatch || !dbUrlMatch[2]) return false;
-        const host = dbUrlMatch[2];
-        const isLocal =
-          host === "localhost" ||
-          host === "127.0.0.1" ||
-          host === "0.0.0.0" ||
-          host.endsWith(".local");
-        if (isLocal) return false;
-        const isProd =
-          /prod/i.test(host) || /production/i.test(text) || /live/i.test(host);
-        return isProd || !isLocal;
+        const payload = ctx.payload || {};
+        const payloadStr = JSON.stringify(payload);
+        const text = cmd + " " + payloadStr;
+        
+        const dbUrlPattern = /(postgres|postgresql|mysql|mongodb|redis):\/\/[^@\s"']+@([^:\s\/"']+)/gi;
+        let match;
+        while ((match = dbUrlPattern.exec(text)) !== null) {
+          const host = match[2];
+          if (!host) continue;
+          
+          const isLocal =
+            host === "localhost" ||
+            host === "127.0.0.1" ||
+            host === "0.0.0.0" ||
+            host.endsWith(".local");
+          
+          if (isLocal) continue;
+          
+          const isProd =
+            /prod/i.test(host) || 
+            /production/i.test(text) || 
+            /live/i.test(host);
+          
+          if (isProd || !isLocal) return true;
+        }
+        
+        return false;
       },
     },
   },
@@ -324,11 +344,12 @@ export const RULES: Rule[] = [
         const hasProdKeyword =
           /prod/i.test(cmd) ||
           /production/i.test(cmd) ||
-          /prd\b/i.test(cmd) ||
-          /live\b/i.test(cmd);
+          /prd\b/i.test(cmd);
         const isCloudCmd =
           /\b(aws|gcloud|az|kubectl|terraform)\b/i.test(cmd);
-        return hasProdKeyword && isCloudCmd;
+        const isDestructive =
+          /(delete|destroy|terminate|remove)/i.test(cmd);
+        return hasProdKeyword && isCloudCmd && !isDestructive;
       },
     },
   },

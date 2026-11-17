@@ -58,15 +58,23 @@ export const PATTERNS: RedactionRule[] = [
     },
   },
 
-  // password=..., "password": "...", --password ... (lowercase / config forms
-  // the uppercase dotenv rule below doesn't see). Requires = or a quoted
-  // value so TypeScript like `password: string` is left alone.
+  // password="...", "password": "..." (quoted values, including JSON)
   {
-    name: "password-assignment",
-    re: /\b(password|passwd|pwd|secret|client_secret)(\s*=\s*["']?|["']?\s*:\s*["'])(?!\[REDACTED)([^\s"'&;,]{3,})/gi,
+    name: "password-quoted",
+    re: /(["']?)(password|passwd|pwd|secret|client_secret)\1(\s*[:=]\s*)(["'])(?!\[REDACTED)([^"']{3,}?)\4/gi,
     replacement: (m: string) => {
-      const inner = /^(\w+)(\s*=\s*["']?|["']?\s*:\s*["'])/i.exec(m);
-      return `${inner?.[1] ?? ""}${inner?.[2] ?? "="}[REDACTED:password]`;
+      const inner = /(["']?)(password|passwd|pwd|secret|client_secret)\1(\s*[:=]\s*)(["'])/i.exec(m);
+      if (!inner) return "[REDACTED:password]";
+      return `${inner[1]}${inner[2]}${inner[1]}${inner[3]}${inner[4]}[REDACTED:password]${inner[4]}`;
+    },
+  },
+  // password=..., password: ... (unquoted values, excludes TypeScript type annotations)
+  {
+    name: "password-unquoted",
+    re: /\b(password|passwd|pwd|secret|client_secret)(\s*[:=]\s*)(?!\[REDACTED|string\b|number\b|boolean\b|any\b|unknown\b|null\b)([^\s"'&;,\n]{3,})/gi,
+    replacement: (m: string) => {
+      const inner = /^(\w+)(\s*[:=]\s*)/i.exec(m);
+      return `${inner?.[1] ?? ""}${inner?.[2] ?? ""}[REDACTED:password]`;
     },
   },
   {
@@ -108,7 +116,7 @@ export const PATTERNS: RedactionRule[] = [
   // OpenAI (sk-proj-..., sk-svcacct-..., legacy sk-...)
   {
     name: "openai-key",
-    re: /\bsk-(?:proj-|svcacct-|admin-)?[A-Za-z0-9_-]{20,}\b/g,
+    re: /\bsk-(?:proj-|svcacct-|admin-)?[A-Za-z0-9_-]{8,}\b/g,
     replacement: "[REDACTED:openai-key]",
   },
 

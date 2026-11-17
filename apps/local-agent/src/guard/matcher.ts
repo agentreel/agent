@@ -1,6 +1,6 @@
 import type { Rule, MatchContext, Finding } from "./types.js";
 import type { GuardConfig } from "./types.js";
-import { scrubString } from "../redact/scrubber.js";
+import { scrubString, scrubAny } from "../redact/scrubber.js";
 
 export function matchRule(rule: Rule, context: MatchContext): Finding | null {
   if (!rule.enabled) return null;
@@ -45,25 +45,24 @@ export function matchRule(rule: Rule, context: MatchContext): Finding | null {
     const scrubbedContext: MatchContext = {
       ...context,
       command: context.command ? scrubString(context.command) : undefined,
-      payload: context.payload ? JSON.parse(scrubString(JSON.stringify(context.payload))) : undefined,
+      payload: context.payload ? scrubAny(context.payload) : undefined,
     };
 
     const evidence = extractEvidence(scrubbedContext);
-    const scrubbedEvidence = scrubString(evidence);
 
     return {
       ruleId: rule.id,
       severity: rule.severity,
       category: rule.category,
       timestamp: Date.now(),
-      evidence: scrubbedEvidence,
+      evidence,
       context: {
         command: scrubbedContext.command,
         file:
           typeof scrubbedContext.payload === "object" &&
           scrubbedContext.payload !== null &&
           "file" in scrubbedContext.payload
-            ? scrubString(String(scrubbedContext.payload.file))
+            ? String(scrubbedContext.payload.file)
             : undefined,
         location: context.cwd,
       },
