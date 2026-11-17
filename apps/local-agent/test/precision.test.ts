@@ -1,3 +1,12 @@
+/**
+ * INTERNAL TEST ARTIFACT: Precision and recall measurement for Guard rules.
+ * 
+ * NOTE: This corpus is too small (26 test cases) and labels were assigned by the test author
+ * based on documented incident patterns, not by independent human review. Results are not
+ * suitable for public claims about detection accuracy. Use only for regression testing and
+ * internal development guidance.
+ */
+
 import { describe, it, expect } from "vitest";
 import { RULES } from "../src/guard/rules.js";
 import { matchRule } from "../src/guard/matcher.js";
