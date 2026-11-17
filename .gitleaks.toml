@@ -1,0 +1,11 @@
+# gitleaks config for agentreel/agent. Extends the default ruleset.
+[extend]
+useDefault = true
+
+# Test files under apps/local-agent/test/ contain fake credentials and key
+# blocks that exercise the scrubber and Guard rules. Scoped to those test
+# files and only to the rules that currently hit them.
+[[allowlists]]
+description = "Fake secrets in local-agent test fixtures"
+targetRules = ["generic-api-key", "private-key"]
+paths = ['''^apps/local-agent/test/[^/]+\.test\.ts$''']

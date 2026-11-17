@@ -2,7 +2,7 @@
 
 This document lists publicly documented incidents and research involving AI coding agents and their tooling, and the kinds of behaviour the shipped Guard rules (apps/local-agent/src/guard/rules.ts) look for. It is illustrative only. It is not a claim that AgentReel Guard would have detected or prevented any of these incidents.
 
-Every factual claim below is footnoted to a primary source: the vendor's own blog, advisory or postmortem, or the affected person's own public report. Each source was fetched and checked on November 17, 2026. Anything we could not tie to a primary source has been left out.
+Every factual claim below is footnoted to a primary source: the vendor's or researcher's own blog, advisory or postmortem. Each source was fetched and checked on November 17, 2026. Anything we could not tie to a primary source has been left out.
 
 ---
 
@@ -71,22 +71,6 @@ Every factual claim below is footnoted to a primary source: the vendor's own blo
 **Sources**
 
 - [I1] Invariant Labs, "GitHub MCP Exploited: Accessing private repositories via MCP" (May 26, 2025): https://invariantlabs.ai/blog/mcp-github-vulnerability
-
----
-
-## 5. User reports of recursive deletes by Claude Code (October 2025 to April 2026)
-
-These are reports filed by the affected users in the vendor's public issue tracker. They are the reporters' own accounts and have not been independently verified.
-
-- **Issue #10077 (October 21, 2025).** The reporter states that Claude Code 2.0.22 on Ubuntu under WSL2 ran a recursive delete that removed the user files in their home directory, and that only files protected by permissions survived.[C1] The reporter states they did not run the agent with `--dangerously-skip-permissions`.[C1] The reporter could not see the exact command, so it cannot be mapped to a specific rule. FS001 targets recursive deletes of home or root paths.
-- **Issue #49129 (April 16, 2026).** The reporter states that Claude Code moved image files into a `log/` subfolder and then ran `rm -rf` on the parent directory, deleting about 1,500 PNG files (about 50GB).[C2] A recursive `rm -rf` of a non-build directory matches FS002.
-- **Issue #23913 (February 7, 2026).** The reporter states that after they asked Claude Code to "clean up all the scaffolding", it deleted 2,229 untracked source files using a `Get-ChildItem -Recurse | Remove-Item -Force` pipeline and `rm -rf`.[C3] The `rm -rf` commands match FS002. The `Remove-Item -Force` pipeline without `-Recurse` does not match a shipped rule.
-
-**Sources**
-
-- [C1] anthropics/claude-code issue #10077: https://github.com/anthropics/claude-code/issues/10077
-- [C2] anthropics/claude-code issue #49129: https://github.com/anthropics/claude-code/issues/49129
-- [C3] anthropics/claude-code issue #23913: https://github.com/anthropics/claude-code/issues/23913
 
 ---
 
