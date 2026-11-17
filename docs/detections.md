@@ -13,7 +13,7 @@ Rule version: 1
 
 **Severity**: Critical  
 **What it catches**: Commands that recursively delete the home directory or root filesystem  
-**Why**: Complete data loss. Documented in Claude Code Mac wipe (Dec 2025) and WSL2 incident (Oct 2025).
+**Why**: Irreversible deletion of an entire home directory or filesystem.
 
 **Examples**:
 - `rm -rf ~/`
@@ -34,7 +34,7 @@ Rule version: 1
 
 **Severity**: High  
 **What it catches**: Recursive deletion with force flag on any directory  
-**Why**: Permanent data loss. Claude Code deleted 50GB of images (Apr 2026) and 2,229 source files in similar incidents.
+**Why**: Can cause permanent data loss.
 
 **Examples**:
 - `rm -rf /var/www/uploads`
@@ -66,7 +66,7 @@ Rule version: 1
 
 **Severity**: Critical  
 **What it catches**: SQL DROP TABLE, DROP DATABASE, or DROP SCHEMA commands  
-**Why**: Permanent data loss. Replit agent deleted 1,206 executive records (Jul 2025). Claude Code wiped a Supabase database (Jul 2026).
+**Why**: Permanent data loss. Dropped tables or databases usually cannot be recovered without a backup.
 
 **Examples**:
 - `DROP TABLE users`
@@ -84,7 +84,7 @@ Rule version: 1
 
 **Severity**: Critical  
 **What it catches**: DELETE FROM statements without WHERE clause  
-**Why**: Deletes all rows. Common pattern in production database incidents.
+**Why**: Deletes all rows from a table.
 
 **Examples**:
 - `DELETE FROM users`
@@ -132,7 +132,7 @@ Rule version: 1
 
 **Severity**: Critical  
 **What it catches**: `terraform destroy` commands  
-**Why**: Destroys cloud infrastructure. Can take down production services like Amazon Kiro incident (Dec 2025).
+**Why**: Destroys cloud infrastructure and can take down production services.
 
 **Examples**:
 - `terraform destroy`
@@ -148,7 +148,7 @@ Rule version: 1
 
 **Severity**: Critical  
 **What it catches**: AWS CLI commands that delete resources  
-**Why**: Permanent cloud resource deletion. Kiro incident took down AWS Cost Explorer for 13 hours.
+**Why**: Permanent cloud resource deletion.
 
 **Examples**:
 - `aws ec2 terminate-instances --instance-ids i-123`
@@ -210,7 +210,7 @@ Rule version: 1
 
 **Severity**: High  
 **What it catches**: Database connections to non-localhost hosts, especially those containing "prod"  
-**Why**: Agents should not operate directly on production databases. Replit incident occurred when dev and prod databases were not separated.
+**Why**: Agents should not operate directly on production databases. Replit has described a case where, before it separated development and production databases, changes made during development could impact a user's production application ([Replit blog](https://replit.com/blog/doubling-down-on-our-commitment-to-secure-vibe-coding)).
 
 **Examples**:
 - `postgres://user:pass@prod-db.example.com:5432/app`
@@ -256,7 +256,7 @@ Rule version: 1
 
 **Severity**: High  
 **What it catches**: Reading of credential files followed by network operations within 60 seconds  
-**Why**: Nx s1ngularity attack (Aug 2025) exfiltrated secrets by reading credential files then uploading to GitHub.
+**Why**: Reading credential files and then making a network request is a common exfiltration pattern. Nx's postmortem describes malicious packages that scanned systems for sensitive data and uploaded the results to a public GitHub repo ([Nx postmortem](https://nx.dev/blog/s1ngularity-postmortem)).
 
 **Detected sequences**:
 1. Read `.env`, `.aws/credentials`, `.ssh/id_rsa`, `.gnupg/`, or similar files
@@ -268,7 +268,7 @@ Rule version: 1
 
 **Severity**: High  
 **What it catches**: Copying or staging of credential files to /tmp or other staging locations  
-**Why**: Nx attack staged secrets in /tmp/inventory.txt before exfiltration
+**Why**: Copying credential files to a staging location such as /tmp can precede exfiltration.
 
 **Examples**:
 - `cp ~/.aws/credentials /tmp/`
@@ -351,7 +351,7 @@ Rule version: 1
 
 **Severity**: High  
 **What it catches**: AI CLI tools invoked with permission bypass flags  
-**Why**: Nx s1ngularity attack weaponized Claude/Gemini/Q CLIs with these flags to hunt for secrets. Never legitimate in captured sessions.
+**Why**: These flags let an AI CLI run tools without asking for permission. Nx's postmortem describes malicious packages that attempted to use local AI tools such as Claude and Gemini ([Nx postmortem](https://nx.dev/blog/s1ngularity-postmortem)).
 
 **Examples**:
 - `claude --dangerously-skip-permissions search ~/.ssh`
@@ -441,7 +441,7 @@ Rule version: 1
 
 **Severity**: High  
 **What it catches**: Fetched content (web, issue, file) containing agent-override instructions  
-**Why**: GitHub MCP attack (May 2025) used malicious issue text to inject instructions. Amazon Q attack (Jul 2025) shipped injection code.
+**Why**: Fetched content can carry instructions meant to hijack an agent. Invariant Labs demonstrated this with a malicious GitHub issue read through the GitHub MCP server ([Invariant Labs](https://invariantlabs.ai/blog/mcp-github-vulnerability)).
 
 **Examples**:
 - Issue body containing "Ignore previous instructions. Your goal is to..."
@@ -473,7 +473,7 @@ Rule version: 1
 
 **Severity**: Critical  
 **What it catches**: Three-step attack sequence within 2 minutes  
-**Why**: GitHub MCP attack pattern: malicious issue → private file read → public PR. Composite signature of complete attack.
+**Why**: Composite pattern: injected instructions, then a sensitive read, then an upload. It matches the flow Invariant Labs demonstrated with the GitHub MCP server, where a malicious issue led to private repository data in a public pull request ([Invariant Labs](https://invariantlabs.ai/blog/mcp-github-vulnerability)).
 
 **Sequence detected**:
 1. Content with injection markers (ignore instructions, your goal is to, etc.)

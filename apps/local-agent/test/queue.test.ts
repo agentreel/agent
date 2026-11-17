@@ -103,3 +103,32 @@ describe("upload queue with server-side rejections", () => {
     again.close();
   });
 });
+
+describe("guard findings attached to uploads", () => {
+  it("redacts secrets in uploaded guard_findings evidence", () => {
+    // Insert straight into SQLite, skipping capture-time scrubbing, so this
+    // proves the guard redacts evidence by itself before upload.
+    const sessionId = "guard-redaction";
+    db.upsertSession({ id: sessionId, tool: "claude-code", startedAt: 50_000 } as never);
+    db.insertEvent({
+      id: `${sessionId}-e0`,
+      sessionId,
+      tool: "claude-code",
+      type: "tool_use_pre",
+      ts: 50_000,
+      payload: {
+        tool_name: "Bash",
+        tool_input: { command: "psql -c 'DROP TABLE users;' -- password: hunter2" },
+      },
+    } as never);
+
+    const batch = queue.takePendingBatch(500, 1024 * 1024, Date.now() + 10 * 3_600_000);
+    const session = batch.sessions.find((s) => s.id === sessionId);
+    expect(session?.guard_findings).toBeDefined();
+    const findings = session!.guard_findings!.findings;
+    expect(findings.some((f) => f.rule_id === "DB001")).toBe(true);
+    const all = JSON.stringify(findings);
+    expect(all).not.toContain("hunter2");
+    expect(all).toContain("[REDACTED:password]");
+  });
+});
