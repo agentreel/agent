@@ -10,6 +10,18 @@ export interface IngestSession {
   total_tokens?: number | null;
   /** Who/where ran the agent (agent >= 0.1.7). Older servers ignore it. */
   attribution?: unknown;
+  /** AgentReel Guard findings (agent >= 0.2.0). Optional, additive field. */
+  guard_findings?: {
+    version: number;
+    risk_score: number;
+    findings: Array<{
+      rule_id: string;
+      severity: string;
+      category: string;
+      timestamp: number;
+      evidence: string;
+    }>;
+  };
 }
 
 export interface IngestEvent {

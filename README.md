@@ -18,6 +18,12 @@ sharing, and MP4 export pipeline are not part of this repo.
 - Records who and where ran the agent: OS user, hostname (or a salted hash, or
   nothing: `agentreel config hostname hash|omit`), git user, repo remote with
   credentials stripped, branch and commit at start and end, agent versions.
+- **AgentReel Guard**: Detects and identifies risky agent behavior patterns
+  (destructive filesystem ops, production database targeting, secret
+  exfiltration, prompt injection, etc.) motivated by real documented incidents.
+  Runs locally, makes zero network calls, and scans sessions on-demand via
+  `agentreel scan`. See [docs/threat-research.md](docs/threat-research.md)
+  and [docs/detections.md](docs/detections.md).
 - Scrubs PII (AWS / GitHub / OpenAI / Anthropic / Stripe / Slack / Google / npm
   tokens, JWTs, PEM keys, dotenv `KEY=VAL`, emails, IPv4 addresses) **before**
   any data leaves the machine.
@@ -59,6 +65,7 @@ exponential backoff (1 s → 5 min, with jitter) on transient failures.
 | `agentreel init` | Install Claude Code + Cursor hooks, create local DB (`--no-claude`, `--no-cursor`) |
 | `agentreel config [key] [value]` | `hostname plain\|hash\|omit`, `attribution on\|off` |
 | `agentreel link <key>` | Authenticate with agentreel.dev |
+| `agentreel scan [session-id]` | Scan a session for risky agent behavior (local, no network calls) |
 | `agentreel watch` | Watch Cursor's history dir |
 | `agentreel daemon` | Run the background uploader |
 | `agentreel push` | Drain the queue once and exit |
