@@ -1,6 +1,8 @@
 # AgentReel Local Agent
 
-The on-device half of [AgentReel](https://agentreel.dev) — Loom for AI coding sessions.
+[![License](https://img.shields.io/badge/License-Apache%202.0-blue.svg)](LICENSE)
+
+The on-device half of [AgentReel](https://agentreel.dev), Loom for AI coding sessions.
 
 This repo contains the open-source **local agent** that runs on a developer's
 machine and captures Claude Code and Cursor sessions. The cloud dashboard,
@@ -21,7 +23,9 @@ sharing, and MP4 export pipeline are not part of this repo.
 - **AgentReel Guard**: Detects and identifies risky agent behavior patterns
   (destructive filesystem ops, production database targeting, secret
   exfiltration, prompt injection, etc.) motivated by real documented incidents.
-  Runs locally, makes zero network calls, and scans sessions on-demand via
+  Enabled by default (`~/.agentreel/guard-config.json`). Runs locally and makes
+  zero network calls. Hooks do not scan during recording; sessions are scanned
+  when they upload (background uploader or `agentreel push`) and on demand via
   `agentreel scan`. See [docs/threat-research.md](docs/threat-research.md)
   and [docs/detections.md](docs/detections.md).
 - Scrubs PII (AWS / GitHub / OpenAI / Anthropic / Stripe / Slack / Google / npm
@@ -32,6 +36,9 @@ sharing, and MP4 export pipeline are not part of this repo.
   with exponential backoff and a persistent queue. Network-loss-safe.
 
 ## Install
+
+Supported clients: **Claude Code** and **Cursor** (use `--no-claude` or
+`--no-cursor` on `init` if you only need one).
 
 ```bash
 npx @agentreel/agent init
@@ -99,7 +106,7 @@ network. The SQLite buffer is local-only and never uploaded as a file. The
 `config.json` containing your API key is written with mode `0600`.
 
 If you find a regex pattern that misses a credential shape, please open an
-issue or PR — `apps/local-agent/src/redact/patterns.ts` is the file.
+issue or PR. `apps/local-agent/src/redact/patterns.ts` is the file.
 
 ## Development
 
@@ -113,4 +120,6 @@ pnpm --filter @agentreel/agent typecheck
 
 ## License
 
-MIT — see [LICENSE](./LICENSE).
+Apache License 2.0. See [LICENSE](./LICENSE) and [NOTICE](./NOTICE).
+
+Versions **0.2.0 and earlier** were released under the [MIT License](https://opensource.org/licenses/MIT).
