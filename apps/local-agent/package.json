@@ -1,6 +1,6 @@
 {
   "name": "@agentreel/agent",
-  "version": "0.2.0",
+  "version": "0.2.1",
   "description": "Loom for AI coding sessions — captures every Claude Code and Cursor session locally and ships it to a scrubbable, shareable replay.",
   "keywords": [
     "claude-code",
@@ -22,7 +22,7 @@
     "url": "git+https://github.com/agentreel/agent.git",
     "directory": "apps/local-agent"
   },
-  "license": "MIT",
+  "license": "Apache-2.0",
   "author": "AgentReel <hello@agentreel.dev>",
   "type": "module",
   "bin": {
@@ -31,7 +31,8 @@
   "files": [
     "dist",
     "README.md",
-    "LICENSE"
+    "LICENSE",
+    "NOTICE"
   ],
   "scripts": {
     "build": "tsup",

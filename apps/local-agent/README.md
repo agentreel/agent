@@ -1,5 +1,7 @@
 # @agentreel/agent
 
+[![License](https://img.shields.io/badge/License-Apache%202.0-blue.svg)](LICENSE)
+
 > **Loom for AI coding sessions.** The local agent for [AgentReel](https://agentreel.dev) — captures every Claude Code and Cursor session on your machine, scrubs PII before anything leaves it, and ships replays you can share, scrub, and export to MP4.
 
 ## Install
@@ -8,7 +10,10 @@
 npx @agentreel/agent init
 ```
 
-`init` writes Claude Code hooks into `~/.claude/settings.json` and creates a local SQLite buffer at `~/.agentreel/sessions.db`. That's the entire setup.
+`init` writes Claude Code hooks into `~/.claude/settings.json`, Cursor observe-only
+hooks into `~/.cursor/hooks.json`, and creates a local SQLite buffer at
+`~/.agentreel/sessions.db`. Use `agentreel init --no-cursor` or `--no-claude` if you
+only need one client.
 
 For faster cold-starts on every hook fire, install globally instead:
 
@@ -74,8 +79,10 @@ sqlite3 ~/.agentreel/sessions.db "SELECT payload FROM events LIMIT 5;" | grep -E
 
 ## License
 
-MIT — see [LICENSE](./LICENSE).
+Apache License 2.0. See [LICENSE](./LICENSE) and [NOTICE](./NOTICE).
+
+Versions **0.2.0 and earlier** were released under the [MIT License](https://opensource.org/licenses/MIT).
 
 ---
 
-Built by [Black Highlights](https://blackhighlights.com). Source: [github.com/agentreel/agentreel](https://github.com/agentreel/agentreel).
+Built by [Black Highlights](https://blackhighlights.com). Source: [github.com/agentreel/agent](https://github.com/agentreel/agent).
