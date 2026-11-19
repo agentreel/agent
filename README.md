@@ -2,7 +2,7 @@
 
 [![License](https://img.shields.io/badge/License-Apache%202.0-blue.svg)](LICENSE)
 
-The on-device half of [AgentReel](https://agentreel.dev) — Loom for AI coding sessions.
+The on-device half of [AgentReel](https://agentreel.dev), Loom for AI coding sessions.
 
 This repo contains the open-source **local agent** that runs on a developer's
 machine and captures Claude Code and Cursor sessions. The cloud dashboard,
@@ -106,7 +106,7 @@ network. The SQLite buffer is local-only and never uploaded as a file. The
 `config.json` containing your API key is written with mode `0600`.
 
 If you find a regex pattern that misses a credential shape, please open an
-issue or PR — `apps/local-agent/src/redact/patterns.ts` is the file.
+issue or PR. `apps/local-agent/src/redact/patterns.ts` is the file.
 
 ## Development
 
