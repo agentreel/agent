@@ -124,7 +124,7 @@ describe("telemetry payload schema", () => {
       "cli_first_run",
       "550e8400-e29b-41d4-a716-446655440000",
       3,
-      "0.2.2",
+      "0.2.3",
       "linux",
     );
 
@@ -136,7 +136,7 @@ describe("telemetry payload schema", () => {
     expect(payload).toEqual({
       event: "cli_first_run",
       anon_id: "550e8400-e29b-41d4-a716-446655440000",
-      version: "0.2.2",
+      version: "0.2.3",
       os: "linux",
       session_count: 3,
     });
@@ -163,7 +163,7 @@ describe("telemetry recorded session count", () => {
     const { runCliTelemetry, countLocalRecordedSessions } = await loadTelemetry();
     expect(countLocalRecordedSessions()).toBe(2);
 
-    await runCliTelemetry("0.2.2", ["node", "agentreel", "status"]);
+    await runCliTelemetry("0.2.3", ["node", "agentreel", "status"]);
     const body = JSON.parse(String(fetchMock.mock.calls.at(-1)?.[1]?.body));
     expect(body.session_count).toBe(2);
 
@@ -221,14 +221,14 @@ describe("telemetry heartbeat cadence", () => {
     const t0 = 1_700_000_000_000;
 
     vi.setSystemTime(t0);
-    await runCliTelemetry("0.2.2", ["node", "agentreel", "status"]);
+    await runCliTelemetry("0.2.3", ["node", "agentreel", "status"]);
     expect(fetchMock).toHaveBeenCalledTimes(1);
     const firstBody = JSON.parse(String(fetchMock.mock.calls[0]![1]?.body));
     expect(firstBody.event).toBe("cli_first_run");
 
     fetchMock.mockClear();
     vi.setSystemTime(t0 + 60_000);
-    await runCliTelemetry("0.2.2", ["node", "agentreel", "status"]);
+    await runCliTelemetry("0.2.3", ["node", "agentreel", "status"]);
     expect(fetchMock).not.toHaveBeenCalled();
 
     const state = {
@@ -242,7 +242,7 @@ describe("telemetry heartbeat cadence", () => {
 
     fetchMock.mockClear();
     vi.setSystemTime(t0 + day);
-    await runCliTelemetry("0.2.2", ["node", "agentreel", "status"]);
+    await runCliTelemetry("0.2.3", ["node", "agentreel", "status"]);
     expect(fetchMock).toHaveBeenCalledTimes(1);
     const hbBody = JSON.parse(String(fetchMock.mock.calls[0]![1]?.body));
     expect(hbBody.event).toBe("cli_heartbeat");
@@ -265,8 +265,8 @@ describe("telemetry notice", () => {
       return true;
     });
 
-    await runCliTelemetry("0.2.2", ["node", "agentreel", "status"]);
-    await runCliTelemetry("0.2.2", ["node", "agentreel", "status"]);
+    await runCliTelemetry("0.2.3", ["node", "agentreel", "status"]);
+    await runCliTelemetry("0.2.3", ["node", "agentreel", "status"]);
 
     stderrSpy.mockRestore();
 
@@ -289,11 +289,11 @@ describe("telemetry network failures", () => {
   it("runCliTelemetry never throws on fetch failure or timeout", async () => {
     const { runCliTelemetry, flushCliTelemetry } = await loadTelemetry();
     fetchMock.mockRejectedValueOnce(new Error("network down"));
-    await expect(runCliTelemetry("0.2.2", ["node", "agentreel", "status"])).resolves.toBeUndefined();
+    await expect(runCliTelemetry("0.2.3", ["node", "agentreel", "status"])).resolves.toBeUndefined();
     await flushCliTelemetry(800);
 
     fetchMock.mockImplementationOnce(() => new Promise(() => {}));
-    void runCliTelemetry("0.2.2", ["node", "agentreel", "status"]);
+    void runCliTelemetry("0.2.3", ["node", "agentreel", "status"]);
     const t0 = performance.now();
     await flushCliTelemetry(800);
     expect(performance.now() - t0).toBeLessThan(1000);
@@ -309,7 +309,7 @@ describe("telemetry first-run delivery", () => {
 
   it("--version as the first command sends cli_first_run and writes marker after 2xx", async () => {
     const { runCliTelemetry, flushCliTelemetry } = await loadTelemetry();
-    await runCliTelemetry("0.2.2", ["node", "agentreel", "--version"]);
+    await runCliTelemetry("0.2.3", ["node", "agentreel", "--version"]);
     await flushCliTelemetry(800);
     expect(fetchMock).toHaveBeenCalledTimes(1);
     const body = JSON.parse(String(fetchMock.mock.calls[0]![1]?.body));
@@ -322,7 +322,7 @@ describe("telemetry first-run delivery", () => {
   it("failed POST (non-2xx) does not set first_run_sent; next run sends cli_first_run again", async () => {
     const { runCliTelemetry, flushCliTelemetry } = await loadTelemetry();
     fetchMock.mockResolvedValueOnce(new Response("{}", { status: 500 }));
-    await runCliTelemetry("0.2.2", ["node", "agentreel", "status"]);
+    await runCliTelemetry("0.2.3", ["node", "agentreel", "status"]);
     await flushCliTelemetry(800);
 
     const path = join(home, ".agentreel", "telemetry.json");
@@ -332,7 +332,7 @@ describe("telemetry first-run delivery", () => {
 
     fetchMock.mockClear();
     fetchMock.mockResolvedValueOnce(new Response("{}", { status: 200 }));
-    await runCliTelemetry("0.2.2", ["node", "agentreel", "status"]);
+    await runCliTelemetry("0.2.3", ["node", "agentreel", "status"]);
     await flushCliTelemetry(800);
     expect(fetchMock).toHaveBeenCalledTimes(1);
     const body = JSON.parse(String(fetchMock.mock.calls[0]![1]?.body));
@@ -342,7 +342,7 @@ describe("telemetry first-run delivery", () => {
   it("network error on POST does not set first_run_sent; next run retries cli_first_run", async () => {
     const { runCliTelemetry, flushCliTelemetry } = await loadTelemetry();
     fetchMock.mockRejectedValueOnce(new Error("network down"));
-    await runCliTelemetry("0.2.2", ["node", "agentreel", "status"]);
+    await runCliTelemetry("0.2.3", ["node", "agentreel", "status"]);
     await flushCliTelemetry(800);
 
     const path = join(home, ".agentreel", "telemetry.json");
@@ -351,7 +351,7 @@ describe("telemetry first-run delivery", () => {
     }
 
     fetchMock.mockClear();
-    await runCliTelemetry("0.2.2", ["node", "agentreel", "status"]);
+    await runCliTelemetry("0.2.3", ["node", "agentreel", "status"]);
     await flushCliTelemetry(800);
     expect(fetchMock).toHaveBeenCalledTimes(1);
     expect(JSON.parse(String(fetchMock.mock.calls[0]![1]?.body)).event).toBe("cli_first_run");
@@ -360,7 +360,7 @@ describe("telemetry first-run delivery", () => {
   it("a hanging POST is capped within about 800ms via flushCliTelemetry", async () => {
     const { runCliTelemetry, flushCliTelemetry } = await loadTelemetry();
     fetchMock.mockImplementation(() => new Promise(() => {}));
-    void runCliTelemetry("0.2.2", ["node", "agentreel", "status"]);
+    void runCliTelemetry("0.2.3", ["node", "agentreel", "status"]);
     const t0 = performance.now();
     await flushCliTelemetry(800);
     expect(performance.now() - t0).toBeLessThan(1000);
@@ -500,7 +500,7 @@ describe("telemetry hook commands", () => {
 
   it("skips internal hook subcommands", async () => {
     const { runCliTelemetry } = await loadTelemetry();
-    await runCliTelemetry("0.2.2", ["node", "agentreel", "hook", "SessionStart"]);
+    await runCliTelemetry("0.2.3", ["node", "agentreel", "hook", "SessionStart"]);
     expect(fetchMock).not.toHaveBeenCalled();
     expect(existsSync(join(home, ".agentreel", "telemetry.json"))).toBe(false);
   });
