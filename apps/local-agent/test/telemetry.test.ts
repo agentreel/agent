@@ -124,7 +124,7 @@ describe("telemetry payload schema", () => {
       "cli_first_run",
       "550e8400-e29b-41d4-a716-446655440000",
       3,
-      "0.2.1",
+      "0.2.2",
       "linux",
     );
 
@@ -136,7 +136,7 @@ describe("telemetry payload schema", () => {
     expect(payload).toEqual({
       event: "cli_first_run",
       anon_id: "550e8400-e29b-41d4-a716-446655440000",
-      version: "0.2.1",
+      version: "0.2.2",
       os: "linux",
       session_count: 3,
     });
@@ -163,7 +163,7 @@ describe("telemetry recorded session count", () => {
     const { runCliTelemetry, countLocalRecordedSessions } = await loadTelemetry();
     expect(countLocalRecordedSessions()).toBe(2);
 
-    runCliTelemetry("0.2.1", ["node", "agentreel", "status"]);
+    runCliTelemetry("0.2.2", ["node", "agentreel", "status"]);
     const body = JSON.parse(String(fetchMock.mock.calls.at(-1)?.[1]?.body));
     expect(body.session_count).toBe(2);
 
@@ -221,14 +221,14 @@ describe("telemetry heartbeat cadence", () => {
     const t0 = 1_700_000_000_000;
 
     vi.setSystemTime(t0);
-    runCliTelemetry("0.2.1", ["node", "agentreel", "status"]);
+    runCliTelemetry("0.2.2", ["node", "agentreel", "status"]);
     expect(fetchMock).toHaveBeenCalledTimes(1);
     const firstBody = JSON.parse(String(fetchMock.mock.calls[0]![1]?.body));
     expect(firstBody.event).toBe("cli_first_run");
 
     fetchMock.mockClear();
     vi.setSystemTime(t0 + 60_000);
-    runCliTelemetry("0.2.1", ["node", "agentreel", "status"]);
+    runCliTelemetry("0.2.2", ["node", "agentreel", "status"]);
     expect(fetchMock).not.toHaveBeenCalled();
 
     const state = {
@@ -242,7 +242,7 @@ describe("telemetry heartbeat cadence", () => {
 
     fetchMock.mockClear();
     vi.setSystemTime(t0 + day);
-    runCliTelemetry("0.2.1", ["node", "agentreel", "status"]);
+    runCliTelemetry("0.2.2", ["node", "agentreel", "status"]);
     expect(fetchMock).toHaveBeenCalledTimes(1);
     const hbBody = JSON.parse(String(fetchMock.mock.calls[0]![1]?.body));
     expect(hbBody.event).toBe("cli_heartbeat");
@@ -265,8 +265,8 @@ describe("telemetry notice", () => {
       return true;
     });
 
-    runCliTelemetry("0.2.1", ["node", "agentreel", "status"]);
-    runCliTelemetry("0.2.1", ["node", "agentreel", "status"]);
+    runCliTelemetry("0.2.2", ["node", "agentreel", "status"]);
+    runCliTelemetry("0.2.2", ["node", "agentreel", "status"]);
 
     stderrSpy.mockRestore();
 
@@ -289,12 +289,12 @@ describe("telemetry network failures", () => {
   it("runCliTelemetry never throws on fetch failure or timeout", async () => {
     const { runCliTelemetry } = await loadTelemetry();
     fetchMock.mockRejectedValueOnce(new Error("network down"));
-    expect(() => runCliTelemetry("0.2.1", ["node", "agentreel", "status"])).not.toThrow();
+    expect(() => runCliTelemetry("0.2.2", ["node", "agentreel", "status"])).not.toThrow();
 
     fetchMock.mockImplementationOnce(() => {
       return new Promise(() => {});
     });
-    expect(() => runCliTelemetry("0.2.1", ["node", "agentreel", "status"])).not.toThrow();
+    expect(() => runCliTelemetry("0.2.2", ["node", "agentreel", "status"])).not.toThrow();
   });
 });
 
@@ -335,7 +335,7 @@ describe("telemetry hook commands", () => {
 
   it("skips internal hook subcommands", async () => {
     const { runCliTelemetry } = await loadTelemetry();
-    runCliTelemetry("0.2.1", ["node", "agentreel", "hook", "SessionStart"]);
+    runCliTelemetry("0.2.2", ["node", "agentreel", "hook", "SessionStart"]);
     expect(fetchMock).not.toHaveBeenCalled();
     expect(existsSync(join(home, ".agentreel", "telemetry.json"))).toBe(false);
   });
