@@ -1,5 +1,6 @@
 import { Command } from "commander";
 import { initCommand } from "./commands/init.js";
+import { runCliTelemetry } from "./telemetry.js";
 
 // Replaced at build time by tsup's `define`. Fallback covers running via
 // ts-node where the literal isn't substituted.
@@ -146,6 +147,8 @@ program
   .action(async (sessionId?: string) => {
     await scanCommand(sessionId ? [sessionId] : []);
   });
+
+runCliTelemetry(VERSION);
 
 program.parseAsync(process.argv).catch((err) => {
   // Top-level: if we got this far on a hook invocation, something is very wrong.

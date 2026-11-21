@@ -1,0 +1,1 @@
+globalThis.fetch = () => Promise.reject(new Error("telemetry mock network failure"));

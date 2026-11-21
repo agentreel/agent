@@ -99,6 +99,29 @@ exponential backoff (1 s → 5 min, with jitter) on transient failures.
 | `agentreel logout` | Clear local credentials |
 | `agentreel uninstall` | Remove Claude Code and Cursor hooks |
 
+## Telemetry
+
+<!-- PLACEHOLDER: replace this section when https://agentreel.dev/docs/cli-telemetry ships -->
+
+The AgentReel CLI sends **anonymous usage metrics** by default: invocation
+count, package version, and OS platform string (`linux`, `darwin`, `win32`,
+etc.). Command names, session content, file paths, hostnames, usernames, and
+environment values are not transmitted.
+
+Events: one `cli_first_run` on the first invocation, then at most one
+`cli_heartbeat` per 24 hours.
+
+**Opt out** (no telemetry file writes and no network calls):
+
+| Variable | Effect |
+|----------|--------|
+| `AGENTREEL_TELEMETRY=0` | Disables CLI telemetry |
+| `DO_NOT_TRACK=1` (any non-empty value) | Disables CLI telemetry |
+| `CI` (set in CI environments) | Disables CLI telemetry |
+
+Telemetry state (anonymous id and last heartbeat time) is stored in
+`~/.agentreel/telemetry.json`.
+
 ## Privacy
 
 PII scrubbing is **default-on** and runs on every event before it touches the
