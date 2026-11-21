@@ -44,7 +44,11 @@ export interface TelemetryState {
 export function countLocalRecordedSessions(): number {
   try {
     if (!existsSync(DB_PATH)) return 0;
-    const db = new Database(DB_PATH, { readonly: true, fileMustExist: true });
+    const db = new Database(DB_PATH, {
+      readonly: true,
+      fileMustExist: true,
+      timeout: 0,
+    });
     try {
       const row = db.prepare(`SELECT COUNT(*) AS c FROM sessions`).get() as { c: number } | undefined;
       const n = row?.c;

@@ -175,6 +175,32 @@ describe("telemetry recorded session count", () => {
     const { countLocalRecordedSessions } = await loadTelemetry();
     expect(countLocalRecordedSessions()).toBe(0);
   });
+
+  it("returns 0 quickly when sessions.db is exclusively locked", async () => {
+    const Database = (await import("better-sqlite3")).default;
+    const { mkdirSync } = await import("node:fs");
+    const { join } = await import("node:path");
+    const dir = join(home, ".agentreel");
+    mkdirSync(dir, { recursive: true });
+    const dbPath = join(dir, "sessions.db");
+    const locker = new Database(dbPath);
+    locker.exec(
+      `CREATE TABLE IF NOT EXISTS sessions (
+        id TEXT PRIMARY KEY,
+        tool TEXT NOT NULL,
+        started_at INTEGER NOT NULL
+      )`,
+    );
+    locker.exec("BEGIN EXCLUSIVE");
+
+    const { countLocalRecordedSessions } = await loadTelemetry();
+    const t0 = performance.now();
+    expect(countLocalRecordedSessions()).toBe(0);
+    expect(performance.now() - t0).toBeLessThan(200);
+
+    locker.exec("ROLLBACK");
+    locker.close();
+  });
 });
 
 describe("telemetry heartbeat cadence", () => {
