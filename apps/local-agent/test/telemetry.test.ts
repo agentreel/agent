@@ -122,7 +122,8 @@ describe("telemetry payload schema", () => {
 
     const payload = buildTelemetryPayload(
       "cli_first_run",
-      { anon_id: "550e8400-e29b-41d4-a716-446655440000", session_count: 3 },
+      "550e8400-e29b-41d4-a716-446655440000",
+      3,
       "0.2.1",
       "linux",
     );
@@ -139,6 +140,40 @@ describe("telemetry payload schema", () => {
       os: "linux",
       session_count: 3,
     });
+  });
+});
+
+describe("telemetry recorded session count", () => {
+  beforeEach(() => {
+    vi.stubEnv("NODE_ENV", "production");
+    vi.stubEnv("VITEST", "");
+    vi.stubEnv("VITEST_WORKER_ID", "");
+  });
+
+  afterEach(async () => {
+    const db = await import("../src/db.js");
+    db.closeDb();
+  });
+
+  it("session_count is rows in sessions.db, not CLI invocations", async () => {
+    const db = await import("../src/db.js");
+    db.upsertSession({ id: "s1", tool: "claude-code", startedAt: 1 } as never);
+    db.upsertSession({ id: "s2", tool: "cursor", startedAt: 2 } as never);
+
+    const { runCliTelemetry, countLocalRecordedSessions } = await loadTelemetry();
+    expect(countLocalRecordedSessions()).toBe(2);
+
+    runCliTelemetry("0.2.1", ["node", "agentreel", "status"]);
+    const body = JSON.parse(String(fetchMock.mock.calls.at(-1)?.[1]?.body));
+    expect(body.session_count).toBe(2);
+
+    db.upsertSession({ id: "s3", tool: "cursor", startedAt: 3 } as never);
+    expect(countLocalRecordedSessions()).toBe(3);
+  });
+
+  it("returns 0 when sessions.db is missing", async () => {
+    const { countLocalRecordedSessions } = await loadTelemetry();
+    expect(countLocalRecordedSessions()).toBe(0);
   });
 });
 
@@ -172,7 +207,6 @@ describe("telemetry heartbeat cadence", () => {
 
     const state = {
       anon_id: "a",
-      session_count: 2,
       first_run_sent: true,
       notice_shown: true,
       last_heartbeat_at: t0,

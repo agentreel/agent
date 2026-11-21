@@ -1,8 +1,9 @@
 import { randomUUID } from "node:crypto";
-import { mkdirSync, readFileSync, writeFileSync } from "node:fs";
+import Database from "better-sqlite3";
+import { existsSync, mkdirSync, readFileSync, writeFileSync } from "node:fs";
 import { platform } from "node:os";
 import { join } from "node:path";
-import { AGENTREEL_DIR } from "./paths.js";
+import { AGENTREEL_DIR, DB_PATH } from "./paths.js";
 
 export const CLI_EVENTS_URL = "https://agentreel.dev/api/cli/events";
 
@@ -34,10 +35,26 @@ export type CliTelemetryPayload = {
 
 export interface TelemetryState {
   anon_id: string;
-  session_count: number;
   first_run_sent: boolean;
   notice_shown: boolean;
   last_heartbeat_at?: number;
+}
+
+/** Distinct replay sessions in the local SQLite buffer (read-only; never throws). */
+export function countLocalRecordedSessions(): number {
+  try {
+    if (!existsSync(DB_PATH)) return 0;
+    const db = new Database(DB_PATH, { readonly: true, fileMustExist: true });
+    try {
+      const row = db.prepare(`SELECT COUNT(*) AS c FROM sessions`).get() as { c: number } | undefined;
+      const n = row?.c;
+      return typeof n === "number" && Number.isInteger(n) && n >= 0 ? n : 0;
+    } finally {
+      db.close();
+    }
+  } catch {
+    return 0;
+  }
 }
 
 export function isAgentreelTelemetryOptedOut(value: string | undefined): boolean {
@@ -74,10 +91,6 @@ function readState(): TelemetryState | null {
     if (typeof parsed.anon_id !== "string" || !parsed.anon_id) return null;
     return {
       anon_id: parsed.anon_id,
-      session_count:
-        typeof parsed.session_count === "number" && Number.isInteger(parsed.session_count)
-          ? parsed.session_count
-          : 0,
       first_run_sent: Boolean(parsed.first_run_sent),
       notice_shown: Boolean(parsed.notice_shown),
       last_heartbeat_at:
@@ -95,16 +108,17 @@ function writeState(state: TelemetryState): void {
 
 export function buildTelemetryPayload(
   event: CliTelemetryEvent,
-  state: Pick<TelemetryState, "anon_id" | "session_count">,
+  anonId: string,
+  recordedSessionCount: number,
   version: string,
   osName: string = platform(),
 ): CliTelemetryPayload {
   return {
     event,
-    anon_id: state.anon_id,
+    anon_id: anonId,
     version,
     os: osName,
-    session_count: state.session_count,
+    session_count: recordedSessionCount,
   };
 }
 
@@ -149,13 +163,11 @@ export function runCliTelemetry(version: string, argv: string[] = process.argv):
     if (!state) {
       state = {
         anon_id: randomUUID(),
-        session_count: 0,
         first_run_sent: false,
         notice_shown: false,
       };
     }
 
-    state = { ...state, session_count: state.session_count + 1 };
     state = maybePrintTelemetryNotice(state);
 
     const event = pickTelemetryEvent(state, now);
@@ -169,7 +181,10 @@ export function runCliTelemetry(version: string, argv: string[] = process.argv):
     writeState(state);
 
     if (event) {
-      postTelemetryPayload(buildTelemetryPayload(event, state, version));
+      const recordedSessionCount = countLocalRecordedSessions();
+      postTelemetryPayload(
+        buildTelemetryPayload(event, state.anon_id, recordedSessionCount, version),
+      );
     }
   } catch {
     // telemetry must never affect the CLI
