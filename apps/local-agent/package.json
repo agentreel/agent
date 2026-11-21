@@ -1,6 +1,6 @@
 {
   "name": "@agentreel/agent",
-  "version": "0.2.2",
+  "version": "0.2.3",
   "description": "Loom for AI coding sessions. Captures every Claude Code and Cursor session locally and ships it to a scrubbable, shareable replay.",
   "keywords": [
     "claude-code",
@@ -32,13 +32,15 @@
     "dist",
     "README.md",
     "LICENSE",
-    "NOTICE"
+    "NOTICE",
+    "CHANGELOG.md"
   ],
   "scripts": {
     "build": "tsup",
     "dev": "tsup --watch",
     "start": "node dist/cli.js",
     "typecheck": "tsc --noEmit",
+    "prepack": "cp ../../CHANGELOG.md CHANGELOG.md",
     "prepublishOnly": "pnpm build",
     "test": "vitest run"
   },
