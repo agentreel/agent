@@ -99,6 +99,10 @@ exponential backoff (1 s → 5 min, with jitter) on transient failures.
 | `agentreel logout` | Clear local credentials |
 | `agentreel uninstall` | Remove Claude Code and Cursor hooks |
 
+## Telemetry
+
+The agentreel CLI sends anonymous usage data so we know how many people use it: one event the first time it runs, then at most one heartbeat a day. Each event carries the CLI version, OS type, and the number of sessions recorded. It never includes session content, prompts, code, file paths, or your IP address. It's identified only by a random ID stored in ~/.agentreel. To turn it off, set AGENTREEL_TELEMETRY=0 (or false, off, no) or DO_NOT_TRACK=1. Telemetry is always off in CI.
+
 ## Privacy
 
 PII scrubbing is **default-on** and runs on every event before it touches the
