@@ -1,60 +1,53 @@
+<!-- PNGs rasterized from the SVGs with resvg at 2x and 3x (160px and 240px). -->
+<picture>
+  <source media="(prefers-color-scheme: dark)" srcset=".github/assets/agentreel-logo-dark.png">
+  <img src=".github/assets/agentreel-logo-light.png" alt="AgentReel" width="80" height="80">
+</picture>
+
 # AgentReel Local Agent
 
 [![License](https://img.shields.io/badge/License-Apache%202.0-blue.svg)](LICENSE)
+[![npm version](https://img.shields.io/npm/v/@agentreel/agent)](https://www.npmjs.com/package/@agentreel/agent)
 
-The on-device half of [AgentReel](https://agentreel.dev), Loom for AI coding sessions.
+Open-source [agent session replay](https://agentreel.dev) for your machine. This repo is the local CLI that captures **Claude Code** and **Cursor** sessions, buffers them in SQLite on disk, and uploads scrubbed events to [AgentReel](https://agentreel.dev) when you link an account. The cloud dashboard, sharing, and export pipeline live in the separate [agentreel/web](https://github.com/agentreel/web) repo.
 
-This repo contains the open-source **local agent** that runs on a developer's
-machine and captures Claude Code and Cursor sessions. The cloud dashboard,
-sharing, and MP4 export pipeline are not part of this repo.
-
-## What it does
-
-- Hooks into Claude Code's lifecycle events (`PreToolUse`, `PostToolUse`,
-  `UserPromptSubmit`, `SessionStart`, `SessionEnd`) and writes them to a local
-  SQLite buffer at `~/.agentreel/sessions.db`.
-- Installs observe-only Cursor hooks (`~/.cursor/hooks.json`) for the agent's
-  shell commands (output, exit code, duration), MCP and tool calls, file reads
-  and edits, and prompts. An optional watcher (`agentreel watch`) adds manual
-  edits from Cursor's local history.
-- Records who and where ran the agent: OS user, hostname (or a salted hash, or
-  nothing: `agentreel config hostname hash|omit`), git user, repo remote with
-  credentials stripped, branch and commit at start and end, agent versions.
-- **AgentReel Guard**: Detects and identifies risky agent behavior patterns
-  (destructive filesystem ops, production database targeting, secret
-  exfiltration, prompt injection, etc.) motivated by real documented incidents.
-  Enabled by default (`~/.agentreel/guard-config.json`). Runs locally and makes
-  zero network calls. Hooks do not scan during recording; sessions are scanned
-  when they upload (background uploader or `agentreel push`) and on demand via
-  `agentreel scan`. See [docs/threat-research.md](docs/threat-research.md)
-  and [docs/detections.md](docs/detections.md).
-- Scrubs PII (AWS / GitHub / OpenAI / Anthropic / Stripe / Slack / Google / npm
-  tokens, JWTs, PEM keys, dotenv `KEY=VAL`, emails, IPv4 addresses) **before**
-  any data leaves the machine.
-- Honours per-project `.agentreelignore` files (gitignore syntax).
-- Ships events to the AgentReel cloud over HTTPS, batched every 30 s or 1 MB,
-  with exponential backoff and a persistent queue. Network-loss-safe.
-
-## Install
-
-Supported clients: **Claude Code** and **Cursor** (use `--no-claude` or
-`--no-cursor` on `init` if you only need one).
+## Quickstart
 
 ```bash
 npx @agentreel/agent init
+npx @agentreel/agent link <api-key>
+npx @agentreel/agent daemon
 ```
 
-That writes the Claude Code hooks into `~/.claude/settings.json`, the Cursor
-hooks into `~/.cursor/hooks.json`, and creates
-the local SQLite buffer. Then link the agent to your account:
+Get an API key at [agentreel.dev/dashboard/settings](https://agentreel.dev/dashboard/settings).
 
-```bash
-npx @agentreel/agent link <your-api-key>
-```
+`init` installs Claude Code hooks (`~/.claude/settings.json`), Cursor observe-only hooks (`~/.cursor/hooks.json`), and creates `~/.agentreel/sessions.db`. Use `agentreel init --no-claude` or `--no-cursor` if you only need one client.
 
-Generate the key from your dashboard at
-[agentreel.dev](https://agentreel.dev/dashboard/settings).
+## What it does
 
+- **Capture**: Claude Code lifecycle hooks and Cursor hooks record tool use, shell output, prompts, and session boundaries into `~/.agentreel/sessions.db`. Optional `agentreel watch` adds manual edits from Cursor local history.
+- **Redaction**: Sensitive patterns (tokens, keys, emails, and similar) are scrubbed when events are written to SQLite, before any upload.
+- **Attribution**: Sessions can record OS user, hostname (plain, salted hash, or omitted via `agentreel config hostname`), git user, repo remote with credentials stripped, and branch/commit at start and end (`agentreel config attribution off` disables this).
+- **Upload**: `agentreel daemon` or `agentreel push` sends batches over HTTPS (30 s or 1 MB thresholds, exponential backoff, persistent queue). The SQLite file itself is not uploaded.
+- **AgentReel Guard**: Local pattern detection for risky agent behavior. Default `policyMode` is **warn** (findings are recorded; hooks do not block Claude or Cursor). Scans run on upload and via `agentreel scan`. See [docs/threat-research.md](docs/threat-research.md) and [docs/detections.md](docs/detections.md).
+- **Ignore lists**: Per-project `.agentreelignore` (gitignore syntax) can drop file contents from payloads.
+
+## Commands
+
+| Command | Description |
+| --- | --- |
+| `agentreel init` | Install hooks and create local DB (`--no-claude`, `--no-cursor`) |
+| `agentreel link [api-key]` | Authenticate with agentreel.dev |
+| `agentreel daemon` | Run the background uploader (`--detach` to fork) |
+| `agentreel push` | Upload pending events once (`--retry-held` for plan-limit refusals) |
+| `agentreel status` | Queue depth, capture state, last sync/error |
+| `agentreel scan [session-id]` | Guard scan (local, no network) |
+| `agentreel watch` | Optional Cursor history watcher |
+| `agentreel config [key] [value]` | `hostname plain\|hash\|omit`, `attribution on\|off` |
+| `agentreel pause` / `agentreel resume` | Pause or resume local capture |
+| `agentreel forget` | Remove sessions from the local buffer |
+| `agentreel logout` | Clear local API credentials |
+| `agentreel uninstall` | Remove installed hooks |
 
 ## Secret scanning (gitleaks)
 
@@ -73,57 +66,27 @@ gitleaks git --log-opts="origin/main..HEAD" --redact .
 
 Each command should end with "no leaks found". If one finds a real secret, rotate it first, then remove it. Never widen the allowlist to hide a real secret.
 
-## Run the background uploader
-
-```bash
-npx @agentreel/agent daemon
-```
-
-Ticks every 30 seconds, flushes early when the local queue exceeds 1 MB,
-records `last_sync_at` / `last_error_at` to the SQLite meta table, and uses
-exponential backoff (1 s → 5 min, with jitter) on transient failures.
-
-## All commands
-
-| Command | Description |
-|---|---|
-| `agentreel init` | Install Claude Code + Cursor hooks, create local DB (`--no-claude`, `--no-cursor`) |
-| `agentreel config [key] [value]` | `hostname plain\|hash\|omit`, `attribution on\|off` |
-| `agentreel link <key>` | Authenticate with agentreel.dev |
-| `agentreel scan [session-id]` | Scan a session for risky agent behavior (local, no network calls) |
-| `agentreel watch` | Watch Cursor's history dir |
-| `agentreel daemon` | Run the background uploader |
-| `agentreel push` | Drain the queue once and exit |
-| `agentreel push --retry-held` | Retry sessions the server refused for the plan limit (kept locally until then) |
-| `agentreel status` | Show capture state, queue depth, last sync, last error |
-| `agentreel logout` | Clear local credentials |
-| `agentreel uninstall` | Remove Claude Code and Cursor hooks |
-
 ## Telemetry
 
 The agentreel CLI sends anonymous usage data so we know how many people use it: one event the first time it runs, then at most one heartbeat a day. Each event carries the CLI version, OS type, and the number of sessions recorded. It never includes session content, prompts, code, file paths, or your IP address. It's identified only by a random ID stored in ~/.agentreel. To turn it off, set AGENTREEL_TELEMETRY=0 (or false, off, no) or DO_NOT_TRACK=1. Telemetry is always off in CI.
 
-## Privacy
+## Roadmap
 
-PII scrubbing is **default-on** and runs on every event before it touches the
-network. The SQLite buffer is local-only and never uploaded as a file. The
-`config.json` containing your API key is written with mode `0600`.
-
-If you find a regex pattern that misses a credential shape, please open an
-issue or PR. `apps/local-agent/src/redact/patterns.ts` is the file.
+`/govern` and `/defend` are coming soon on [agentreel.dev](https://agentreel.dev).
 
 ## Development
 
-This is a pnpm workspace. Node 20+ required.
+pnpm workspace, Node 20+.
 
 ```bash
 pnpm install
 pnpm -r build
 pnpm --filter @agentreel/agent typecheck
+pnpm --filter @agentreel/agent test
 ```
 
 ## License
 
-Apache License 2.0. See [LICENSE](./LICENSE) and [NOTICE](./NOTICE).
+Apache License 2.0 from **v0.2.1** onward. See [LICENSE](./LICENSE) and [NOTICE](./NOTICE).
 
 Versions **0.2.0 and earlier** were released under the [MIT License](https://opensource.org/licenses/MIT).

@@ -1,0 +1,15 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 32 32" width="32" height="32" fill="none" role="img" aria-label="AgentReel">
+  <circle cx="27.0000" cy="16.0000" r="2" fill="#e6e9ec"/>
+  <circle cx="25.5263" cy="21.5000" r="2" fill="#e6e9ec"/>
+  <circle cx="21.5000" cy="25.5263" r="2" fill="#e6e9ec"/>
+  <circle cx="16.0000" cy="27.0000" r="2" fill="#e6e9ec"/>
+  <circle cx="10.5000" cy="25.5263" r="2" fill="#e6e9ec"/>
+  <circle cx="6.4737" cy="21.5000" r="2" fill="#e6e9ec"/>
+  <circle cx="5.0000" cy="16.0000" r="2" fill="#e6e9ec"/>
+  <circle cx="6.4737" cy="10.5000" r="2" fill="#e6e9ec"/>
+  <circle cx="10.5000" cy="6.4737" r="2" fill="#e6e9ec"/>
+  <circle cx="16.0000" cy="5.0000" r="2" fill="#ff4fa8"/>
+  <circle cx="21.5000" cy="6.4737" r="2" fill="#e6e9ec"/>
+  <circle cx="25.5263" cy="10.5000" r="2" fill="#e6e9ec"/>
+  <circle cx="16" cy="16" r="5" fill="#1e40ff"/>
+</svg>
