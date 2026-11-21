@@ -101,26 +101,7 @@ exponential backoff (1 s → 5 min, with jitter) on transient failures.
 
 ## Telemetry
 
-<!-- PLACEHOLDER: replace this section when https://agentreel.dev/docs/cli-telemetry ships -->
-
-The AgentReel CLI sends **anonymous usage metrics** by default: invocation
-count, package version, and OS platform string (`linux`, `darwin`, `win32`,
-etc.). Command names, session content, file paths, hostnames, usernames, and
-environment values are not transmitted.
-
-Events: one `cli_first_run` on the first invocation, then at most one
-`cli_heartbeat` per 24 hours.
-
-**Opt out** (no telemetry file writes and no network calls):
-
-| Variable | Effect |
-|----------|--------|
-| `AGENTREEL_TELEMETRY=0` | Disables CLI telemetry |
-| `DO_NOT_TRACK=1` (any non-empty value) | Disables CLI telemetry |
-| `CI` (set in CI environments) | Disables CLI telemetry |
-
-Telemetry state (anonymous id and last heartbeat time) is stored in
-`~/.agentreel/telemetry.json`.
+The agentreel CLI sends anonymous usage data so we know how many people use it: one event the first time it runs, then at most one heartbeat a day. Each event carries the CLI version, OS type, and the number of sessions recorded. It never includes session content, prompts, code, file paths, or your IP address. It's identified only by a random ID stored in ~/.agentreel. To turn it off, set AGENTREEL_TELEMETRY=0 (or false, off, no) or DO_NOT_TRACK=1. Telemetry is always off in CI.
 
 ## Privacy
 

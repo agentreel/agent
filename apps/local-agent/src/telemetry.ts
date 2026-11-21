@@ -11,10 +11,8 @@ const HEARTBEAT_INTERVAL_MS = 24 * 60 * 60 * 1000;
 const POST_TIMEOUT_MS = 1500;
 
 export const TELEMETRY_NOTICE =
-  "AgentReel collects anonymous CLI usage metrics (version, OS, invocation count). " +
-  "No session content, paths, or credentials are sent. " +
-  "Opt out: set AGENTREEL_TELEMETRY=0 or DO_NOT_TRACK=1. " +
-  "Details: https://agentreel.dev/docs/cli-telemetry (PLACEHOLDER)";
+  "agentreel sends anonymous usage stats (version, OS, session count, no content). " +
+  "Turn off with AGENTREEL_TELEMETRY=0. Details: agentreel.dev/docs#telemetry";
 
 export type CliTelemetryEvent = "cli_first_run" | "cli_heartbeat";
 
@@ -42,8 +40,19 @@ export interface TelemetryState {
   last_heartbeat_at?: number;
 }
 
+export function isAgentreelTelemetryOptedOut(value: string | undefined): boolean {
+  if (value == null) return false;
+  const normalized = value.trim().toLowerCase();
+  return (
+    normalized === "0" ||
+    normalized === "false" ||
+    normalized === "off" ||
+    normalized === "no"
+  );
+}
+
 export function isTelemetryEnabled(env: NodeJS.ProcessEnv = process.env): boolean {
-  if (env.AGENTREEL_TELEMETRY === "0") return false;
+  if (isAgentreelTelemetryOptedOut(env.AGENTREEL_TELEMETRY)) return false;
   if (env.DO_NOT_TRACK != null && env.DO_NOT_TRACK !== "") return false;
   if (env.CI != null && env.CI !== "") return false;
   if (env.NODE_ENV === "test") return false;

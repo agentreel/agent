@@ -60,10 +60,24 @@ describe("telemetry opt-out matrix", () => {
     expect(isTelemetryEnabled(enabledEnv())).toBe(true);
   });
 
-  it("AGENTREEL_TELEMETRY=0 disables", async () => {
+  it.each([
+    ["0"],
+    ["false"],
+    ["FALSE"],
+    ["  Off  "],
+    ["NO"],
+  ])("AGENTREEL_TELEMETRY=%s opts out", async (value) => {
     const { isTelemetryEnabled } = await loadTelemetry();
-    expect(isTelemetryEnabled({ ...enabledEnv(), AGENTREEL_TELEMETRY: "0" })).toBe(false);
+    expect(isTelemetryEnabled({ ...enabledEnv(), AGENTREEL_TELEMETRY: value })).toBe(false);
   });
+
+  it.each([["1"], ["true"], ["yes"], ["enabled"], ["  on  "]])(
+    "AGENTREEL_TELEMETRY=%s does not opt out",
+    async (value) => {
+      const { isTelemetryEnabled } = await loadTelemetry();
+      expect(isTelemetryEnabled({ ...enabledEnv(), AGENTREEL_TELEMETRY: value })).toBe(true);
+    },
+  );
 
   it("DO_NOT_TRACK disables", async () => {
     const { isTelemetryEnabled } = await loadTelemetry();
@@ -197,7 +211,7 @@ describe("telemetry notice", () => {
     stderrSpy.mockRestore();
 
     const joined = lines.join("");
-    expect((joined.match(/Opt out/g) ?? []).length).toBe(1);
+    expect((joined.match(/Turn off with/g) ?? []).length).toBe(1);
     expect(joined).toContain(TELEMETRY_NOTICE.slice(0, 40));
 
     const raw = readFileSync(join(home, ".agentreel", "telemetry.json"), "utf8");
