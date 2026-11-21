@@ -1,6 +1,6 @@
-import { Command } from "commander";
+import { Command, CommanderError } from "commander";
 import { initCommand } from "./commands/init.js";
-import { runCliTelemetry } from "./telemetry.js";
+import { flushCliTelemetry, runCliTelemetry } from "./telemetry.js";
 
 // Replaced at build time by tsup's `define`. Fallback covers running via
 // ts-node where the literal isn't substituted.
@@ -148,15 +148,31 @@ program
     await scanCommand(sessionId ? [sessionId] : []);
   });
 
-runCliTelemetry(VERSION);
+program.exitOverride();
 
-program.parseAsync(process.argv).catch((err) => {
-  // Top-level: if we got this far on a hook invocation, something is very wrong.
-  // For all other commands, print and exit non-zero.
-  const cmd = process.argv[2];
-  if (cmd === "hook" || cmd === "cursor-hook") {
-    process.exit(0);
+async function main(): Promise<void> {
+  void runCliTelemetry(VERSION);
+  let exitCode = 0;
+  try {
+    await program.parseAsync(process.argv);
+  } catch (err) {
+    if (err instanceof CommanderError) {
+      exitCode = err.exitCode;
+    } else {
+      const cmd = process.argv[2];
+      if (cmd === "hook" || cmd === "cursor-hook") {
+        exitCode = 0;
+      } else {
+        console.error(err);
+        exitCode = 1;
+      }
+    }
+  } finally {
+    await flushCliTelemetry();
   }
-  console.error(err);
-  process.exit(1);
-});
+  if (exitCode !== 0) {
+    process.exit(exitCode);
+  }
+}
+
+void main();

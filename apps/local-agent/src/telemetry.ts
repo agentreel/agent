@@ -9,7 +9,9 @@ export const CLI_EVENTS_URL = "https://agentreel.dev/api/cli/events";
 
 const TELEMETRY_PATH = join(AGENTREEL_DIR, "telemetry.json");
 const HEARTBEAT_INTERVAL_MS = 24 * 60 * 60 * 1000;
-const POST_TIMEOUT_MS = 1500;
+const POST_TIMEOUT_MS = 800;
+
+export const TELEMETRY_EXIT_AWAIT_MS = 800;
 
 export const TELEMETRY_NOTICE =
   "agentreel sends anonymous usage stats (version, OS, session count, no content). " +
@@ -39,6 +41,8 @@ export interface TelemetryState {
   notice_shown: boolean;
   last_heartbeat_at?: number;
 }
+
+let inFlightTelemetry: Promise<void> | null = null;
 
 /** Distinct replay sessions in the local SQLite buffer (read-only; never throws). */
 export function countLocalRecordedSessions(): number {
@@ -136,13 +140,22 @@ export function pickTelemetryEvent(
   return null;
 }
 
-function postTelemetryPayload(payload: CliTelemetryPayload): void {
-  void fetch(CLI_EVENTS_URL, {
-    method: "POST",
-    headers: { "content-type": "application/json" },
-    body: JSON.stringify(payload),
-    signal: AbortSignal.timeout(POST_TIMEOUT_MS),
-  }).catch(() => {});
+async function postTelemetryPayload(payload: CliTelemetryPayload): Promise<boolean> {
+  const controller = new AbortController();
+  const timer = setTimeout(() => controller.abort(), POST_TIMEOUT_MS);
+  try {
+    const res = await globalThis.fetch(CLI_EVENTS_URL, {
+      method: "POST",
+      headers: { "content-type": "application/json" },
+      body: JSON.stringify(payload),
+      signal: controller.signal,
+    });
+    return res.ok;
+  } catch {
+    return false;
+  } finally {
+    clearTimeout(timer);
+  }
 }
 
 export function maybePrintTelemetryNotice(
@@ -155,9 +168,36 @@ export function maybePrintTelemetryNotice(
 }
 
 /**
- * Anonymous CLI telemetry. Fire-and-forget; never throws.
+ * Await any in-flight telemetry work, up to capMs. Never throws.
  */
-export function runCliTelemetry(version: string, argv: string[] = process.argv): void {
+export async function flushCliTelemetry(capMs: number = TELEMETRY_EXIT_AWAIT_MS): Promise<void> {
+  const current = inFlightTelemetry;
+  if (!current) return;
+  try {
+    await Promise.race([
+      current,
+      new Promise<void>((resolve) => setTimeout(resolve, capMs)),
+    ]);
+  } catch {
+    // telemetry must never affect the CLI
+  }
+}
+
+/**
+ * Anonymous CLI telemetry. Never throws; delivery markers persist only after a 2xx POST.
+ */
+export function runCliTelemetry(version: string, argv: string[] = process.argv): Promise<void> {
+  const run = runCliTelemetryInner(version, argv);
+  inFlightTelemetry = run;
+  void run.finally(() => {
+    if (inFlightTelemetry === run) {
+      inFlightTelemetry = null;
+    }
+  });
+  return run;
+}
+
+async function runCliTelemetryInner(version: string, argv: string[]): Promise<void> {
   try {
     if (!isTelemetryEnabled()) return;
     if (shouldSkipTelemetryForArgv(argv)) return;
@@ -175,20 +215,27 @@ export function runCliTelemetry(version: string, argv: string[] = process.argv):
     state = maybePrintTelemetryNotice(state);
 
     const event = pickTelemetryEvent(state, now);
-    if (event === "cli_first_run") {
-      // Anchor heartbeat cadence to first run even though the event is not a heartbeat.
-      state = { ...state, first_run_sent: true, last_heartbeat_at: now };
-    } else if (event === "cli_heartbeat") {
-      state = { ...state, last_heartbeat_at: now };
+    if (!event) {
+      writeState(state);
+      return;
     }
 
-    writeState(state);
+    const recordedSessionCount = countLocalRecordedSessions();
+    const payload = buildTelemetryPayload(
+      event,
+      state.anon_id,
+      recordedSessionCount,
+      version,
+    );
+    const sent = await postTelemetryPayload(payload);
 
-    if (event) {
-      const recordedSessionCount = countLocalRecordedSessions();
-      postTelemetryPayload(
-        buildTelemetryPayload(event, state.anon_id, recordedSessionCount, version),
-      );
+    if (sent) {
+      if (event === "cli_first_run") {
+        state = { ...state, first_run_sent: true, last_heartbeat_at: now };
+      } else if (event === "cli_heartbeat") {
+        state = { ...state, last_heartbeat_at: now };
+      }
+      writeState(state);
     }
   } catch {
     // telemetry must never affect the CLI
