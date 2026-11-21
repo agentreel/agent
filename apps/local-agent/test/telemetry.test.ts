@@ -163,7 +163,7 @@ describe("telemetry recorded session count", () => {
     const { runCliTelemetry, countLocalRecordedSessions } = await loadTelemetry();
     expect(countLocalRecordedSessions()).toBe(2);
 
-    runCliTelemetry("0.2.2", ["node", "agentreel", "status"]);
+    await runCliTelemetry("0.2.2", ["node", "agentreel", "status"]);
     const body = JSON.parse(String(fetchMock.mock.calls.at(-1)?.[1]?.body));
     expect(body.session_count).toBe(2);
 
@@ -221,14 +221,14 @@ describe("telemetry heartbeat cadence", () => {
     const t0 = 1_700_000_000_000;
 
     vi.setSystemTime(t0);
-    runCliTelemetry("0.2.2", ["node", "agentreel", "status"]);
+    await runCliTelemetry("0.2.2", ["node", "agentreel", "status"]);
     expect(fetchMock).toHaveBeenCalledTimes(1);
     const firstBody = JSON.parse(String(fetchMock.mock.calls[0]![1]?.body));
     expect(firstBody.event).toBe("cli_first_run");
 
     fetchMock.mockClear();
     vi.setSystemTime(t0 + 60_000);
-    runCliTelemetry("0.2.2", ["node", "agentreel", "status"]);
+    await runCliTelemetry("0.2.2", ["node", "agentreel", "status"]);
     expect(fetchMock).not.toHaveBeenCalled();
 
     const state = {
@@ -242,7 +242,7 @@ describe("telemetry heartbeat cadence", () => {
 
     fetchMock.mockClear();
     vi.setSystemTime(t0 + day);
-    runCliTelemetry("0.2.2", ["node", "agentreel", "status"]);
+    await runCliTelemetry("0.2.2", ["node", "agentreel", "status"]);
     expect(fetchMock).toHaveBeenCalledTimes(1);
     const hbBody = JSON.parse(String(fetchMock.mock.calls[0]![1]?.body));
     expect(hbBody.event).toBe("cli_heartbeat");
@@ -265,8 +265,8 @@ describe("telemetry notice", () => {
       return true;
     });
 
-    runCliTelemetry("0.2.2", ["node", "agentreel", "status"]);
-    runCliTelemetry("0.2.2", ["node", "agentreel", "status"]);
+    await runCliTelemetry("0.2.2", ["node", "agentreel", "status"]);
+    await runCliTelemetry("0.2.2", ["node", "agentreel", "status"]);
 
     stderrSpy.mockRestore();
 
@@ -287,14 +287,179 @@ describe("telemetry network failures", () => {
   });
 
   it("runCliTelemetry never throws on fetch failure or timeout", async () => {
-    const { runCliTelemetry } = await loadTelemetry();
+    const { runCliTelemetry, flushCliTelemetry } = await loadTelemetry();
     fetchMock.mockRejectedValueOnce(new Error("network down"));
-    expect(() => runCliTelemetry("0.2.2", ["node", "agentreel", "status"])).not.toThrow();
+    await expect(runCliTelemetry("0.2.2", ["node", "agentreel", "status"])).resolves.toBeUndefined();
+    await flushCliTelemetry(800);
 
-    fetchMock.mockImplementationOnce(() => {
-      return new Promise(() => {});
+    fetchMock.mockImplementationOnce(() => new Promise(() => {}));
+    void runCliTelemetry("0.2.2", ["node", "agentreel", "status"]);
+    const t0 = performance.now();
+    await flushCliTelemetry(800);
+    expect(performance.now() - t0).toBeLessThan(1000);
+  });
+});
+
+describe("telemetry first-run delivery", () => {
+  beforeEach(() => {
+    vi.stubEnv("NODE_ENV", "production");
+    vi.stubEnv("VITEST", "");
+    vi.stubEnv("VITEST_WORKER_ID", "");
+  });
+
+  it("--version as the first command sends cli_first_run and writes marker after 2xx", async () => {
+    const { runCliTelemetry, flushCliTelemetry } = await loadTelemetry();
+    await runCliTelemetry("0.2.2", ["node", "agentreel", "--version"]);
+    await flushCliTelemetry(800);
+    expect(fetchMock).toHaveBeenCalledTimes(1);
+    const body = JSON.parse(String(fetchMock.mock.calls[0]![1]?.body));
+    expect(body.event).toBe("cli_first_run");
+
+    const raw = readFileSync(join(home, ".agentreel", "telemetry.json"), "utf8");
+    expect(JSON.parse(raw).first_run_sent).toBe(true);
+  });
+
+  it("failed POST (non-2xx) does not set first_run_sent; next run sends cli_first_run again", async () => {
+    const { runCliTelemetry, flushCliTelemetry } = await loadTelemetry();
+    fetchMock.mockResolvedValueOnce(new Response("{}", { status: 500 }));
+    await runCliTelemetry("0.2.2", ["node", "agentreel", "status"]);
+    await flushCliTelemetry(800);
+
+    const path = join(home, ".agentreel", "telemetry.json");
+    if (existsSync(path)) {
+      expect(JSON.parse(readFileSync(path, "utf8")).first_run_sent).not.toBe(true);
+    }
+
+    fetchMock.mockClear();
+    fetchMock.mockResolvedValueOnce(new Response("{}", { status: 200 }));
+    await runCliTelemetry("0.2.2", ["node", "agentreel", "status"]);
+    await flushCliTelemetry(800);
+    expect(fetchMock).toHaveBeenCalledTimes(1);
+    const body = JSON.parse(String(fetchMock.mock.calls[0]![1]?.body));
+    expect(body.event).toBe("cli_first_run");
+  });
+
+  it("network error on POST does not set first_run_sent; next run retries cli_first_run", async () => {
+    const { runCliTelemetry, flushCliTelemetry } = await loadTelemetry();
+    fetchMock.mockRejectedValueOnce(new Error("network down"));
+    await runCliTelemetry("0.2.2", ["node", "agentreel", "status"]);
+    await flushCliTelemetry(800);
+
+    const path = join(home, ".agentreel", "telemetry.json");
+    if (existsSync(path)) {
+      expect(JSON.parse(readFileSync(path, "utf8")).first_run_sent).not.toBe(true);
+    }
+
+    fetchMock.mockClear();
+    await runCliTelemetry("0.2.2", ["node", "agentreel", "status"]);
+    await flushCliTelemetry(800);
+    expect(fetchMock).toHaveBeenCalledTimes(1);
+    expect(JSON.parse(String(fetchMock.mock.calls[0]![1]?.body)).event).toBe("cli_first_run");
+  });
+
+  it("a hanging POST is capped within about 800ms via flushCliTelemetry", async () => {
+    const { runCliTelemetry, flushCliTelemetry } = await loadTelemetry();
+    fetchMock.mockImplementation(() => new Promise(() => {}));
+    void runCliTelemetry("0.2.2", ["node", "agentreel", "status"]);
+    const t0 = performance.now();
+    await flushCliTelemetry(800);
+    expect(performance.now() - t0).toBeLessThan(1000);
+    expect(existsSync(join(home, ".agentreel", "telemetry.json"))).toBe(false);
+  });
+});
+
+describe("telemetry opt-out never fetches", () => {
+  const cliPath = join(dirname(fileURLToPath(import.meta.url)), "../dist/cli.js");
+  const fetchSuccessPreload = join(
+    dirname(fileURLToPath(import.meta.url)),
+    "fixtures/telemetry-fetch-success.mjs",
+  );
+
+  function fetchLogPath(): string {
+    return join(home, ".agentreel", "fetch-log.txt");
+  }
+
+  it("AGENTREEL_TELEMETRY=0 does not call fetch on --version", () => {
+    if (!existsSync(cliPath)) {
+      return;
+    }
+    const logPath = fetchLogPath();
+    rmSync(join(home, ".agentreel"), { recursive: true, force: true });
+    const out = execFileSync("node", [cliPath, "--version"], {
+      env: {
+        ...process.env,
+        HOME: home,
+        NODE_ENV: "production",
+        VITEST: "",
+        VITEST_WORKER_ID: "",
+        AGENTREEL_TELEMETRY: "0",
+        AGENTREEL_TELEMETRY_FETCH_LOG: logPath,
+        NODE_OPTIONS: `--import ${fetchSuccessPreload}`,
+      },
+      encoding: "utf8",
+      stdio: ["pipe", "pipe", "pipe"],
     });
-    expect(() => runCliTelemetry("0.2.2", ["node", "agentreel", "status"])).not.toThrow();
+    expect(out.trim().length).toBeGreaterThan(0);
+    expect(existsSync(logPath)).toBe(false);
+    expect(existsSync(join(home, ".agentreel", "telemetry.json"))).toBe(false);
+  });
+
+  it("CI=1 does not call fetch on --version", () => {
+    if (!existsSync(cliPath)) {
+      return;
+    }
+    const logPath = fetchLogPath();
+    rmSync(join(home, ".agentreel"), { recursive: true, force: true });
+    execFileSync("node", [cliPath, "--version"], {
+      env: {
+        ...process.env,
+        HOME: home,
+        NODE_ENV: "production",
+        VITEST: "",
+        VITEST_WORKER_ID: "",
+        CI: "true",
+        AGENTREEL_TELEMETRY_FETCH_LOG: logPath,
+        NODE_OPTIONS: `--import ${fetchSuccessPreload}`,
+      },
+      encoding: "utf8",
+      stdio: ["pipe", "pipe", "pipe"],
+    });
+    expect(existsSync(logPath)).toBe(false);
+    expect(existsSync(join(home, ".agentreel", "telemetry.json"))).toBe(false);
+  });
+});
+
+describe("telemetry CLI integration", () => {
+  const cliPath = join(dirname(fileURLToPath(import.meta.url)), "../dist/cli.js");
+  const fetchSuccessPreload = join(
+    dirname(fileURLToPath(import.meta.url)),
+    "fixtures/telemetry-fetch-success.mjs",
+  );
+
+  it("built CLI --version awaits telemetry POST then writes first_run_sent", () => {
+    if (!existsSync(cliPath)) {
+      return;
+    }
+    const logPath = join(home, ".agentreel", "fetch-log.txt");
+    rmSync(join(home, ".agentreel"), { recursive: true, force: true });
+    execFileSync("node", [cliPath, "--version"], {
+      env: {
+        ...process.env,
+        HOME: home,
+        NODE_ENV: "production",
+        VITEST: "",
+        VITEST_WORKER_ID: "",
+        AGENTREEL_TELEMETRY_FETCH_LOG: logPath,
+        NODE_OPTIONS: `--import ${fetchSuccessPreload}`,
+      },
+      encoding: "utf8",
+      stdio: ["pipe", "pipe", "pipe"],
+    });
+    expect(existsSync(logPath)).toBe(true);
+    expect(existsSync(join(home, ".agentreel", "telemetry.json"))).toBe(true);
+    expect(JSON.parse(readFileSync(join(home, ".agentreel", "telemetry.json"), "utf8")).first_run_sent).toBe(
+      true,
+    );
   });
 });
 
@@ -335,7 +500,7 @@ describe("telemetry hook commands", () => {
 
   it("skips internal hook subcommands", async () => {
     const { runCliTelemetry } = await loadTelemetry();
-    runCliTelemetry("0.2.2", ["node", "agentreel", "hook", "SessionStart"]);
+    await runCliTelemetry("0.2.2", ["node", "agentreel", "hook", "SessionStart"]);
     expect(fetchMock).not.toHaveBeenCalled();
     expect(existsSync(join(home, ".agentreel", "telemetry.json"))).toBe(false);
   });
