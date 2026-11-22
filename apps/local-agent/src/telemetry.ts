@@ -114,6 +114,17 @@ function writeState(state: TelemetryState): void {
   writeFileSync(TELEMETRY_PATH, JSON.stringify(state, null, 2) + "\n", { mode: 0o600 });
 }
 
+/** Persist anon_id and notice_shown without clobbering delivery markers from disk. */
+function persistLocalTelemetryMarkers(state: TelemetryState): void {
+  const onDisk = readState();
+  writeState({
+    anon_id: state.anon_id,
+    notice_shown: state.notice_shown,
+    first_run_sent: onDisk?.first_run_sent ?? false,
+    last_heartbeat_at: onDisk?.last_heartbeat_at,
+  });
+}
+
 export function buildTelemetryPayload(
   event: CliTelemetryEvent,
   anonId: string,
@@ -210,9 +221,14 @@ async function runCliTelemetryInner(version: string, argv: string[]): Promise<vo
         first_run_sent: false,
         notice_shown: false,
       };
+      persistLocalTelemetryMarkers(state);
     }
 
+    const noticeBefore = state.notice_shown;
     state = maybePrintTelemetryNotice(state);
+    if (!noticeBefore && state.notice_shown) {
+      persistLocalTelemetryMarkers(state);
+    }
 
     const event = pickTelemetryEvent(state, now);
     if (!event) {

@@ -1,5 +1,6 @@
 import {
   afterEach,
+  beforeAll,
   beforeEach,
   describe,
   expect,
@@ -7,7 +8,7 @@ import {
   vi,
   type MockInstance,
 } from "vitest";
-import { execFileSync } from "node:child_process";
+import { execFileSync, execSync } from "node:child_process";
 import { mkdtempSync, readFileSync, rmSync, existsSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { dirname, join } from "node:path";
@@ -326,9 +327,15 @@ describe("telemetry first-run delivery", () => {
     await flushCliTelemetry(800);
 
     const path = join(home, ".agentreel", "telemetry.json");
-    if (existsSync(path)) {
-      expect(JSON.parse(readFileSync(path, "utf8")).first_run_sent).not.toBe(true);
-    }
+    expect(existsSync(path)).toBe(true);
+    const persisted = JSON.parse(readFileSync(path, "utf8")) as {
+      anon_id?: string;
+      notice_shown?: boolean;
+      first_run_sent?: boolean;
+    };
+    expect(typeof persisted.anon_id).toBe("string");
+    expect(persisted.notice_shown).toBe(true);
+    expect(persisted.first_run_sent).not.toBe(true);
 
     fetchMock.mockClear();
     fetchMock.mockResolvedValueOnce(new Response("{}", { status: 200 }));
@@ -346,9 +353,15 @@ describe("telemetry first-run delivery", () => {
     await flushCliTelemetry(800);
 
     const path = join(home, ".agentreel", "telemetry.json");
-    if (existsSync(path)) {
-      expect(JSON.parse(readFileSync(path, "utf8")).first_run_sent).not.toBe(true);
-    }
+    expect(existsSync(path)).toBe(true);
+    const persisted = JSON.parse(readFileSync(path, "utf8")) as {
+      anon_id?: string;
+      notice_shown?: boolean;
+      first_run_sent?: boolean;
+    };
+    expect(typeof persisted.anon_id).toBe("string");
+    expect(persisted.notice_shown).toBe(true);
+    expect(persisted.first_run_sent).not.toBe(true);
 
     fetchMock.mockClear();
     await runCliTelemetry("0.2.3", ["node", "agentreel", "status"]);
@@ -364,7 +377,16 @@ describe("telemetry first-run delivery", () => {
     const t0 = performance.now();
     await flushCliTelemetry(800);
     expect(performance.now() - t0).toBeLessThan(1000);
-    expect(existsSync(join(home, ".agentreel", "telemetry.json"))).toBe(false);
+    const path = join(home, ".agentreel", "telemetry.json");
+    expect(existsSync(path)).toBe(true);
+    const persisted = JSON.parse(readFileSync(path, "utf8")) as {
+      anon_id?: string;
+      notice_shown?: boolean;
+      first_run_sent?: boolean;
+    };
+    expect(typeof persisted.anon_id).toBe("string");
+    expect(persisted.notice_shown).toBe(true);
+    expect(persisted.first_run_sent).not.toBe(true);
   });
 });
 
@@ -429,37 +451,66 @@ describe("telemetry opt-out never fetches", () => {
   });
 });
 
-describe("telemetry CLI integration", () => {
-  const cliPath = join(dirname(fileURLToPath(import.meta.url)), "../dist/cli.js");
-  const fetchSuccessPreload = join(
-    dirname(fileURLToPath(import.meta.url)),
-    "fixtures/telemetry-fetch-success.mjs",
-  );
+type IntegrationRunResult = {
+  requests: Array<Record<string, unknown>>;
+  telemetry: Record<string, unknown> | null;
+};
 
-  it("built CLI --version awaits telemetry POST then writes first_run_sent", () => {
-    if (!existsSync(cliPath)) {
-      return;
-    }
-    const logPath = join(home, ".agentreel", "fetch-log.txt");
-    rmSync(join(home, ".agentreel"), { recursive: true, force: true });
-    execFileSync("node", [cliPath, "--version"], {
+function runTelemetryCliIntegration(
+  fixtureDir: string,
+  statusCode: number,
+  integrationHome: string,
+  keepState: boolean,
+): IntegrationRunResult {
+  const outPath = join(integrationHome, "integration-result.json");
+  const integrationScript = join(fixtureDir, "telemetry-cli-integration.mjs");
+  const keepArg = keepState ? "keep" : "reset";
+  execFileSync(
+    "node",
+    [integrationScript, String(statusCode), integrationHome, outPath, keepArg],
+    {
       env: {
         ...process.env,
-        HOME: home,
         NODE_ENV: "production",
         VITEST: "",
         VITEST_WORKER_ID: "",
-        AGENTREEL_TELEMETRY_FETCH_LOG: logPath,
-        NODE_OPTIONS: `--import ${fetchSuccessPreload}`,
       },
       encoding: "utf8",
       stdio: ["pipe", "pipe", "pipe"],
-    });
-    expect(existsSync(logPath)).toBe(true);
-    expect(existsSync(join(home, ".agentreel", "telemetry.json"))).toBe(true);
-    expect(JSON.parse(readFileSync(join(home, ".agentreel", "telemetry.json"), "utf8")).first_run_sent).toBe(
-      true,
-    );
+    },
+  );
+  return JSON.parse(readFileSync(outPath, "utf8")) as IntegrationRunResult;
+}
+
+describe("telemetry CLI integration", () => {
+  const packageRoot = join(dirname(fileURLToPath(import.meta.url)), "..");
+  const fixtureDir = join(dirname(fileURLToPath(import.meta.url)), "fixtures");
+
+  beforeAll(() => {
+    execSync("pnpm build", { cwd: packageRoot, stdio: "pipe" });
+  });
+
+  it("built CLI --version persists markers via local HTTP stub; second run sends no cli_first_run", () => {
+    const integrationHome = mkdtempSync(join(tmpdir(), "agentreel-telemetry-cli-int-"));
+    const first = runTelemetryCliIntegration(fixtureDir, 200, integrationHome, false);
+    expect(first.requests).toHaveLength(1);
+    expect(first.requests[0]?.event).toBe("cli_first_run");
+    expect(first.telemetry?.first_run_sent).toBe(true);
+    expect(typeof first.telemetry?.anon_id).toBe("string");
+    expect(first.telemetry?.notice_shown).toBe(true);
+
+    const second = runTelemetryCliIntegration(fixtureDir, 200, integrationHome, true);
+    expect(second.requests).toHaveLength(0);
+  });
+
+  it("built CLI keeps local markers when stub returns non-2xx", () => {
+    const integrationHome = mkdtempSync(join(tmpdir(), "agentreel-telemetry-cli-int-"));
+    const result = runTelemetryCliIntegration(fixtureDir, 503, integrationHome, false);
+    expect(result.requests).toHaveLength(1);
+    expect(result.requests[0]?.event).toBe("cli_first_run");
+    expect(typeof result.telemetry?.anon_id).toBe("string");
+    expect(result.telemetry?.notice_shown).toBe(true);
+    expect(result.telemetry?.first_run_sent).not.toBe(true);
   });
 });
 
