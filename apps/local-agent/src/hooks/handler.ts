@@ -115,53 +115,56 @@ export async function handleClaudeHookInput(
   const type: EventType = HOOK_EVENT_TO_TYPE[hookEventName] ?? "unknown";
   const ts = deps.now ? deps.now() : Date.now();
   const sessionId = input.session_id ?? "unknown-session";
+  const capturePaused = isCapturePaused(deps.config ?? readConfig());
 
-  if (type === "session_start") {
-    upsertSession({
-      id: sessionId,
+  if (!capturePaused) {
+    if (type === "session_start") {
+      upsertSession({
+        id: sessionId,
+        tool: "claude-code",
+        startedAt: ts,
+        cwd: input.cwd,
+      });
+    } else if (type === "session_end") {
+      upsertSession({
+        id: sessionId,
+        tool: "claude-code",
+        startedAt: ts,
+        endedAt: ts,
+        cwd: input.cwd,
+      });
+    } else {
+      upsertSession({
+        id: sessionId,
+        tool: "claude-code",
+        startedAt: ts,
+        cwd: input.cwd,
+      });
+    }
+
+    try {
+      ensureSessionAttribution(sessionId, {
+        cwd: input.cwd,
+        tool: "claude-code",
+        toolVersion: () => claudeVersionFromTranscript(input.transcript_path),
+      });
+      if (type === "stop" || type === "session_end") recordSessionEndGit(sessionId, input.cwd);
+    } catch (err) {
+      logError(err);
+    }
+
+    const safePayload = scrubAny(applyIgnoreRules(input as never) as typeof input);
+    const event: AgentEvent = {
+      id: nanoid(),
+      sessionId,
       tool: "claude-code",
-      startedAt: ts,
+      type,
+      ts,
       cwd: input.cwd,
-    });
-  } else if (type === "session_end") {
-    upsertSession({
-      id: sessionId,
-      tool: "claude-code",
-      startedAt: ts,
-      endedAt: ts,
-      cwd: input.cwd,
-    });
-  } else {
-    upsertSession({
-      id: sessionId,
-      tool: "claude-code",
-      startedAt: ts,
-      cwd: input.cwd,
-    });
+      payload: safePayload,
+    };
+    insertEvent(event);
   }
-
-  try {
-    ensureSessionAttribution(sessionId, {
-      cwd: input.cwd,
-      tool: "claude-code",
-      toolVersion: () => claudeVersionFromTranscript(input.transcript_path),
-    });
-    if (type === "stop" || type === "session_end") recordSessionEndGit(sessionId, input.cwd);
-  } catch (err) {
-    logError(err);
-  }
-
-  const safePayload = scrubAny(applyIgnoreRules(input as never) as typeof input);
-  const event: AgentEvent = {
-    id: nanoid(),
-    sessionId,
-    tool: "claude-code",
-    type,
-    ts,
-    cwd: input.cwd,
-    payload: safePayload,
-  };
-  insertEvent(event);
 
   let stdout: string | null = null;
   let outcome: PreExecOutcome | undefined;
@@ -169,10 +172,12 @@ export async function handleClaudeHookInput(
   if (type === "tool_use_pre") {
     try {
       let attribution: Attribution | null = null;
-      try {
-        attribution = getSessionAttribution<Attribution>(sessionId);
-      } catch {
-        attribution = null;
+      if (!capturePaused) {
+        try {
+          attribution = getSessionAttribution<Attribution>(sessionId);
+        } catch {
+          attribution = null;
+        }
       }
       const req = extractClaudePreExecRequest(input, sessionId, ts, attribution);
       outcome = await enforcePreExec(req, deps);
@@ -185,10 +190,12 @@ export async function handleClaudeHookInput(
     }
   }
 
-  try {
-    recomputeSessionCost(sessionId, input.transcript_path);
-  } catch (err) {
-    logError(err);
+  if (!capturePaused) {
+    try {
+      recomputeSessionCost(sessionId, input.transcript_path);
+    } catch (err) {
+      logError(err);
+    }
   }
 
   return { stdout, outcome };
@@ -197,6 +204,8 @@ export async function handleClaudeHookInput(
 export interface RunHookOptions {
   /** Hook start timestamp in ms (defaults to Date.now(); cli.ts passes process timeOrigin). */
   hookStartMs?: number;
+  readStdin?: () => Promise<string>;
+  writeStdout?: (text: string) => void;
 }
 
 export async function runHook(
@@ -205,14 +214,11 @@ export async function runHook(
 ): Promise<void> {
   // Hooks must never block or fail Claude Code on internal errors. Wrap everything.
   const hookStartMs = opts.hookStartMs ?? Date.now();
+  const readInput = opts.readStdin ?? readStdin;
+  const writeOutput = opts.writeStdout ?? ((s: string) => process.stdout.write(s));
   try {
     const cfg = readConfig();
-    if (isCapturePaused(cfg)) {
-      await readStdin().catch(() => "");
-      return;
-    }
-
-    const raw = await readStdin();
+    const raw = await readInput();
     if (!raw.trim()) return;
     const input = JSON.parse(raw) as ClaudeCodeHookInput;
 
@@ -221,7 +227,9 @@ export async function runHook(
     // cursor_version. Record them as Cursor, or skip them when the native
     // Cursor hooks are installed so nothing is captured twice.
     if (isCursorPayload(input)) {
-      if (!nativeCursorHooksInstalled()) recordCursorHook(eventArg, input as never);
+      if (!isCapturePaused(cfg) && !nativeCursorHooksInstalled()) {
+        recordCursorHook(eventArg, input as never);
+      }
       return;
     }
 
@@ -233,7 +241,7 @@ export async function runHook(
       installedTimeoutS,
     });
     if (result.stdout) {
-      process.stdout.write(result.stdout + "\n");
+      writeOutput(result.stdout + "\n");
     }
   } catch (err) {
     logError(err);

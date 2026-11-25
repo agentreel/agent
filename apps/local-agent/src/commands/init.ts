@@ -150,13 +150,13 @@ export async function initCommand(opts: InitOptions = {}): Promise<void> {
   console.log(
     pc.dim("Privacy: ") +
       pc.cyan("agentreel pause") +
-      pc.dim(" to stop capturing temporarily, ") +
+      pc.dim(" to stop recording temporarily (org policy is still enforced), ") +
       pc.cyan("agentreel forget --all") +
       pc.dim(" to wipe local sessions."),
   );
   console.log(
     pc.dim("         Or set ") +
       pc.cyan("AGENTREEL_DISABLE=1") +
-      pc.dim(" before launching Claude Code to skip a single session.\n"),
+      pc.dim(" before launching Claude Code to skip recording a single session (org policy is still enforced).\n"),
   );
 }

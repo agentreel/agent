@@ -87,7 +87,7 @@ program
 
 program
   .command("pause")
-  .description("pause local capture — hooks and watcher no-op until `resume`")
+  .description("pause local capture (stops recording until `resume`; org policy is still enforced)")
   .action(() => {
     pauseCommand();
   });

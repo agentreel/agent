@@ -44,7 +44,7 @@ Get an API key at [agentreel.dev/dashboard/settings](https://agentreel.dev/dashb
 | `agentreel scan [session-id]` | Guard scan (local, no network) |
 | `agentreel watch` | Optional Cursor history watcher |
 | `agentreel config [key] [value]` | `hostname plain\|hash\|omit`, `attribution on\|off` |
-| `agentreel pause` / `agentreel resume` | Pause or resume local capture |
+| `agentreel pause` / `agentreel resume` | Pause or resume local recording (`AGENTREEL_DISABLE=1` skips one session; org policy is still enforced) |
 | `agentreel forget` | Remove sessions from the local buffer |
 | `agentreel logout` | Clear local API credentials |
 | `agentreel uninstall` | Remove installed hooks |

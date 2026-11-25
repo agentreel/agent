@@ -238,7 +238,10 @@ export async function handleCursorHookInput(
 ): Promise<HandleCursorHookResult> {
   const hook = canonicalHookName(input.hook_event_name) ?? canonicalHookName(eventArg);
   const ts = deps.now ? deps.now() : Date.now();
-  const sessionId = recordCursorHook(eventArg, input, ts) ?? cursorSessionId(input);
+  const capturePaused = isCapturePaused(deps.config ?? readConfig());
+  const sessionId = capturePaused
+    ? cursorSessionId(input)
+    : (recordCursorHook(eventArg, input, ts) ?? cursorSessionId(input));
 
   let decision: CursorPermissionDecision | undefined;
   let outcome: PreExecOutcome | undefined;
@@ -246,10 +249,12 @@ export async function handleCursorHookInput(
   if (hook && isCursorPreExecHook(hook)) {
     try {
       let attribution: Attribution | null = null;
-      try {
-        attribution = getSessionAttribution<Attribution>(sessionId);
-      } catch {
-        attribution = null;
+      if (!capturePaused) {
+        try {
+          attribution = getSessionAttribution<Attribution>(sessionId);
+        } catch {
+          attribution = null;
+        }
       }
       const req = extractCursorPreExecRequest(hook, input, sessionId, ts, attribution);
       outcome = await enforcePreExec(req, deps);
@@ -278,20 +283,24 @@ export async function handleCursorHookInput(
 export interface RunCursorHookOptions {
   /** Hook start timestamp in ms (defaults to Date.now(); cli.ts passes process timeOrigin). */
   hookStartMs?: number;
+  readStdin?: () => Promise<string>;
+  writeStdout?: (text: string) => void;
 }
 
-/** `agentreel cursor-hook <event>`: read JSON on stdin, record, enforce if pre-exec, answer. */
+/** `agentreel cursor-hook <event>`: read JSON on stdin, record (unless paused), enforce if pre-exec, answer. */
 export async function runCursorHook(
   eventArg?: string,
   opts: RunCursorHookOptions = {},
 ): Promise<void> {
   const hookStartMs = opts.hookStartMs ?? Date.now();
+  const readInput = opts.readStdin ?? readStdin;
+  const writeOutput = opts.writeStdout ?? ((s: string) => process.stdout.write(s));
   let hook = canonicalHookName(eventArg);
   let decision: CursorPermissionDecision | undefined;
   try {
-    const raw = await readStdin().catch(() => "");
+    const raw = await readInput().catch(() => "");
     const cfg = readConfig();
-    if (!isCapturePaused(cfg) && raw.trim()) {
+    if (raw.trim()) {
       const input = JSON.parse(raw) as CursorHookInput;
       hook = canonicalHookName(input.hook_event_name) ?? hook;
       const installedTimeoutS = getInstalledPreExecTimeoutS(cfg, "cursor");
@@ -308,6 +317,6 @@ export async function runCursorHook(
     decision = undefined;
   } finally {
     // Always answer, failing open to allow on pre-exec hooks if anything errored.
-    process.stdout.write(cursorHookResponse(hook, decision) + "\n");
+    writeOutput(cursorHookResponse(hook, decision) + "\n");
   }
 }

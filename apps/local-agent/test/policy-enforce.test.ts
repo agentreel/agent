@@ -22,6 +22,7 @@ const queue = await import("../src/upload/queue.js");
 const doctor = await import("../src/commands/doctor.js");
 const initMod = await import("../src/commands/init.js");
 const configMod = await import("../src/config.js");
+const pathsMod = await import("../src/paths.js");
 const { RULES } = await import("../src/guard/rules.js");
 
 const cursorFixtureRaw = readFileSync(
@@ -2774,5 +2775,171 @@ describe("eval timeout fail-closed enforcement and match preservation", () => {
     expect(staleOutcome.downgraded).toBe(true);
     expect(staleOutcome.timedOut).toBe(true);
     expect(staleOutcome.reason).toBe(enforce.STALE_FAIL_OPEN_REASON);
+  });
+});
+
+describe("pause and AGENTREEL_DISABLE=1 keep enforcing org policy without capture", () => {
+  afterEach(() => {
+    delete process.env.AGENTREEL_DISABLE;
+    configMod.writeConfig(makeConfig());
+  });
+
+  it("enforces block rules in Claude and Cursor while paused or AGENTREEL_DISABLE=1 and skips normal capture", async () => {
+    const policy = makeEnforcePolicy({ etag: "etag-paused-enforce" });
+    cache.writeCachedPolicyAtomic(
+      { policy, etag: policy.etag, fetched_at: Date.now() },
+      pathsMod.POLICY_PATH,
+    );
+
+    const modes = [
+      { label: "paused", paused: true, envDisable: undefined },
+      { label: "AGENTREEL_DISABLE=1", paused: false, envDisable: "1" },
+    ] as const;
+
+    for (const mode of modes) {
+      if (mode.envDisable) {
+        process.env.AGENTREEL_DISABLE = mode.envDisable;
+      } else {
+        delete process.env.AGENTREEL_DISABLE;
+      }
+      configMod.writeConfig(
+        makeConfig("http://127.0.0.1:1", undefined, {
+          paused: mode.paused,
+          pausedAt: mode.paused ? Date.now() : undefined,
+        }),
+      );
+
+      // 1. Claude Code blocked command via runHook -> MUST deny, and write no session or tool_use_pre capture
+      const claudeSessionId = `sess-claude-block-${mode.label}`;
+      const claudeOut: string[] = [];
+      await claudeHandler.runHook("PreToolUse", {
+        readStdin: async () =>
+          JSON.stringify({
+            session_id: claudeSessionId,
+            hook_event_name: "PreToolUse",
+            tool_name: "Bash",
+            tool_use_id: `tu-block-${mode.label}`,
+            cwd: workDir,
+            tool_input: { command: "git push --force origin main" },
+          }),
+        writeStdout: (s) => claudeOut.push(s),
+      });
+
+      expect(claudeOut.length).toBe(1);
+      const claudeDecision = JSON.parse(claudeOut[0]!);
+      expect(claudeDecision.hookSpecificOutput.permissionDecision).toBe("deny");
+      expect(claudeDecision.hookSpecificOutput.permissionDecisionReason).toContain(
+        "Blocked by Acme Corp policy",
+      );
+
+      const database = db.getDb();
+      const claudeSessionRows = database
+        .prepare("SELECT * FROM sessions WHERE id = ?")
+        .all(claudeSessionId);
+      expect(claudeSessionRows.length).toBe(0);
+
+      const claudeEventRows = database
+        .prepare("SELECT type FROM events WHERE session_id = ?")
+        .all(claudeSessionId) as Array<{ type: string }>;
+      // Only policy_decision required by enforcement, never tool_use_pre capture
+      expect(claudeEventRows.map((r) => r.type)).toEqual(["policy_decision"]);
+
+      // 2. Claude Code benign command while paused/disabled -> allowed, ZERO rows written
+      const claudeBenignId = `sess-claude-benign-${mode.label}`;
+      const claudeBenignOut: string[] = [];
+      await claudeHandler.runHook("PreToolUse", {
+        readStdin: async () =>
+          JSON.stringify({
+            session_id: claudeBenignId,
+            hook_event_name: "PreToolUse",
+            tool_name: "Bash",
+            tool_use_id: `tu-ok-${mode.label}`,
+            cwd: workDir,
+            tool_input: { command: "echo hello" },
+          }),
+        writeStdout: (s) => claudeBenignOut.push(s),
+      });
+      expect(claudeBenignOut.length).toBe(0);
+      expect(
+        database.prepare("SELECT * FROM sessions WHERE id = ?").all(claudeBenignId).length,
+      ).toBe(0);
+      expect(
+        database.prepare("SELECT * FROM events WHERE session_id = ?").all(claudeBenignId).length,
+      ).toBe(0);
+
+      // 3. Cursor blocked command via runCursorHook -> MUST deny, and write no session or tool capture
+      const cursorConvId = `conv-cursor-block-${mode.label}`;
+      const cursorSessionId = `cursor-${cursorConvId}`;
+      const cursorOut: string[] = [];
+      await cursorRunner.runCursorHook("beforeShellExecution", {
+        readStdin: async () =>
+          JSON.stringify({
+            ...cursorBaseInput,
+            conversation_id: cursorConvId,
+            generation_id: `gen-block-${mode.label}`,
+            hook_event_name: "beforeShellExecution",
+            command: "git push --force origin main",
+            cwd: workDir,
+          }),
+        writeStdout: (s) => cursorOut.push(s),
+      });
+
+      expect(cursorOut.length).toBe(1);
+      const cursorDecision = JSON.parse(cursorOut[0]!);
+      expect(cursorDecision.permission).toBe("deny");
+      expect(cursorDecision.user_message).toContain("Blocked by Acme Corp policy");
+      expect(cursorDecision.agent_message).toContain("Blocked by Acme Corp policy");
+
+      expect(
+        database.prepare("SELECT * FROM sessions WHERE id = ?").all(cursorSessionId).length,
+      ).toBe(0);
+      const cursorEventRows = database
+        .prepare("SELECT type FROM events WHERE session_id = ?")
+        .all(cursorSessionId) as Array<{ type: string }>;
+      expect(cursorEventRows.map((r) => r.type)).toEqual(["policy_decision"]);
+
+      // 4. Cursor benign command while paused/disabled -> allow, ZERO rows written
+      const cursorBenignConv = `conv-cursor-benign-${mode.label}`;
+      const cursorBenignSid = `cursor-${cursorBenignConv}`;
+      const cursorBenignOut: string[] = [];
+      await cursorRunner.runCursorHook("beforeShellExecution", {
+        readStdin: async () =>
+          JSON.stringify({
+            ...cursorBaseInput,
+            conversation_id: cursorBenignConv,
+            generation_id: `gen-ok-${mode.label}`,
+            hook_event_name: "beforeShellExecution",
+            command: "echo hello",
+            cwd: workDir,
+          }),
+        writeStdout: (s) => cursorBenignOut.push(s),
+      });
+      expect(JSON.parse(cursorBenignOut[0]!).permission).toBe("allow");
+      expect(
+        database.prepare("SELECT * FROM sessions WHERE id = ?").all(cursorBenignSid).length,
+      ).toBe(0);
+      expect(
+        database.prepare("SELECT * FROM events WHERE session_id = ?").all(cursorBenignSid).length,
+      ).toBe(0);
+    }
+
+    // 5. Doctor output reports capture paused while org policy enforcement remains active
+    delete process.env.AGENTREEL_DISABLE;
+    const claudeSettings = join(workDir, "claude-paused.json");
+    const cursorHooks = join(workDir, "cursor-paused.json");
+    claudeInstall.installClaudeCodeHooks("/usr/local/bin/agentreel", claudeSettings);
+    cursorInstall.installCursorHooks("/usr/local/bin/agentreel", cursorHooks);
+    const report = doctor.inspectDoctorState({
+      cachePath: pathsMod.POLICY_PATH,
+      guardConfigPath,
+      claudeSettingsPath: claudeSettings,
+      cursorHooksPath: cursorHooks,
+      config: makeConfig("http://127.0.0.1:1", undefined, { paused: true, pausedAt: Date.now() }),
+    });
+    expect(report.capturePaused).toBe(true);
+    expect(report.enforcementActive).toBe(true);
+    const formatted = doctor.formatDoctorReport(report);
+    expect(formatted).toContain("paused (recording stopped; org policy still enforced)");
+    expect(formatted).toContain("active (enforce)");
   });
 });

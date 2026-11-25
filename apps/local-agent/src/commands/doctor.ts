@@ -115,7 +115,6 @@ export function inspectDoctorState(opts: DoctorInspectOptions = {}): DoctorRepor
   const capturePaused = isCapturePaused(cfg);
 
   const enforcementActive =
-    !capturePaused &&
     loaded.source === "server_cache" &&
     policy !== null &&
     policy.mode === "enforce" &&
@@ -201,18 +200,20 @@ function formatRecordedTimeoutLabel(
 }
 
 export function formatDoctorReport(report: DoctorReport): string {
-  const enforcementLabel = report.capturePaused
-    ? pc.yellow("paused (capture disabled)")
-    : report.enforcementActive
-      ? pc.green("active (enforce)")
-      : report.policySource === "server_cache" &&
-          report.mode === "enforce" &&
-          report.offline === "fail_open" &&
-          report.stale
-        ? pc.yellow("paused (policy stale, fail_open)")
-        : report.policyLoaded
-          ? pc.yellow(`observe only (${report.mode})`)
-          : pc.dim("inactive (no policy loaded)");
+  const enforcementLabel = report.enforcementActive
+    ? pc.green("active (enforce)")
+    : report.policySource === "server_cache" &&
+        report.mode === "enforce" &&
+        report.offline === "fail_open" &&
+        report.stale
+      ? pc.yellow("paused (policy stale, fail_open)")
+      : report.policyLoaded
+        ? pc.yellow(`observe only (${report.mode})`)
+        : pc.dim("inactive (no policy loaded)");
+
+  const captureLabel = report.capturePaused
+    ? pc.yellow("paused (recording stopped; org policy still enforced)")
+    : pc.green("active");
 
   const claudeLine = !report.claude.preToolUseInstalled
     ? pc.yellow("PreToolUse not installed (run `agentreel init`)")
@@ -234,6 +235,7 @@ export function formatDoctorReport(report: DoctorReport): string {
   const lines = [
     pc.bold(pc.cyan("AgentReel doctor")),
     "",
+    `  capture:        ${captureLabel}`,
     `  enforcement:    ${enforcementLabel}`,
     `  policy loaded:  ${report.policyLoaded ? pc.green("yes") : pc.dim("no")} (${report.policySource})`,
     `  mode:           ${report.policyLoaded ? report.mode : pc.dim("none")}`,
