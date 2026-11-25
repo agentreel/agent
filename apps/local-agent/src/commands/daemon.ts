@@ -17,9 +17,34 @@ import { flushOnce, nextAttemptAt } from "../upload/flush.js";
 import { MAX_BATCH_BYTES } from "../upload/queue.js";
 import { IngestError } from "../upload/client.js";
 import { readConfig } from "../config.js";
+import {
+  fetchPolicy,
+  POLICY_REFRESH_INTERVAL_MS,
+  type FetchPolicyResult,
+} from "../policy/fetch.js";
 
 const TICK_INTERVAL_MS = 30_000;
 const EARLY_FLUSH_BYTES = MAX_BATCH_BYTES; // flush early once pending crosses 1 MB
+
+export function createPolicyRefresher(
+  intervalMs: number = POLICY_REFRESH_INTERVAL_MS,
+  fetchFn: () => Promise<FetchPolicyResult> = () => fetchPolicy(),
+  monoNow: () => number = () => performance.now(),
+): () => Promise<FetchPolicyResult | null> {
+  let lastAttemptMono: number | null = null;
+  return async () => {
+    const current = monoNow();
+    if (lastAttemptMono !== null && current - lastAttemptMono < intervalMs) {
+      return null;
+    }
+    lastAttemptMono = current;
+    try {
+      return await fetchFn();
+    } catch {
+      return null;
+    }
+  };
+}
 
 export interface DaemonOpts {
   detach?: boolean;
@@ -66,18 +91,30 @@ export async function daemonCommand(opts: DaemonOpts = {}): Promise<void> {
   console.log(pc.dim(`  tick: every ${TICK_INTERVAL_MS / 1000}s, early flush at ${(EARLY_FLUSH_BYTES / 1024).toFixed(0)} KB`));
   console.log(pc.dim("  Ctrl-C to stop"));
 
+  const maybeRefreshPolicy = createPolicyRefresher();
+
   // Loop until killed. Each iteration:
-  //   1. honor backoff (next_attempt_at) before doing anything
-  //   2. drain the queue in batches as long as moreAvailable
-  //   3. sleep up to 30s, but wake early if pending bytes cross 1 MB
+  //   1. refresh cached org policy every 5 minutes (quiet on failure)
+  //   2. honor backoff (next_attempt_at) before uploading
+  //   3. drain the queue in batches as long as moreAvailable
+  //   4. sleep up to 30s, but wake early if pending bytes cross 1 MB
   for (;;) {
     if (stopping) return;
+
+    const policyRes = await maybeRefreshPolicy();
+    if (policyRes?.status === "updated") {
+      console.log(
+        pc.dim(`  [${ts()}]`) +
+          pc.green(" ✓") +
+          ` policy updated (${policyRes.policy.mode}, etag ${policyRes.etag})`,
+      );
+    }
 
     // Backoff: if a prior failure scheduled a retry in the future, wait.
     const nextAt = nextAttemptAt();
     const now = Date.now();
     if (nextAt > now) {
-      await sleepInterruptible(nextAt - now, () => stopping);
+      await sleepInterruptible(Math.min(nextAt - now, TICK_INTERVAL_MS), () => stopping);
       continue;
     }
 

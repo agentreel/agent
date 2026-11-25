@@ -1,0 +1,184 @@
+import { appendFileSync } from "node:fs";
+import { readConfig, type AgentConfig } from "../config.js";
+import { ensureAgentreelDir, LOG_PATH, POLICY_PATH } from "../paths.js";
+import {
+  POLICY_REFRESH_INTERVAL_MS,
+  readCachedPolicy,
+  shouldRefreshPolicy,
+  writeCachedPolicyAtomic,
+} from "./cache.js";
+import { validatePolicy, type Policy } from "./types.js";
+
+export { POLICY_REFRESH_INTERVAL_MS, shouldRefreshPolicy };
+
+export const POLICY_FETCH_TIMEOUT_MS = 10_000;
+
+export type FetchPolicyResult =
+  | { status: "unlinked" }
+  | { status: "updated"; policy: Policy; etag: string; fetchedAt: number }
+  | { status: "not_modified"; policy: Policy; etag: string; fetchedAt: number }
+  | { status: "invalid_policy"; error: string; keptCache: boolean }
+  | {
+      status: "kept_cache";
+      reason: string;
+      httpStatus?: number;
+      keptCache: boolean;
+    };
+
+export interface FetchPolicyOptions {
+  config?: AgentConfig;
+  cachePath?: string;
+  timeoutMs?: number;
+  now?: () => number;
+  fetchImpl?: typeof fetch;
+  log?: (message: string) => void;
+}
+
+function defaultLog(message: string): void {
+  try {
+    ensureAgentreelDir();
+    appendFileSync(
+      LOG_PATH,
+      `[${new Date().toISOString()}] policy: ${message}\n`,
+    );
+  } catch {
+    // Logging must never crash the daemon or CLI.
+  }
+}
+
+/**
+ * Fetches GET ${apiBaseUrl}/api/v1/policy using the linked API key and cached ETag.
+ * Keeps the last-known cache on any error, non-200/304 status, or invalid payload.
+ * Never throws.
+ */
+export async function fetchPolicy(
+  opts: FetchPolicyOptions = {},
+): Promise<FetchPolicyResult> {
+  const log = opts.log ?? defaultLog;
+  const cachePath = opts.cachePath ?? POLICY_PATH;
+  const nowFn = opts.now ?? Date.now;
+  const timeoutMs = opts.timeoutMs ?? POLICY_FETCH_TIMEOUT_MS;
+  const fetchImpl = opts.fetchImpl ?? globalThis.fetch;
+
+  try {
+    const cfg = opts.config ?? readConfig();
+    if (!cfg.apiKey) {
+      return { status: "unlinked" };
+    }
+
+    const cached = readCachedPolicy(cachePath);
+    const url = `${cfg.apiBaseUrl.replace(/\/$/, "")}/api/v1/policy`;
+    const headers: Record<string, string> = {
+      accept: "application/json",
+      authorization: `Bearer ${cfg.apiKey}`,
+    };
+    if (cached?.etag) {
+      headers["if-none-match"] = cached.etag;
+    }
+
+    const controller = new AbortController();
+    const timer = setTimeout(() => controller.abort(), timeoutMs);
+
+    let res: Response;
+    try {
+      res = await fetchImpl(url, {
+        method: "GET",
+        headers,
+        signal: controller.signal,
+      });
+    } catch (err) {
+      const e = err as Error;
+      const reason =
+        e?.name === "AbortError"
+          ? `timeout after ${timeoutMs}ms`
+          : e?.message || "network error";
+      log(`fetch failed (${reason}); keeping last-known cache`);
+      return { status: "kept_cache", reason, keptCache: cached !== null };
+    } finally {
+      clearTimeout(timer);
+    }
+
+    if (res.status === 304) {
+      if (!cached) {
+        log("received 304 Not Modified without a valid cached policy");
+        return {
+          status: "kept_cache",
+          reason: "http-304 without cached policy",
+          httpStatus: 304,
+          keptCache: false,
+        };
+      }
+      const fetchedAt = nowFn();
+      writeCachedPolicyAtomic(
+        {
+          policy: cached.policy,
+          etag: cached.etag,
+          fetched_at: fetchedAt,
+        },
+        cachePath,
+      );
+      return {
+        status: "not_modified",
+        policy: cached.policy,
+        etag: cached.etag,
+        fetchedAt,
+      };
+    }
+
+    if (res.status === 200) {
+      let body: unknown;
+      try {
+        body = await res.json();
+      } catch {
+        log("received invalid JSON from policy endpoint; keeping last-known cache");
+        return {
+          status: "invalid_policy",
+          error: "invalid JSON body",
+          keptCache: cached !== null,
+        };
+      }
+
+      const validated = validatePolicy(body);
+      if (!validated.ok) {
+        log(`rejected invalid policy (${validated.error}); keeping last-known cache`);
+        return {
+          status: "invalid_policy",
+          error: validated.error,
+          keptCache: cached !== null,
+        };
+      }
+
+      const policy = validated.value;
+      const etag = policy.etag;
+      const fetchedAt = nowFn();
+      writeCachedPolicyAtomic(
+        {
+          policy,
+          etag,
+          fetched_at: fetchedAt,
+        },
+        cachePath,
+      );
+      return {
+        status: "updated",
+        policy,
+        etag,
+        fetchedAt,
+      };
+    }
+
+    log(`policy endpoint returned HTTP ${res.status}; keeping last-known cache`);
+    return {
+      status: "kept_cache",
+      reason: `http-${res.status}`,
+      httpStatus: res.status,
+      keptCache: cached !== null,
+    };
+  } catch (err) {
+    const e = err as Error;
+    const reason = e?.message || "unexpected error";
+    log(`unexpected policy fetch error (${reason})`);
+    const hasCache = readCachedPolicy(cachePath) !== null;
+    return { status: "kept_cache", reason, keptCache: hasCache };
+  }
+}

@@ -1,0 +1,226 @@
+import { randomBytes } from "node:crypto";
+import {
+  chmodSync,
+  existsSync,
+  mkdirSync,
+  readFileSync,
+  renameSync,
+  unlinkSync,
+  writeFileSync,
+} from "node:fs";
+import { dirname } from "node:path";
+import type { GuardConfig } from "../guard/types.js";
+import { GUARD_CONFIG_PATH, POLICY_PATH } from "../paths.js";
+import {
+  isValidSeverity,
+  validateCachedPolicyFile,
+  type BuiltinRuleOverride,
+  type CachedPolicyFile,
+  type Policy,
+} from "./types.js";
+
+export const POLICY_REFRESH_INTERVAL_MS = 5 * 60_000;
+
+export type PolicySource = "server_cache" | "local_fallback" | "none";
+
+export interface LoadedPolicy {
+  source: PolicySource;
+  policy: Policy | null;
+  etag: string | null;
+  fetchedAt: number | null;
+}
+
+export interface PolicyAgeInfo {
+  ageMs: number;
+  clockSkewed: boolean;
+}
+
+/**
+ * Reads and validates ~/.agentreel/policy.json.
+ * Corrupt, invalid, or unreadable cache files are treated as no cache and never throw.
+ */
+export function readCachedPolicy(
+  cachePath: string = POLICY_PATH,
+): CachedPolicyFile | null {
+  try {
+    if (!existsSync(cachePath)) return null;
+    const raw = readFileSync(cachePath, "utf8");
+    const parsed: unknown = JSON.parse(raw);
+    const validated = validateCachedPolicyFile(parsed);
+    return validated.ok ? validated.value : null;
+  } catch {
+    return null;
+  }
+}
+
+/**
+ * Atomically writes the cached policy file with 0600 permissions (temp file then rename).
+ */
+export function writeCachedPolicyAtomic(
+  entry: CachedPolicyFile,
+  cachePath: string = POLICY_PATH,
+): void {
+  const dir = dirname(cachePath);
+  mkdirSync(dir, { recursive: true });
+  const suffix = randomBytes(6).toString("hex");
+  const tmpPath = `${cachePath}.tmp.${process.pid}.${suffix}`;
+  const serialized = JSON.stringify(entry, null, 2) + "\n";
+
+  try {
+    writeFileSync(tmpPath, serialized, { encoding: "utf8", mode: 0o600 });
+    try {
+      chmodSync(tmpPath, 0o600);
+    } catch {
+      // Non-Unix filesystem without mode bits: best effort.
+    }
+    renameSync(tmpPath, cachePath);
+  } catch (err) {
+    try {
+      unlinkSync(tmpPath);
+    } catch {
+      // Ignore cleanup failures.
+    }
+    throw err;
+  }
+}
+
+function toStringArray(v: unknown): string[] {
+  if (!Array.isArray(v)) return [];
+  return v.filter((item): item is string => typeof item === "string");
+}
+
+/**
+ * Converts a local guard-config.json object into an observe-mode Policy.
+ */
+export function guardConfigToPolicy(guardConfig: Partial<GuardConfig>): Policy {
+  const builtin: Record<string, BuiltinRuleOverride> = {};
+  if (
+    guardConfig.rules &&
+    typeof guardConfig.rules === "object" &&
+    !Array.isArray(guardConfig.rules)
+  ) {
+    for (const [ruleId, ruleCfg] of Object.entries(guardConfig.rules)) {
+      if (!ruleId.trim() || !ruleCfg || typeof ruleCfg !== "object") continue;
+      if (typeof ruleCfg.enabled !== "boolean") continue;
+      builtin[ruleId] = {
+        enabled: ruleCfg.enabled,
+        action: "flag",
+        ...(isValidSeverity(ruleCfg.severity)
+          ? { severity: ruleCfg.severity }
+          : {}),
+      };
+    }
+  }
+
+  return {
+    version: 1,
+    etag: "local-guard-config",
+    workspace_id: "local",
+    updated_at: 0,
+    mode: "observe",
+    offline: "last_known",
+    builtin,
+    custom: [],
+    allow: {
+      commands: toStringArray(guardConfig.allowlists?.commands),
+      paths: toStringArray(guardConfig.allowlists?.paths),
+      repos: [],
+    },
+  };
+}
+
+function readLocalGuardFallback(guardConfigPath: string): Policy | null {
+  try {
+    if (!existsSync(guardConfigPath)) return null;
+    const raw = readFileSync(guardConfigPath, "utf8");
+    const parsed: unknown = JSON.parse(raw);
+    if (
+      typeof parsed !== "object" ||
+      parsed === null ||
+      Array.isArray(parsed)
+    ) {
+      return null;
+    }
+    const cfg = parsed as Partial<GuardConfig>;
+    if (cfg.enabled === false || cfg.policyMode === "off") {
+      return null;
+    }
+    return guardConfigToPolicy(cfg);
+  } catch {
+    return null;
+  }
+}
+
+export interface LoadPolicyOptions {
+  cachePath?: string;
+  guardConfigPath?: string;
+}
+
+/**
+ * Loads the active policy from the server cache, falling back to local
+ * guard-config.json in observe mode when no valid server policy is cached.
+ * Never throws.
+ */
+export function loadEffectivePolicy(
+  opts: LoadPolicyOptions = {},
+): LoadedPolicy {
+  const cachePath = opts.cachePath ?? POLICY_PATH;
+  const guardConfigPath = opts.guardConfigPath ?? GUARD_CONFIG_PATH;
+
+  const cached = readCachedPolicy(cachePath);
+  if (cached) {
+    return {
+      source: "server_cache",
+      policy: cached.policy,
+      etag: cached.etag,
+      fetchedAt: cached.fetched_at,
+    };
+  }
+
+  const fallback = readLocalGuardFallback(guardConfigPath);
+  if (fallback) {
+    return {
+      source: "local_fallback",
+      policy: fallback,
+      etag: null,
+      fetchedAt: null,
+    };
+  }
+
+  return {
+    source: "none",
+    policy: null,
+    etag: null,
+    fetchedAt: null,
+  };
+}
+
+/**
+ * Returns non-negative cache age and whether fetched_at lies in the future.
+ */
+export function getPolicyCacheAgeMs(
+  fetchedAt: number,
+  now: number = Date.now(),
+): PolicyAgeInfo {
+  if (!Number.isFinite(fetchedAt)) {
+    return { ageMs: 0, clockSkewed: true };
+  }
+  if (fetchedAt > now) {
+    return { ageMs: 0, clockSkewed: true };
+  }
+  return { ageMs: now - fetchedAt, clockSkewed: false };
+}
+
+/**
+ * Returns true if the cached policy is missing, stale, or skewed into the future.
+ */
+export function shouldRefreshPolicy(
+  cached: CachedPolicyFile | null,
+  now: number = Date.now(),
+  intervalMs: number = POLICY_REFRESH_INTERVAL_MS,
+): boolean {
+  if (!cached) return true;
+  if (!Number.isFinite(cached.fetched_at)) return true;
+  if (cached.fetched_at > now) return true;
+  return now - cached.fetched_at >= intervalMs;
+}
