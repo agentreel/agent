@@ -23,6 +23,10 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - Pre-execution hook timeout installation in `agentreel init` (130s default, or max rule expiry plus 10s, applied idempotently only to Claude `PreToolUse` and Cursor `preToolUse`, `beforeShellExecution`, `beforeMCPExecution`, `beforeReadFile`; other hooks remain at 5s), recorded per host in `~/.agentreel/config.json`, enforced via a process-start hook deadline (installed timeout minus 5s margin) and pre-request `expires_s` check so hooks never time out into an unapproved allow.
 - `agentreel doctor` CLI command reporting enforcement state, policy load status, mode, cache ETag age, recorded per-host pre-exec hook timeouts, re-init warnings when policy max `expires_s` exceeds installed timeouts, and pre-exec hook installation and timeout checks.
 
+### Fixed
+
+- Regex escape decoding, multi-unbounded leading-literal requirement, and `agentreel doctor` no-cache rejection wording: `isRe2SafePattern` now decodes `\xHH`, `\uHHHH`, and `\u{H...}` as single characters (both outside and inside `[...]`) while rejecting `\p{...}`, `\P{...}`, `\cX`, and malformed hex/Unicode escapes (`> 0x10FFFF` or bad hex); patterns with 2+ unbounded quantifiers now require a mandatory leading literal (or literal-only bounded token, including a literal-only alternation group like `(DROP|TRUNCATE)`) after an optional `^` before the first unbounded quantifier (rejecting `\w+\s+\w+`, `\S+\s+\S+`, `[a-z]+@[a-z]+`, and `a+\s+b+`, while leaving single-unbounded patterns unaffected); and `agentreel doctor` / `fetchPolicy` now report `the rejected policy was not installed and org enforcement is off until a valid policy is cached` instead of `last known policy still in use` when a first fetch is rejected with no cached server policy.
+
 ## [0.2.4] - 2026-11-21
 
 ### Fixed
