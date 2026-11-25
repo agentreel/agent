@@ -10,7 +10,10 @@ import type {
   PolicyAction,
   PolicyDecisionAction,
   PolicyTool,
+  RuleApprovalConfig,
 } from "./types.js";
+
+export const POLICY_EVAL_DEADLINE_MS = 50;
 
 export interface PolicyEvalInput {
   tool: PolicyTool;
@@ -19,6 +22,7 @@ export interface PolicyEvalInput {
   file_path?: string;
   url?: string;
   mcp_tool?: string;
+  toolInput?: unknown;
   repo?: string;
   branch?: string;
   member?: string;
@@ -31,6 +35,7 @@ export interface PolicyRuleMatch {
   action: PolicyAction;
   severity: Severity;
   source: "builtin" | "custom";
+  approval?: RuleApprovalConfig;
 }
 
 export interface PolicyEvalResult {
@@ -39,6 +44,12 @@ export interface PolicyEvalResult {
   matches: PolicyRuleMatch[];
   downgraded: boolean;
   original_action?: PolicyAction;
+  timed_out?: boolean;
+}
+
+export interface PolicyEvalOptions {
+  deadlineMs?: number;
+  nowMs?: () => number;
 }
 
 const ACTION_RANK: Record<PolicyDecisionAction, number> = {
@@ -120,7 +131,6 @@ export function matchGlob(
         if (matched) curr[j] = 1;
       }
     } else if (tok.kind === "globstar_slash") {
-      // Matches zero segments (empty) or any prefix ending with "/".
       let seenPrefix = false;
       for (let j = 0; j <= n; j++) {
         if (prev[j]) {
@@ -259,6 +269,21 @@ interface FieldCandidate {
   pathAware: boolean;
 }
 
+interface EvalClock {
+  deadline: number;
+  nowMs: () => number;
+  timedOut: boolean;
+}
+
+function checkExpired(clock: EvalClock): boolean {
+  if (clock.timedOut) return true;
+  if (clock.nowMs() >= clock.deadline) {
+    clock.timedOut = true;
+    return true;
+  }
+  return false;
+}
+
 function extractFieldCandidates(
   field: CustomRuleCondition["field"],
   input: PolicyEvalInput,
@@ -309,7 +334,10 @@ function extractFieldCandidates(
 function matchConditionAgainstCandidate(
   cond: CustomRuleCondition,
   candidate: FieldCandidate,
+  clock: EvalClock,
 ): boolean {
+  if (checkExpired(clock)) return false;
+
   const caseSensitive = cond.case_sensitive === true;
   const hay = caseSensitive ? candidate.value : candidate.value.toLowerCase();
   const needle = caseSensitive ? cond.value : cond.value.toLowerCase();
@@ -329,9 +357,35 @@ function matchConditionAgainstCandidate(
         candidate.pathAware,
       );
     case "regex": {
-      const re = compileSafeRegex(cond.value, { caseSensitive });
+      const remainingBeforeCompile = clock.deadline - clock.nowMs();
+      if (remainingBeforeCompile <= 0) {
+        clock.timedOut = true;
+        return false;
+      }
+      const re = compileSafeRegex(cond.value, {
+        caseSensitive,
+        timeoutMs: Math.max(1, Math.ceil(remainingBeforeCompile)),
+        onTimeout: () => {
+          clock.timedOut = true;
+        },
+      });
+      if (checkExpired(clock)) return false;
       if (!re) return false;
-      return testSafeRegex(re, candidate.value);
+      const remainingBeforeTest = clock.deadline - clock.nowMs();
+      if (remainingBeforeTest <= 0) {
+        clock.timedOut = true;
+        return false;
+      }
+      const matched = testSafeRegex(
+        re,
+        candidate.value,
+        Math.max(1, Math.ceil(remainingBeforeTest)),
+        () => {
+          clock.timedOut = true;
+        },
+      );
+      if (checkExpired(clock)) return false;
+      return matched;
     }
   }
 }
@@ -339,17 +393,33 @@ function matchConditionAgainstCandidate(
 function matchesCondition(
   cond: CustomRuleCondition,
   input: PolicyEvalInput,
+  clock: EvalClock,
 ): boolean {
+  if (checkExpired(clock)) return false;
   const candidates = extractFieldCandidates(cond.field, input);
   if (candidates.length === 0) return false;
-  return candidates.some((c) => matchConditionAgainstCandidate(cond, c));
+  for (const c of candidates) {
+    if (checkExpired(clock)) return false;
+    if (matchConditionAgainstCandidate(cond, c, clock)) return true;
+    if (clock.timedOut) return false;
+  }
+  return false;
 }
 
-function matchesCustomRule(rule: CustomRule, input: PolicyEvalInput): boolean {
+function matchesCustomRule(
+  rule: CustomRule,
+  input: PolicyEvalInput,
+  clock: EvalClock,
+): boolean {
+  if (checkExpired(clock)) return false;
   if (!rule.enabled) return false;
   if (!rule.when || rule.when.length === 0) return false;
   if (!matchesScope(rule.scope, input)) return false;
-  return rule.when.every((cond) => matchesCondition(cond, input));
+  for (const cond of rule.when) {
+    if (!matchesCondition(cond, input, clock)) return false;
+    if (clock.timedOut) return false;
+  }
+  return true;
 }
 
 function buildBuiltinMatchContext(input: PolicyEvalInput): MatchContext {
@@ -359,6 +429,7 @@ function buildBuiltinMatchContext(input: PolicyEvalInput): MatchContext {
   if (input.file_path !== undefined) payload.file_path = input.file_path;
   if (input.url !== undefined) payload.url = input.url;
   if (input.mcp_tool !== undefined) payload.mcp_tool = input.mcp_tool;
+  if (input.toolInput !== undefined) payload.tool_input = input.toolInput;
 
   return {
     command: input.command,
@@ -367,16 +438,36 @@ function buildBuiltinMatchContext(input: PolicyEvalInput): MatchContext {
   };
 }
 
+function timedOutResult(): PolicyEvalResult {
+  return {
+    action: "allow",
+    rule_ids: [],
+    matches: [],
+    downgraded: false,
+    timed_out: true,
+  };
+}
+
 /**
  * Pure, synchronous, network-free policy evaluator.
  * Evaluates built-in Guard rules with policy overrides first, then custom rules,
- * honoring allow lists, scope, strictest-wins precedence, and observe mode.
+ * honoring allow lists, scope, strictest-wins precedence, observe mode, and
+ * a total evaluation deadline (fail-open to allow when exceeded).
  */
 export function evaluatePolicy(
   input: PolicyEvalInput,
   policy: Policy,
   builtinRules: Rule[] = RULES,
+  opts: PolicyEvalOptions = {},
 ): PolicyEvalResult {
+  const nowMs = opts.nowMs ?? (() => performance.now());
+  const deadlineMs = opts.deadlineMs ?? POLICY_EVAL_DEADLINE_MS;
+  const clock: EvalClock = {
+    deadline: nowMs() + deadlineMs,
+    nowMs,
+    timedOut: false,
+  };
+
   if (isExemptByAllowLists(input, policy)) {
     return {
       action: "allow",
@@ -390,12 +481,14 @@ export function evaluatePolicy(
   const ctx = buildBuiltinMatchContext(input);
 
   for (const rule of builtinRules) {
+    if (checkExpired(clock)) return timedOutResult();
     const override = policy.builtin[rule.id];
     const enabled = override !== undefined ? override.enabled : rule.enabled;
     if (!enabled) continue;
 
     const effectiveRule: Rule = rule.enabled ? rule : { ...rule, enabled: true };
     const finding = matchRule(effectiveRule, ctx);
+    if (checkExpired(clock)) return timedOutResult();
     if (!finding) continue;
 
     const action: PolicyAction = override?.action ?? "flag";
@@ -407,11 +500,16 @@ export function evaluatePolicy(
       action,
       severity,
       source: "builtin",
+      ...(override?.approval ? { approval: override.approval } : {}),
     });
   }
 
   for (const rule of policy.custom) {
-    if (!matchesCustomRule(rule, input)) continue;
+    if (checkExpired(clock)) return timedOutResult();
+    if (!matchesCustomRule(rule, input, clock)) {
+      if (clock.timedOut) return timedOutResult();
+      continue;
+    }
     matches.push({
       rule_id: rule.id,
       name: rule.name,
@@ -419,8 +517,11 @@ export function evaluatePolicy(
       action: rule.action,
       severity: rule.severity,
       source: "custom",
+      ...(rule.approval ? { approval: rule.approval } : {}),
     });
   }
+
+  if (checkExpired(clock)) return timedOutResult();
 
   if (matches.length === 0) {
     return {

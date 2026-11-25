@@ -5,6 +5,7 @@ import { matchAllRules, calculateRiskScore } from "./matcher.js";
 import { readGuardConfig } from "./config.js";
 
 export function scanEvent(event: AgentEvent): Finding[] {
+  if (event.type === "policy_decision") return [];
   const config = readGuardConfig();
 
   const context: MatchContext = {
@@ -30,7 +31,7 @@ export function scanSession(
 
   for (let i = 0; i < events.length; i++) {
     const event = events[i];
-    if (!event) continue;
+    if (!event || event.type === "policy_decision") continue;
 
     const recentEvents = events
       .slice(Math.max(0, i - 10), i)

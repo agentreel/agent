@@ -7,6 +7,8 @@ export interface AgentConfig {
   apiKey?: string;
   apiBaseUrl: string;
   workspaceId?: string;
+  orgName?: string;
+  orgSlug?: string;
   installedAt?: number;
   hooksInstalled?: boolean;
   /** When true, hooks + watcher no-op (don't capture). Toggled via

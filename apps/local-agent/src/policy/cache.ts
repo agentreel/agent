@@ -20,6 +20,7 @@ import {
 } from "./types.js";
 
 export const POLICY_REFRESH_INTERVAL_MS = 5 * 60_000;
+export const POLICY_STALE_MS = 24 * 60 * 60_000;
 
 export type PolicySource = "server_cache" | "local_fallback" | "none";
 
@@ -223,4 +224,14 @@ export function shouldRefreshPolicy(
   if (!Number.isFinite(cached.fetched_at)) return true;
   if (cached.fetched_at > now) return true;
   return now - cached.fetched_at >= intervalMs;
+}
+
+export function isPolicyCacheStale(
+  fetchedAt: number | null,
+  now: number = Date.now(),
+  staleMs: number = POLICY_STALE_MS,
+): boolean {
+  if (fetchedAt === null || !Number.isFinite(fetchedAt)) return true;
+  const { ageMs } = getPolicyCacheAgeMs(fetchedAt, now);
+  return ageMs > staleMs;
 }

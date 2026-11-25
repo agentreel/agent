@@ -2,16 +2,52 @@ import vm from "node:vm";
 
 export const MAX_REGEX_LENGTH = 300;
 export const REGEX_TIMEOUT_MS = 50;
+export const MAX_REGEX_CACHE_SIZE = 256;
 const MAX_QUANTIFIER_BOUND = 100;
 const MAX_GROUP_DEPTH = 16;
 
 interface GroupFrame {
-  hasRepeatingQuantifier: boolean;
+  hasQuantifier: boolean;
+  hasAlternation: boolean;
 }
 
 const regexVmContext = vm.createContext({});
 const compileScript = new vm.Script("new RegExp(pattern, flags)");
 const testScript = new vm.Script("re.test(text)");
+const compiledRegexCache = new Map<string, RegExp | null>();
+
+function isVmTimeoutError(err: unknown): boolean {
+  if (!err || typeof err !== "object") return false;
+  const e = err as { code?: unknown; message?: unknown };
+  if (e.code === "ERR_SCRIPT_EXECUTION_TIMEOUT") return true;
+  if (
+    typeof e.message === "string" &&
+    e.message.includes("Script execution timed out")
+  ) {
+    return true;
+  }
+  return false;
+}
+
+export function clearRegexCache(): void {
+  compiledRegexCache.clear();
+}
+
+export function getRegexCacheSize(): number {
+  return compiledRegexCache.size;
+}
+
+function setCachedRegex(key: string, value: RegExp | null): void {
+  if (compiledRegexCache.has(key)) {
+    compiledRegexCache.delete(key);
+  } else if (compiledRegexCache.size >= MAX_REGEX_CACHE_SIZE) {
+    const oldest = compiledRegexCache.keys().next().value;
+    if (oldest !== undefined) {
+      compiledRegexCache.delete(oldest);
+    }
+  }
+  compiledRegexCache.set(key, value);
+}
 
 function parseBraceQuantifier(
   pattern: string,
@@ -48,14 +84,18 @@ function parseBraceQuantifier(
 
 /**
  * Checks that a pattern stays within an RE2-safe subset without nested
- * repeating quantifiers, lookarounds, or backreferences.
+ * repeating quantifiers, alternation-plus-quantifier groups, lookarounds,
+ * or backreferences.
  */
 export function isRe2SafePattern(pattern: string): boolean {
   if (pattern.length > MAX_REGEX_LENGTH) return false;
 
   let inCharClass = false;
-  const stack: GroupFrame[] = [{ hasRepeatingQuantifier: false }];
-  let lastAtomWasRepeatingGroup = false;
+  const stack: GroupFrame[] = [
+    { hasQuantifier: false, hasAlternation: false },
+  ];
+  let lastAtomWasQuantifiedGroup = false;
+  let lastAtomWasAlternationGroup = false;
   let lastAtomWasGroup = false;
 
   for (let i = 0; i < pattern.length; i++) {
@@ -69,7 +109,8 @@ export function isRe2SafePattern(pattern: string): boolean {
         if (next === "k" && pattern[i + 2] === "<") return false;
       }
       lastAtomWasGroup = false;
-      lastAtomWasRepeatingGroup = false;
+      lastAtomWasQuantifiedGroup = false;
+      lastAtomWasAlternationGroup = false;
       i++;
       continue;
     }
@@ -84,7 +125,16 @@ export function isRe2SafePattern(pattern: string): boolean {
     if (ch === "[") {
       inCharClass = true;
       lastAtomWasGroup = false;
-      lastAtomWasRepeatingGroup = false;
+      lastAtomWasQuantifiedGroup = false;
+      lastAtomWasAlternationGroup = false;
+      continue;
+    }
+
+    if (ch === "|") {
+      stack[stack.length - 1]!.hasAlternation = true;
+      lastAtomWasGroup = false;
+      lastAtomWasQuantifiedGroup = false;
+      lastAtomWasAlternationGroup = false;
       continue;
     }
 
@@ -100,9 +150,10 @@ export function isRe2SafePattern(pattern: string): boolean {
           return false;
         }
       }
-      stack.push({ hasRepeatingQuantifier: false });
+      stack.push({ hasQuantifier: false, hasAlternation: false });
       lastAtomWasGroup = false;
-      lastAtomWasRepeatingGroup = false;
+      lastAtomWasQuantifiedGroup = false;
+      lastAtomWasAlternationGroup = false;
       continue;
     }
 
@@ -110,27 +161,39 @@ export function isRe2SafePattern(pattern: string): boolean {
       if (stack.length <= 1) return false;
       const closed = stack.pop()!;
       const parent = stack[stack.length - 1]!;
-      if (closed.hasRepeatingQuantifier) {
-        parent.hasRepeatingQuantifier = true;
+      if (closed.hasQuantifier) {
+        parent.hasQuantifier = true;
+      }
+      if (closed.hasAlternation) {
+        parent.hasAlternation = true;
       }
       lastAtomWasGroup = true;
-      lastAtomWasRepeatingGroup = closed.hasRepeatingQuantifier;
+      lastAtomWasQuantifiedGroup = closed.hasQuantifier;
+      lastAtomWasAlternationGroup = closed.hasAlternation;
       continue;
     }
 
     if (ch === "*" || ch === "+") {
-      if (lastAtomWasGroup && lastAtomWasRepeatingGroup) return false;
-      stack[stack.length - 1]!.hasRepeatingQuantifier = true;
+      if (
+        lastAtomWasGroup &&
+        (lastAtomWasQuantifiedGroup || lastAtomWasAlternationGroup)
+      ) {
+        return false;
+      }
+      stack[stack.length - 1]!.hasQuantifier = true;
       if (pattern[i + 1] === "?") i++;
       lastAtomWasGroup = false;
-      lastAtomWasRepeatingGroup = false;
+      lastAtomWasQuantifiedGroup = false;
+      lastAtomWasAlternationGroup = false;
       continue;
     }
 
     if (ch === "?") {
+      stack[stack.length - 1]!.hasQuantifier = true;
       if (pattern[i + 1] === "?") i++;
       lastAtomWasGroup = false;
-      lastAtomWasRepeatingGroup = false;
+      lastAtomWasQuantifiedGroup = false;
+      lastAtomWasAlternationGroup = false;
       continue;
     }
 
@@ -139,19 +202,26 @@ export function isRe2SafePattern(pattern: string): boolean {
       if (parsed) {
         if (parsed.tooLarge) return false;
         if (parsed.repeating) {
-          if (lastAtomWasGroup && lastAtomWasRepeatingGroup) return false;
-          stack[stack.length - 1]!.hasRepeatingQuantifier = true;
+          if (
+            lastAtomWasGroup &&
+            (lastAtomWasQuantifiedGroup || lastAtomWasAlternationGroup)
+          ) {
+            return false;
+          }
         }
+        stack[stack.length - 1]!.hasQuantifier = true;
         i = parsed.end;
         if (pattern[i + 1] === "?") i++;
         lastAtomWasGroup = false;
-        lastAtomWasRepeatingGroup = false;
+        lastAtomWasQuantifiedGroup = false;
+        lastAtomWasAlternationGroup = false;
         continue;
       }
     }
 
     lastAtomWasGroup = false;
-    lastAtomWasRepeatingGroup = false;
+    lastAtomWasQuantifiedGroup = false;
+    lastAtomWasAlternationGroup = false;
   }
 
   return !inCharClass && stack.length === 1;
@@ -160,20 +230,33 @@ export function isRe2SafePattern(pattern: string): boolean {
 export interface SafeRegexOptions {
   caseSensitive?: boolean;
   timeoutMs?: number;
+  onTimeout?: () => void;
 }
 
 /**
- * Compiles an RE2-safe regex with a length cap and timeout guard.
- * Returns null if the pattern is invalid, over-length, or unsafe. Never throws.
+ * Compiles an RE2-safe regex with a length cap, bounded compile cache, and
+ * timeout guard. Returns null if invalid, over-length, or unsafe. Never throws.
  */
 export function compileSafeRegex(
   pattern: string,
   opts: SafeRegexOptions = {},
 ): RegExp | null {
   if (typeof pattern !== "string") return null;
-  if (!isRe2SafePattern(pattern)) return null;
+  if (pattern.length > MAX_REGEX_LENGTH) return null;
 
   const flags = opts.caseSensitive ? "" : "i";
+  const cacheKey = `${flags}\0${pattern}`;
+  if (compiledRegexCache.has(cacheKey)) {
+    const cached = compiledRegexCache.get(cacheKey) ?? null;
+    setCachedRegex(cacheKey, cached);
+    return cached;
+  }
+
+  if (!isRe2SafePattern(pattern)) {
+    setCachedRegex(cacheKey, null);
+    return null;
+  }
+
   const timeoutMs = opts.timeoutMs ?? REGEX_TIMEOUT_MS;
   try {
     regexVmContext.pattern = pattern;
@@ -181,8 +264,16 @@ export function compileSafeRegex(
     compileScript.runInContext(regexVmContext, {
       timeout: timeoutMs,
     });
-    return new RegExp(pattern, flags);
-  } catch {
+    const compiled = new RegExp(pattern, flags);
+    setCachedRegex(cacheKey, compiled);
+    return compiled;
+  } catch (err) {
+    if (isVmTimeoutError(err)) {
+      // Never cache transient VM timeouts as permanent failures.
+      opts.onTimeout?.();
+      return null;
+    }
+    setCachedRegex(cacheKey, null);
     return null;
   } finally {
     regexVmContext.pattern = undefined;
@@ -198,12 +289,16 @@ export function testSafeRegex(
   re: RegExp,
   text: string,
   timeoutMs: number = REGEX_TIMEOUT_MS,
+  onTimeout?: () => void,
 ): boolean {
   try {
     regexVmContext.re = re;
     regexVmContext.text = text;
     return Boolean(testScript.runInContext(regexVmContext, { timeout: timeoutMs }));
-  } catch {
+  } catch (err) {
+    if (isVmTimeoutError(err)) {
+      onTimeout?.();
+    }
     return false;
   } finally {
     regexVmContext.re = undefined;

@@ -5,6 +5,37 @@ export type PolicyOfflineMode = "last_known" | "fail_open";
 export type PolicyAction = "flag" | "block" | "require_approval";
 export type PolicyDecisionAction = "allow" | PolicyAction;
 export type PolicyTool = "claude-code" | "cursor";
+export type ApprovalOfflineFallback = "deny" | "allow";
+
+export const DEFAULT_APPROVAL_EXPIRES_S = 120;
+export const PRE_EXEC_TIMEOUT_BUFFER_S = 10;
+export const DEFAULT_PRE_EXEC_HOOK_TIMEOUT_S =
+  DEFAULT_APPROVAL_EXPIRES_S + PRE_EXEC_TIMEOUT_BUFFER_S;
+export const DEFAULT_HOOK_TIMEOUT_S = 5;
+
+export interface RuleApprovalConfig {
+  expires_s?: number;
+  offline_fallback?: ApprovalOfflineFallback;
+}
+
+export function computePreExecTimeoutS(policy?: Policy | null): number {
+  let maxExpiresS = DEFAULT_APPROVAL_EXPIRES_S;
+  if (policy) {
+    for (const override of Object.values(policy.builtin)) {
+      const exp = override.approval?.expires_s;
+      if (typeof exp === "number" && Number.isFinite(exp) && exp > maxExpiresS) {
+        maxExpiresS = exp;
+      }
+    }
+    for (const rule of policy.custom) {
+      const exp = rule.approval?.expires_s;
+      if (typeof exp === "number" && Number.isFinite(exp) && exp > maxExpiresS) {
+        maxExpiresS = exp;
+      }
+    }
+  }
+  return Math.ceil(maxExpiresS) + PRE_EXEC_TIMEOUT_BUFFER_S;
+}
 
 export type RuleConditionField =
   | "command"
@@ -25,6 +56,7 @@ export interface BuiltinRuleOverride {
   enabled: boolean;
   action: PolicyAction;
   severity?: Severity;
+  approval?: RuleApprovalConfig;
 }
 
 export interface CustomRuleCondition {
@@ -51,6 +83,7 @@ export interface CustomRule {
   action: PolicyAction;
   severity: Severity;
   scope?: CustomRuleScope;
+  approval?: RuleApprovalConfig;
 }
 
 export interface PolicyAllowLists {
@@ -63,6 +96,8 @@ export interface Policy {
   version: 1;
   etag: string;
   workspace_id: string;
+  org_name?: string;
+  org_slug?: string;
   updated_at: string | number;
   mode: PolicyMode;
   offline: PolicyOfflineMode;
@@ -101,6 +136,43 @@ const CONDITION_OPS = new Set<string>([
   "regex",
 ]);
 const POLICY_TOOLS = new Set<string>(["claude-code", "cursor"]);
+const APPROVAL_OFFLINE_FALLBACKS = new Set<string>(["deny", "allow"]);
+
+function validateRuleApproval(
+  input: unknown,
+  path: string,
+): ValidationResult<RuleApprovalConfig> {
+  if (!isPlainObject(input)) {
+    return { ok: false, error: `${path} must be an object` };
+  }
+  const out: RuleApprovalConfig = {};
+  if (input.expires_s !== undefined) {
+    if (
+      typeof input.expires_s !== "number" ||
+      !Number.isFinite(input.expires_s) ||
+      input.expires_s <= 0
+    ) {
+      return {
+        ok: false,
+        error: `${path}.expires_s must be a positive finite number`,
+      };
+    }
+    out.expires_s = input.expires_s;
+  }
+  if (input.offline_fallback !== undefined) {
+    if (
+      typeof input.offline_fallback !== "string" ||
+      !APPROVAL_OFFLINE_FALLBACKS.has(input.offline_fallback)
+    ) {
+      return {
+        ok: false,
+        error: `${path}.offline_fallback must be "deny" or "allow"`,
+      };
+    }
+    out.offline_fallback = input.offline_fallback as ApprovalOfflineFallback;
+  }
+  return { ok: true, value: out };
+}
 
 function isPlainObject(v: unknown): v is Record<string, unknown> {
   return typeof v === "object" && v !== null && !Array.isArray(v);
@@ -242,6 +314,12 @@ function validateCustomRule(
     if (!s.ok) return s;
     scope = s.value;
   }
+  let approval: RuleApprovalConfig | undefined;
+  if (input.approval !== undefined) {
+    const a = validateRuleApproval(input.approval, `${path}.approval`);
+    if (!a.ok) return a;
+    approval = a.value;
+  }
   return {
     ok: true,
     value: {
@@ -254,6 +332,7 @@ function validateCustomRule(
       action: input.action as PolicyAction,
       severity: input.severity,
       ...(scope !== undefined ? { scope } : {}),
+      ...(approval !== undefined ? { approval } : {}),
     },
   };
 }
@@ -270,6 +349,12 @@ export function validatePolicy(input: unknown): ValidationResult<Policy> {
   }
   if (!isNonEmptyString(input.workspace_id)) {
     return { ok: false, error: "policy.workspace_id must be a non-empty string" };
+  }
+  if (input.org_name !== undefined && !isNonEmptyString(input.org_name)) {
+    return { ok: false, error: "policy.org_name must be a non-empty string" };
+  }
+  if (input.org_slug !== undefined && !isNonEmptyString(input.org_slug)) {
+    return { ok: false, error: "policy.org_slug must be a non-empty string" };
   }
   const validUpdatedAt =
     isNonEmptyString(input.updated_at) ||
@@ -325,12 +410,22 @@ export function validatePolicy(input: unknown): ValidationResult<Policy> {
         error: `policy.builtin.${ruleId}.severity is invalid`,
       };
     }
+    let approval: RuleApprovalConfig | undefined;
+    if (rawOverride.approval !== undefined) {
+      const a = validateRuleApproval(
+        rawOverride.approval,
+        `policy.builtin.${ruleId}.approval`,
+      );
+      if (!a.ok) return a;
+      approval = a.value;
+    }
     builtin[ruleId] = {
       enabled: rawOverride.enabled,
       action: rawOverride.action as PolicyAction,
       ...(rawOverride.severity !== undefined
         ? { severity: rawOverride.severity }
         : {}),
+      ...(approval !== undefined ? { approval } : {}),
     };
   }
 
@@ -363,6 +458,8 @@ export function validatePolicy(input: unknown): ValidationResult<Policy> {
       version: 1,
       etag: input.etag,
       workspace_id: input.workspace_id,
+      ...(input.org_name !== undefined ? { org_name: input.org_name } : {}),
+      ...(input.org_slug !== undefined ? { org_slug: input.org_slug } : {}),
       updated_at: input.updated_at as string | number,
       mode: input.mode as PolicyMode,
       offline: input.offline as PolicyOfflineMode,
