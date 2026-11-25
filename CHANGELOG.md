@@ -18,8 +18,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - Distinct offline policy modes: `last_known` enforces cached policies indefinitely; `fail_open` evaluates and records decisions while downgrading `block` and `require_approval` to `flag` with reason `"policy stale, fail_open"` when the cached policy exceeds 24 hours (`POLICY_STALE_MS`) or no server policy exists.
 - Local `policy_decision` audit events uploaded in ingest batches as `policy_decisions` (v2) next to the unchanged `guard_findings` (v1) payload.
 - Performance and regex safety hardening: bounded 256-entry regex compile cache, 50ms total local evaluation deadline (fail-open on expiry), and static rejection of alternation-plus-quantifier ReDoS patterns (`(a|aa)+$`, `(a|a?)+`, `(x|xy)*`).
-- Pre-execution hook timeout installation in `agentreel init` (130s default, or max rule expiry plus 10s, applied idempotently only to Claude `PreToolUse` and Cursor `preToolUse`, `beforeShellExecution`, `beforeMCPExecution`, `beforeReadFile`; other hooks remain at 5s).
-- `agentreel doctor` CLI command reporting enforcement state, policy load status, mode, cache ETag age, and pre-exec hook installation and timeout checks.
+- Pre-execution hook timeout installation in `agentreel init` (130s default, or max rule expiry plus 10s, applied idempotently only to Claude `PreToolUse` and Cursor `preToolUse`, `beforeShellExecution`, `beforeMCPExecution`, `beforeReadFile`; other hooks remain at 5s), recorded per host in `~/.agentreel/config.json`, enforced via a process-start hook deadline (installed timeout minus 5s margin) and pre-request `expires_s` check so hooks never time out into an unapproved allow.
+- `agentreel doctor` CLI command reporting enforcement state, policy load status, mode, cache ETag age, recorded per-host pre-exec hook timeouts, re-init warnings when policy max `expires_s` exceeds installed timeouts, and pre-exec hook installation and timeout checks.
 
 ## [0.2.4] - 2026-11-21
 

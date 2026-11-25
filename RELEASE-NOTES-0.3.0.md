@@ -39,4 +39,4 @@ AgentReel v0.3.0 introduces **AgentReel Govern**: organization policy syncing, l
 
 ## Upgrading
 
-Run `agentreel init` after upgrading to 0.3.0 to register the new Cursor pre-execution hooks and update pre-execution hook timeouts to 130s, then run `agentreel doctor` to verify your setup.
+You must re-run `npx @agentreel/agent init` after upgrading to 0.3.0 so approval rules work. Upgrading without re-running `init` leaves the legacy 5s hook timeout in place, which causes `require_approval` rules to deny with a prompt to run `npx @agentreel/agent init`. Re-running `init` registers the new Cursor pre-execution hooks, updates pre-execution hook timeouts to 130s (or max rule `expires_s` plus 10s), and records the installed timeouts per host in `~/.agentreel/config.json`. Run `agentreel doctor` afterward to verify your setup.
