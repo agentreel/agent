@@ -1,9 +1,6 @@
 import { existsSync, readFileSync, writeFileSync } from "node:fs";
-import { join } from "node:path";
-import { AGENTREEL_DIR } from "../paths.js";
+import { GUARD_CONFIG_PATH } from "../paths.js";
 import type { GuardConfig } from "./types.js";
-
-const GUARD_CONFIG_PATH = join(AGENTREEL_DIR, "guard-config.json");
 
 const DEFAULT_CONFIG: GuardConfig = {
   enabled: true,

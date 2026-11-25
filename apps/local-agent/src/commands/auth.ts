@@ -1,5 +1,6 @@
 import pc from "picocolors";
 import { readConfig, writeConfig } from "../config.js";
+import { fetchPolicy } from "../policy/fetch.js";
 import { postIngest } from "../upload/client.js";
 
 export async function logoutCommand(): Promise<void> {
@@ -37,9 +38,15 @@ export async function linkCommand(rawKey: string | undefined, opts: LinkOpts): P
     process.exit(1);
   }
   writeConfig(cfg);
+  const policyRes = await fetchPolicy({ config: cfg });
   console.log(pc.green("✓") + " Linked.");
   console.log(pc.dim("  api: ") + cfg.apiBaseUrl);
   console.log(pc.dim("  key: ") + key.slice(0, 12) + "…");
+  if (policyRes.status === "updated" || policyRes.status === "not_modified") {
+    console.log(
+      pc.dim("  policy: ") + `${policyRes.policy.mode} (etag ${policyRes.etag})`,
+    );
+  }
 }
 
 export async function uninstallCommand(): Promise<void> {

@@ -21,6 +21,7 @@ import { runHook } from "./hooks/handler.js";
 import { runCursorHook } from "./cursor/hook-runner.js";
 import { configCommand } from "./commands/config.js";
 import { scanCommand } from "./commands/scan.js";
+import { policyCommand } from "./commands/policy.js";
 
 const program = new Command();
 
@@ -146,6 +147,13 @@ program
   .description("scan a session for risky agent behavior patterns (local, no network calls)")
   .action(async (sessionId?: string) => {
     await scanCommand(sessionId ? [sessionId] : []);
+  });
+
+program
+  .command("policy")
+  .description("show cached policy source, etag, age, mode, offline setting, and rule counts")
+  .action(() => {
+    policyCommand();
   });
 
 program.exitOverride();

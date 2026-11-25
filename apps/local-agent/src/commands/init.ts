@@ -7,6 +7,7 @@ import { installCursorHooks } from "../cursor/hooks-install.js";
 import { readConfig, writeConfig } from "../config.js";
 import { getDb } from "../db.js";
 import { ensureAgentreelDir } from "../paths.js";
+import { fetchPolicy } from "../policy/fetch.js";
 
 const PACKAGE_NAME = "@agentreel/agent";
 
@@ -53,6 +54,10 @@ export async function initCommand(opts: InitOptions = {}): Promise<void> {
   if (!cfg.installedAt) cfg.installedAt = Date.now();
   cfg.hooksInstalled = true;
   writeConfig(cfg);
+
+  if (cfg.apiKey) {
+    await fetchPolicy({ config: cfg });
+  }
 
   const binary = resolveAgentBinary();
   const { prefix, mode } = chooseHookPrefix(binary);
