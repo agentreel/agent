@@ -22,6 +22,7 @@ const queue = await import("../src/upload/queue.js");
 const doctor = await import("../src/commands/doctor.js");
 const initMod = await import("../src/commands/init.js");
 const configMod = await import("../src/config.js");
+const { RULES } = await import("../src/guard/rules.js");
 
 const cursorFixtureRaw = readFileSync(
   new URL("./fixtures/cursor-hooks/session.jsonl", import.meta.url),
@@ -2452,5 +2453,326 @@ describe("hook deadline enforcement, timeout pre-check, init recording, and doct
     });
     expect(doc125.needsReinit).toBe(false);
     expect(doctor.formatDoctorReport(doc125)).not.toContain("warning:");
+  });
+});
+
+describe("eval timeout fail-closed enforcement and match preservation", () => {
+  it("repro: denies and records policy_decision preserving GIT001 when a later regex times out", async () => {
+    const policy = makeEnforcePolicy({
+      etag: "etag-timeout-repro",
+      builtin: { GIT001: { enabled: true, action: "block" } },
+      custom: [
+        {
+          id: "later_regex",
+          name: "Later regex",
+          enabled: true,
+          version: 1,
+          message: "Later regex",
+          when: [{ field: "command", op: "regex", value: "^deploy-[a-z]+$" }],
+          action: "block",
+          severity: "high",
+        },
+      ],
+    });
+    cache.writeCachedPolicyAtomic(
+      { policy, etag: policy.etag, fetched_at: Date.now() },
+      cachePath,
+    );
+    const recorded: unknown[] = [];
+
+    const enabledBuiltins = RULES.filter((r) =>
+      r.id === "GIT001" ? true : r.enabled,
+    ).length;
+    let ticks = 0;
+    const evalNowMs = (): number => {
+      ticks += 1;
+      if (ticks === 1) return 0;
+      return ticks <= 1 + enabledBuiltins * 2 ? 10 : 100;
+    };
+
+    const outcome = await enforce.enforcePreExec(
+      {
+        sessionId: "sess-repro-timeout",
+        tool: "claude-code",
+        toolName: "Bash",
+        command: "git push --force " + "a".repeat(35) + "z",
+      },
+      {
+        cachePath,
+        guardConfigPath,
+        config: { orgName: "Acme Corp", orgSlug: "acme" },
+        evalDeadlineMs: 50,
+        evalNowMs,
+        recordDecision: (ev) => recorded.push(ev),
+        log: () => {},
+      },
+    );
+
+    expect(outcome.permitted).toBe(false);
+    expect(outcome.action).toBe("block");
+    expect(outcome.enforced).toBe(true);
+    expect(outcome.timedOut).toBe(true);
+    expect(outcome.decision?.rule_id).toBe("GIT001");
+    expect(outcome.decision?.rule_ids).toContain("GIT001");
+    expect(recorded.length).toBe(1);
+  });
+
+  it("denies with eval_timeout and clear message when a block or require_approval rule is unevaluated", async () => {
+    const policy = makeEnforcePolicy({
+      etag: "etag-uneval-block",
+      builtin: {},
+      custom: [
+        {
+          id: "uneval_block",
+          name: "Block deploys",
+          enabled: true,
+          version: 1,
+          message: "Blocked",
+          when: [{ field: "command", op: "regex", value: "^deploy-[a-z]+$" }],
+          action: "block",
+          severity: "high",
+        },
+      ],
+    });
+    cache.writeCachedPolicyAtomic(
+      { policy, etag: policy.etag, fetched_at: Date.now() },
+      cachePath,
+    );
+    const recorded: Array<{ payload: Record<string, unknown> }> = [];
+
+    let ticks = 0;
+    const evalNowMs = (): number => (ticks++ === 0 ? 0 : 100);
+
+    const outcome = await enforce.enforcePreExec(
+      {
+        sessionId: "sess-uneval-block",
+        tool: "claude-code",
+        toolName: "Bash",
+        command: "echo safe",
+      },
+      {
+        cachePath,
+        guardConfigPath,
+        config: { orgName: "Acme Corp", orgSlug: "acme" },
+        evalDeadlineMs: 50,
+        evalNowMs,
+        recordDecision: (ev) => recorded.push(ev as never),
+        log: () => {},
+      },
+    );
+
+    expect(outcome.permitted).toBe(false);
+    expect(outcome.action).toBe("block");
+    expect(outcome.enforced).toBe(true);
+    expect(outcome.timedOut).toBe(true);
+    expect(outcome.reason).toBe(enforce.EVAL_TIMEOUT_REASON);
+    expect(outcome.message).toContain("policy check timed out");
+    expect(outcome.decision?.rule_id).toBe(enforce.EVAL_TIMEOUT_REASON);
+    expect(outcome.decision?.reason).toBe(enforce.EVAL_TIMEOUT_REASON);
+    expect(recorded.length).toBe(1);
+  });
+
+  it("returns strictest result plus recorded eval_timeout flag when only flag rules remain unevaluated", async () => {
+    const policyFlagOnly = makeEnforcePolicy({
+      etag: "etag-flag-rem",
+      builtin: {},
+      custom: [
+        {
+          id: "uneval_flag",
+          name: "Flag rule",
+          enabled: true,
+          version: 1,
+          message: "Flagged",
+          when: [{ field: "command", op: "regex", value: "^audit-[a-z]+$" }],
+          action: "flag",
+          severity: "warn",
+        },
+      ],
+    });
+    cache.writeCachedPolicyAtomic(
+      { policy: policyFlagOnly, etag: policyFlagOnly.etag, fetched_at: Date.now() },
+      cachePath,
+    );
+    const recordedA: Array<{ payload: Record<string, unknown> }> = [];
+
+    let ticksA = 0;
+    const outcomeA = await enforce.enforcePreExec(
+      {
+        sessionId: "sess-flag-rem-a",
+        tool: "claude-code",
+        toolName: "Bash",
+        command: "echo safe",
+      },
+      {
+        cachePath,
+        guardConfigPath,
+        config: { orgName: "Acme Corp", orgSlug: "acme" },
+        evalDeadlineMs: 50,
+        evalNowMs: () => (ticksA++ === 0 ? 0 : 100),
+        recordDecision: (ev) => recordedA.push(ev as never),
+        log: () => {},
+      },
+    );
+
+    expect(outcomeA.permitted).toBe(true);
+    expect(outcomeA.action).toBe("flag");
+    expect(outcomeA.enforced).toBe(false);
+    expect(outcomeA.timedOut).toBe(true);
+    expect(outcomeA.reason).toBe(enforce.EVAL_TIMEOUT_REASON);
+    expect(recordedA.length).toBe(1);
+    expect(recordedA[0]!.payload.reason).toBe(enforce.EVAL_TIMEOUT_REASON);
+
+    // Prior block matched, only flag rule remains unevaluated -> denies + records both block and eval_timeout flag
+    const policyBlockThenFlag = makeEnforcePolicy({
+      etag: "etag-block-then-flag",
+      builtin: { GIT001: { enabled: true, action: "block" } },
+      custom: [
+        {
+          id: "later_flag",
+          name: "Later flag",
+          enabled: true,
+          version: 1,
+          message: "Flag",
+          when: [{ field: "command", op: "regex", value: "^audit-[a-z]+$" }],
+          action: "flag",
+          severity: "warn",
+        },
+      ],
+    });
+    cache.writeCachedPolicyAtomic(
+      { policy: policyBlockThenFlag, etag: policyBlockThenFlag.etag, fetched_at: Date.now() },
+      cachePath,
+    );
+    const recordedB: Array<{ payload: Record<string, unknown> }> = [];
+    const enabledBuiltins = RULES.filter((r) =>
+      r.id === "GIT001" ? true : r.enabled,
+    ).length;
+    let ticksB = 0;
+
+    const outcomeB = await enforce.enforcePreExec(
+      {
+        sessionId: "sess-block-then-flag",
+        tool: "claude-code",
+        toolName: "Bash",
+        command: "git push --force origin main",
+      },
+      {
+        cachePath,
+        guardConfigPath,
+        config: { orgName: "Acme Corp", orgSlug: "acme" },
+        evalDeadlineMs: 50,
+        evalNowMs: () => {
+          ticksB += 1;
+          if (ticksB === 1) return 0;
+          return ticksB <= 1 + enabledBuiltins * 2 ? 10 : 100;
+        },
+        recordDecision: (ev) => recordedB.push(ev as never),
+        log: () => {},
+      },
+    );
+
+    expect(outcomeB.permitted).toBe(false);
+    expect(outcomeB.action).toBe("block");
+    expect(outcomeB.timedOut).toBe(true);
+    expect(outcomeB.decision?.rule_id).toBe("GIT001");
+    expect(recordedB.length).toBe(2);
+    expect(recordedB.some((r) => r.payload.action === "block" && r.payload.rule_id === "GIT001")).toBe(true);
+    expect(recordedB.some((r) => r.payload.action === "flag" && r.payload.reason === enforce.EVAL_TIMEOUT_REASON)).toBe(true);
+  });
+
+  it("downgrades eval_timeout fail-closed block to flag under observe mode and stale fail_open", async () => {
+    const observePolicy = makeEnforcePolicy({
+      etag: "etag-observe-timeout",
+      mode: "observe",
+      builtin: {},
+      custom: [
+        {
+          id: "uneval_block",
+          name: "Block deploys",
+          enabled: true,
+          version: 1,
+          message: "Blocked",
+          when: [{ field: "command", op: "regex", value: "^deploy-[a-z]+$" }],
+          action: "block",
+          severity: "high",
+        },
+      ],
+    });
+    cache.writeCachedPolicyAtomic(
+      { policy: observePolicy, etag: observePolicy.etag, fetched_at: Date.now() },
+      cachePath,
+    );
+    let ticksObs = 0;
+    const obsOutcome = await enforce.enforcePreExec(
+      {
+        sessionId: "sess-obs-timeout",
+        tool: "claude-code",
+        toolName: "Bash",
+        command: "echo safe",
+      },
+      {
+        cachePath,
+        guardConfigPath,
+        config: { orgName: "Acme Corp", orgSlug: "acme" },
+        evalDeadlineMs: 50,
+        evalNowMs: () => (ticksObs++ === 0 ? 0 : 100),
+        recordDecision: () => {},
+        log: () => {},
+      },
+    );
+    expect(obsOutcome.permitted).toBe(true);
+    expect(obsOutcome.action).toBe("flag");
+    expect(obsOutcome.downgraded).toBe(true);
+    expect(obsOutcome.timedOut).toBe(true);
+    expect(obsOutcome.reason).toBe(enforce.EVAL_TIMEOUT_REASON);
+
+    // Stale fail_open downgrades fail-closed timeout block to flag
+    const stalePolicy = makeEnforcePolicy({
+      etag: "etag-stale-timeout",
+      mode: "enforce",
+      offline: "fail_open",
+      builtin: {},
+      custom: [
+        {
+          id: "uneval_block",
+          name: "Block deploys",
+          enabled: true,
+          version: 1,
+          message: "Blocked",
+          when: [{ field: "command", op: "regex", value: "^deploy-[a-z]+$" }],
+          action: "block",
+          severity: "high",
+        },
+      ],
+    });
+    const now = Date.now();
+    cache.writeCachedPolicyAtomic(
+      { policy: stalePolicy, etag: stalePolicy.etag, fetched_at: now - 48 * 60 * 60 * 1000 },
+      cachePath,
+    );
+    let ticksStale = 0;
+    const staleOutcome = await enforce.enforcePreExec(
+      {
+        sessionId: "sess-stale-timeout",
+        tool: "claude-code",
+        toolName: "Bash",
+        command: "echo safe",
+      },
+      {
+        cachePath,
+        guardConfigPath,
+        config: { orgName: "Acme Corp", orgSlug: "acme" },
+        now: () => now,
+        evalDeadlineMs: 50,
+        evalNowMs: () => (ticksStale++ === 0 ? 0 : 100),
+        recordDecision: () => {},
+        log: () => {},
+      },
+    );
+    expect(staleOutcome.permitted).toBe(true);
+    expect(staleOutcome.action).toBe("flag");
+    expect(staleOutcome.downgraded).toBe(true);
+    expect(staleOutcome.timedOut).toBe(true);
+    expect(staleOutcome.reason).toBe(enforce.STALE_FAIL_OPEN_REASON);
   });
 });

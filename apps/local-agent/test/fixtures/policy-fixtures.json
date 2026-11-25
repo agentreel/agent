@@ -1163,6 +1163,45 @@
         "action": "allow",
         "rule_ids": []
       }
+    },
+    {
+      "name": "regex with multiple unbounded quantifiers is rejected at validation while valid builtin block still fires",
+      "policy": {
+        "version": 1,
+        "etag": "etag-33",
+        "workspace_id": "ws_test",
+        "updated_at": "2026-11-25T00:00:00Z",
+        "mode": "enforce",
+        "offline": "last_known",
+        "builtin": {
+          "GIT001": { "enabled": true, "action": "block" }
+        },
+        "custom": [
+          {
+            "id": "cust_multi_unbounded_regex",
+            "name": "Pathological multi-unbounded regex",
+            "enabled": true,
+            "version": 1,
+            "message": "Multiple unbounded quantifiers must be rejected",
+            "when": [
+              { "field": "command", "op": "regex", "value": "a.*a.*a.*a.*a.*a.*a.*a.*b" }
+            ],
+            "action": "block",
+            "severity": "high",
+            "scope": {}
+          }
+        ],
+        "allow": { "commands": [], "paths": [], "repos": [] }
+      },
+      "input": {
+        "tool": "claude-code",
+        "toolName": "Bash",
+        "command": "git push --force aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaz"
+      },
+      "expected": {
+        "action": "block",
+        "rule_ids": ["GIT001"]
+      }
     }
   ]
 }

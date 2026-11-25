@@ -12,6 +12,7 @@ import { ensureAgentreelDir, LOG_PATH } from "../paths.js";
 import { scrubAny, scrubString } from "../redact/scrubber.js";
 import { isPolicyCacheStale, loadEffectivePolicy } from "./cache.js";
 import {
+  EVAL_TIMEOUT_REASON,
   evaluatePolicy,
   POLICY_EVAL_DEADLINE_MS,
   type PolicyEvalInput,
@@ -29,6 +30,7 @@ import {
   type PolicyTool,
 } from "./types.js";
 
+export { EVAL_TIMEOUT_REASON };
 export const STALE_FAIL_OPEN_REASON = "policy stale, fail_open";
 export const HOOK_TIMEOUT_TOO_SHORT_REASON = "hook_timeout_too_short";
 
@@ -89,6 +91,7 @@ export interface PreExecDeps {
   guardConfigPath?: string;
   config?: AgentConfig;
   now?: () => number;
+  evalNowMs?: () => number;
   sleep?: (ms: number) => Promise<void>;
   evalDeadlineMs?: number;
   hookDeadlineMs?: number;
@@ -155,6 +158,16 @@ export function formatBlockMessage(
   const slug = policy?.org_slug?.trim() || config.orgSlug?.trim();
   const url = slug ? `agentreel.dev/org/${slug}` : "agentreel.dev";
   return `Blocked by ${org} policy: ${ruleName}. Ask an admin or see ${url}`;
+}
+
+export function formatEvalTimeoutBlockMessage(
+  policy: Policy | null,
+  config: AgentConfig,
+): string {
+  const org = policy?.org_name?.trim() || config.orgName?.trim() || "your org";
+  const slug = policy?.org_slug?.trim() || config.orgSlug?.trim();
+  const url = slug ? `agentreel.dev/org/${slug}` : "agentreel.dev";
+  return `Blocked by ${org} policy: policy check timed out. Ask an admin or see ${url}`;
 }
 
 export function formatWaitingMessage(
@@ -345,22 +358,16 @@ export async function enforcePreExec(
 
     const evalResult = evaluateFn(evalInput, loaded.policy, RULES, {
       deadlineMs: deps.evalDeadlineMs ?? POLICY_EVAL_DEADLINE_MS,
+      ...(deps.evalNowMs ? { nowMs: deps.evalNowMs } : {}),
     });
 
     if (evalResult.timed_out) {
       log(
-        `evaluation exceeded ${deps.evalDeadlineMs ?? POLICY_EVAL_DEADLINE_MS}ms deadline for ${req.toolName}; failing open`,
+        `evaluation exceeded ${deps.evalDeadlineMs ?? POLICY_EVAL_DEADLINE_MS}ms deadline for ${req.toolName}; action=${evalResult.action}`,
       );
-      return {
-        permitted: true,
-        action: "allow",
-        enforced: false,
-        downgraded: false,
-        timedOut: true,
-      };
     }
 
-    if (evalResult.action === "allow" || evalResult.matches.length === 0) {
+    if (evalResult.action === "allow") {
       return {
         permitted: true,
         action: "allow",
@@ -371,11 +378,16 @@ export async function enforcePreExec(
 
     const ts = req.ts ?? nowFn();
     const targetAction = evalResult.original_action ?? evalResult.action;
-    const primaryMatch = selectPrimaryMatch(evalResult.matches, targetAction);
+    const primaryMatch =
+      evalResult.matches.length > 0
+        ? selectPrimaryMatch(evalResult.matches, targetAction)
+        : null;
+    const primaryRuleId = primaryMatch?.rule_id ?? EVAL_TIMEOUT_REASON;
+    const primaryRuleName = primaryMatch?.name ?? "policy check timed out";
     const summary = buildActionSummary(req);
     const decisionId = computeDecisionId({
       sessionId: req.sessionId,
-      ruleId: primaryMatch.rule_id,
+      ruleId: primaryRuleId,
       tool: req.tool,
       toolUseId: req.toolUseId,
       summary,
@@ -394,7 +406,7 @@ export async function enforcePreExec(
         id: decisionId,
         ts,
         session_id: req.sessionId,
-        rule_id: primaryMatch.rule_id,
+        rule_id: primaryRuleId,
         rule_ids: evalResult.rule_ids,
         action: "flag",
         enforced: false,
@@ -413,6 +425,7 @@ export async function enforcePreExec(
         downgraded: true,
         reason: STALE_FAIL_OPEN_REASON,
         decision: record,
+        ...(evalResult.timed_out ? { timedOut: true } : {}),
       };
     }
 
@@ -421,7 +434,7 @@ export async function enforcePreExec(
         id: decisionId,
         ts,
         session_id: req.sessionId,
-        rule_id: primaryMatch.rule_id,
+        rule_id: primaryRuleId,
         rule_ids: evalResult.rule_ids,
         action: "flag",
         enforced: false,
@@ -429,6 +442,7 @@ export async function enforcePreExec(
         ...(evalResult.original_action
           ? { original_action: evalResult.original_action }
           : {}),
+        ...(evalResult.reason ? { reason: evalResult.reason } : {}),
         policy_etag: loaded.etag,
         tool: req.tool,
         tool_name: req.toolName,
@@ -439,42 +453,76 @@ export async function enforcePreExec(
         action: "flag",
         enforced: false,
         downgraded: evalResult.downgraded,
+        ...(evalResult.reason ? { reason: evalResult.reason } : {}),
         decision: record,
+        ...(evalResult.timed_out ? { timedOut: true } : {}),
       };
     }
 
     const cfg = deps.config ?? readConfig();
 
+    const recordTimeoutFlagIfPartial = (): void => {
+      if (evalResult.timed_out && !evalResult.unevaluated_enforcing) {
+        const flagRecord: PolicyDecisionRecord = {
+          id: `${decisionId}_timeout`,
+          ts,
+          session_id: req.sessionId,
+          rule_id: EVAL_TIMEOUT_REASON,
+          rule_ids: [EVAL_TIMEOUT_REASON],
+          action: "flag",
+          enforced: false,
+          downgraded: false,
+          reason: EVAL_TIMEOUT_REASON,
+          policy_etag: loaded.etag,
+          tool: req.tool,
+          tool_name: req.toolName,
+        };
+        persistDecisionEvent(flagRecord, req.cwd, recordDecision, log);
+      }
+    };
+
     if (evalResult.action === "block") {
-      const message = formatBlockMessage(primaryMatch.name, loaded.policy, cfg);
+      const isTimeoutFailClosed =
+        Boolean(evalResult.timed_out) &&
+        Boolean(evalResult.unevaluated_enforcing) &&
+        (!primaryMatch || primaryMatch.action !== "block");
+      const message = isTimeoutFailClosed
+        ? formatEvalTimeoutBlockMessage(loaded.policy, cfg)
+        : formatBlockMessage(primaryRuleName, loaded.policy, cfg);
+      const reason = isTimeoutFailClosed
+        ? EVAL_TIMEOUT_REASON
+        : (evalResult.reason ?? primaryMatch?.message ?? EVAL_TIMEOUT_REASON);
       const record: PolicyDecisionRecord = {
         id: decisionId,
         ts,
         session_id: req.sessionId,
-        rule_id: primaryMatch.rule_id,
+        rule_id: primaryRuleId,
         rule_ids: evalResult.rule_ids,
         action: "block",
         enforced: true,
         downgraded: false,
-        reason: primaryMatch.message,
+        reason,
         policy_etag: loaded.etag,
         tool: req.tool,
         tool_name: req.toolName,
       };
       persistDecisionEvent(record, req.cwd, recordDecision, log);
+      recordTimeoutFlagIfPartial();
       return {
         permitted: false,
         action: "block",
         enforced: true,
         downgraded: false,
         message,
-        reason: primaryMatch.message,
+        reason,
         decision: record,
+        ...(evalResult.timed_out ? { timedOut: true } : {}),
       };
     }
 
     // require_approval: the only hook path permitted to reach the network.
     if (evalResult.action === "require_approval") {
+      recordTimeoutFlagIfPartial();
       const approvalCfg = resolveApprovalConfig(evalResult.matches);
       const installedTimeoutS =
         deps.installedTimeoutS ??
@@ -482,13 +530,13 @@ export async function enforcePreExec(
       const maxWaitBudgetS = installedTimeoutS - HOOK_DEADLINE_MARGIN_S;
 
       if (approvalCfg.expiresS > maxWaitBudgetS) {
-        const message = formatHookTimeoutTooShortMessage(primaryMatch.name);
+        const message = formatHookTimeoutTooShortMessage(primaryRuleName);
         const reason = HOOK_TIMEOUT_TOO_SHORT_REASON;
         const record: PolicyDecisionRecord = {
           id: decisionId,
           ts,
           session_id: req.sessionId,
-          rule_id: primaryMatch.rule_id,
+          rule_id: primaryRuleId,
           rule_ids: evalResult.rule_ids,
           action: "require_approval",
           enforced: true,
@@ -509,18 +557,19 @@ export async function enforcePreExec(
           message,
           reason,
           decision: record,
+          ...(evalResult.timed_out ? { timedOut: true } : {}),
         };
       }
 
       const effectiveHookDeadlineMs =
         deps.hookDeadlineMs ?? computeHookDeadlineMs(installedTimeoutS, ts);
 
-      onWaiting(formatWaitingMessage(primaryMatch.name, approvalCfg.expiresS));
+      onWaiting(formatWaitingMessage(primaryRuleName, approvalCfg.expiresS));
 
       const { requestRemoteApproval } = await import("./approval.js");
       const approval = await requestRemoteApproval({
         decisionId,
-        ruleId: primaryMatch.rule_id,
+        ruleId: primaryRuleId,
         sessionId: req.sessionId,
         repo: req.repo,
         tool: req.tool,
@@ -542,7 +591,7 @@ export async function enforcePreExec(
       const message = approval.permitted
         ? undefined
         : formatApprovalDenyMessage(
-            primaryMatch.name,
+            primaryRuleName,
             loaded.policy,
             cfg,
             approval.outcome,
@@ -555,7 +604,7 @@ export async function enforcePreExec(
         id: decisionId,
         ts,
         session_id: req.sessionId,
-        rule_id: primaryMatch.rule_id,
+        rule_id: primaryRuleId,
         rule_ids: evalResult.rule_ids,
         action: "require_approval",
         enforced,
@@ -578,6 +627,7 @@ export async function enforcePreExec(
         ...(message ? { message } : {}),
         ...(approval.reason ? { reason: approval.reason } : {}),
         decision: record,
+        ...(evalResult.timed_out ? { timedOut: true } : {}),
       };
     }
 

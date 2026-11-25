@@ -52,7 +52,7 @@ function setCachedRegex(key: string, value: RegExp | null): void {
 function parseBraceQuantifier(
   pattern: string,
   start: number,
-): { end: number; repeating: boolean; tooLarge: boolean } | null {
+): { end: number; repeating: boolean; unbounded: boolean; tooLarge: boolean } | null {
   if (pattern[start] !== "{") return null;
   let i = start + 1;
   let minStr = "";
@@ -75,17 +75,18 @@ function parseBraceQuantifier(
 
   const min = Number(minStr);
   const max = maxStr === "" ? Infinity : Number(maxStr);
+  const unbounded = max === Infinity;
   const tooLarge =
     min > MAX_QUANTIFIER_BOUND ||
     (Number.isFinite(max) && max > MAX_QUANTIFIER_BOUND);
-  const repeating = max > 1 || max === Infinity;
-  return { end: i, repeating, tooLarge };
+  const repeating = max > 1 || unbounded;
+  return { end: i, repeating, unbounded, tooLarge };
 }
 
 /**
  * Checks that a pattern stays within an RE2-safe subset without nested
- * repeating quantifiers, alternation-plus-quantifier groups, lookarounds,
- * or backreferences.
+ * repeating quantifiers, alternation-plus-quantifier groups, multiple
+ * unbounded quantifiers, lookarounds, or backreferences.
  */
 export function isRe2SafePattern(pattern: string): boolean {
   if (pattern.length > MAX_REGEX_LENGTH) return false;
@@ -97,6 +98,7 @@ export function isRe2SafePattern(pattern: string): boolean {
   let lastAtomWasQuantifiedGroup = false;
   let lastAtomWasAlternationGroup = false;
   let lastAtomWasGroup = false;
+  let unboundedQuantifiers = 0;
 
   for (let i = 0; i < pattern.length; i++) {
     const ch = pattern[i]!;
@@ -180,6 +182,8 @@ export function isRe2SafePattern(pattern: string): boolean {
       ) {
         return false;
       }
+      unboundedQuantifiers++;
+      if (unboundedQuantifiers > 1) return false;
       stack[stack.length - 1]!.hasQuantifier = true;
       if (pattern[i + 1] === "?") i++;
       lastAtomWasGroup = false;
@@ -201,6 +205,10 @@ export function isRe2SafePattern(pattern: string): boolean {
       const parsed = parseBraceQuantifier(pattern, i);
       if (parsed) {
         if (parsed.tooLarge) return false;
+        if (parsed.unbounded) {
+          unboundedQuantifiers++;
+          if (unboundedQuantifiers > 1) return false;
+        }
         if (parsed.repeating) {
           if (
             lastAtomWasGroup &&

@@ -14,6 +14,7 @@ import type {
 } from "./types.js";
 
 export const POLICY_EVAL_DEADLINE_MS = 50;
+export const EVAL_TIMEOUT_REASON = "eval_timeout";
 
 export interface PolicyEvalInput {
   tool: PolicyTool;
@@ -45,6 +46,8 @@ export interface PolicyEvalResult {
   downgraded: boolean;
   original_action?: PolicyAction;
   timed_out?: boolean;
+  reason?: string;
+  unevaluated_enforcing?: boolean;
 }
 
 export interface PolicyEvalOptions {
@@ -384,8 +387,9 @@ function matchConditionAgainstCandidate(
           clock.timedOut = true;
         },
       );
+      if (matched) return true;
       if (checkExpired(clock)) return false;
-      return matched;
+      return false;
     }
   }
 }
@@ -438,21 +442,84 @@ function buildBuiltinMatchContext(input: PolicyEvalInput): MatchContext {
   };
 }
 
-function timedOutResult(): PolicyEvalResult {
+function isEnforcingAction(action: PolicyAction): boolean {
+  return action === "block" || action === "require_approval";
+}
+
+function hasRegexCondition(rule: CustomRule): boolean {
+  return Array.isArray(rule.when) && rule.when.some((c) => c.op === "regex");
+}
+
+function orderCustomRules(customRules: CustomRule[]): CustomRule[] {
+  const cheap: CustomRule[] = [];
+  const regexEnforcing: CustomRule[] = [];
+  const regexFlag: CustomRule[] = [];
+  for (const rule of customRules) {
+    if (!rule.enabled || !rule.when || rule.when.length === 0) continue;
+    if (!hasRegexCondition(rule)) {
+      cheap.push(rule);
+    } else if (isEnforcingAction(rule.action)) {
+      regexEnforcing.push(rule);
+    } else {
+      regexFlag.push(rule);
+    }
+  }
+  return [...cheap, ...regexEnforcing, ...regexFlag];
+}
+
+function finalizeTimeout(
+  matches: PolicyRuleMatch[],
+  unevaluatedEnforcing: boolean,
+  mode: Policy["mode"],
+): PolicyEvalResult {
+  let strictest: PolicyAction | null = null;
+  for (const m of matches) {
+    if (strictest === null || ACTION_RANK[m.action] > ACTION_RANK[strictest]) {
+      strictest = m.action;
+    }
+  }
+
+  let effective: PolicyAction;
+  if (unevaluatedEnforcing) {
+    effective = "block";
+  } else if (strictest !== null && ACTION_RANK[strictest] > ACTION_RANK.flag) {
+    effective = strictest;
+  } else {
+    effective = "flag";
+  }
+
+  const ruleIds = matches.map((m) => m.rule_id);
+
+  if (mode === "observe" && isEnforcingAction(effective)) {
+    return {
+      action: "flag",
+      rule_ids: ruleIds,
+      matches,
+      downgraded: true,
+      original_action: effective,
+      timed_out: true,
+      reason: EVAL_TIMEOUT_REASON,
+      unevaluated_enforcing: unevaluatedEnforcing,
+    };
+  }
+
   return {
-    action: "allow",
-    rule_ids: [],
-    matches: [],
+    action: effective,
+    rule_ids: ruleIds,
+    matches,
     downgraded: false,
     timed_out: true,
+    reason: EVAL_TIMEOUT_REASON,
+    unevaluated_enforcing: unevaluatedEnforcing,
   };
 }
 
 /**
  * Pure, synchronous, network-free policy evaluator.
- * Evaluates built-in Guard rules with policy overrides first, then custom rules,
- * honoring allow lists, scope, strictest-wins precedence, observe mode, and
- * a total evaluation deadline (fail-open to allow when exceeded).
+ * Evaluates built-in Guard rules first, then cheap custom rules, then regex
+ * custom rules (block/require_approval before flag). On deadline expiry, keeps
+ * collected matches, fails closed if any enforcing rule was unevaluated or
+ * timed out, and otherwise returns the strictest result plus an eval_timeout flag.
  */
 export function evaluatePolicy(
   input: PolicyEvalInput,
@@ -477,51 +544,106 @@ export function evaluatePolicy(
     };
   }
 
-  const matches: PolicyRuleMatch[] = [];
-  const ctx = buildBuiltinMatchContext(input);
-
+  const enabledBuiltins: Array<{
+    rule: Rule;
+    effectiveRule: Rule;
+    action: PolicyAction;
+    override: Policy["builtin"][string] | undefined;
+  }> = [];
   for (const rule of builtinRules) {
-    if (checkExpired(clock)) return timedOutResult();
     const override = policy.builtin[rule.id];
     const enabled = override !== undefined ? override.enabled : rule.enabled;
     if (!enabled) continue;
-
-    const effectiveRule: Rule = rule.enabled ? rule : { ...rule, enabled: true };
-    const finding = matchRule(effectiveRule, ctx);
-    if (checkExpired(clock)) return timedOutResult();
-    if (!finding) continue;
-
-    const action: PolicyAction = override?.action ?? "flag";
-    const severity: Severity = override?.severity ?? finding.severity;
-    matches.push({
-      rule_id: rule.id,
-      name: rule.name,
-      message: rule.description || rule.name,
-      action,
-      severity,
-      source: "builtin",
-      ...(override?.approval ? { approval: override.approval } : {}),
+    enabledBuiltins.push({
+      rule,
+      effectiveRule: rule.enabled ? rule : { ...rule, enabled: true },
+      action: override?.action ?? "flag",
+      override,
     });
   }
 
-  for (const rule of policy.custom) {
-    if (checkExpired(clock)) return timedOutResult();
-    if (!matchesCustomRule(rule, input, clock)) {
-      if (clock.timedOut) return timedOutResult();
-      continue;
+  const orderedCustom = orderCustomRules(policy.custom);
+
+  const hasEnforcingCustomFrom = (start: number): boolean => {
+    for (let j = start; j < orderedCustom.length; j++) {
+      if (isEnforcingAction(orderedCustom[j]!.action)) return true;
     }
-    matches.push({
-      rule_id: rule.id,
-      name: rule.name,
-      message: rule.message || rule.name,
-      action: rule.action,
-      severity: rule.severity,
-      source: "custom",
-      ...(rule.approval ? { approval: rule.approval } : {}),
-    });
+    return false;
+  };
+
+  const hasEnforcingBuiltinFrom = (start: number): boolean => {
+    for (let j = start; j < enabledBuiltins.length; j++) {
+      if (isEnforcingAction(enabledBuiltins[j]!.action)) return true;
+    }
+    return false;
+  };
+
+  const matches: PolicyRuleMatch[] = [];
+  const ctx = buildBuiltinMatchContext(input);
+
+  for (let i = 0; i < enabledBuiltins.length; i++) {
+    if (checkExpired(clock)) {
+      return finalizeTimeout(
+        matches,
+        hasEnforcingBuiltinFrom(i) || hasEnforcingCustomFrom(0),
+        policy.mode,
+      );
+    }
+    const entry = enabledBuiltins[i]!;
+    const finding = matchRule(entry.effectiveRule, ctx);
+    if (finding) {
+      const severity: Severity = entry.override?.severity ?? finding.severity;
+      matches.push({
+        rule_id: entry.rule.id,
+        name: entry.rule.name,
+        message: entry.rule.description || entry.rule.name,
+        action: entry.action,
+        severity,
+        source: "builtin",
+        ...(entry.override?.approval
+          ? { approval: entry.override.approval }
+          : {}),
+      });
+    }
+    const hasMoreRules =
+      i + 1 < enabledBuiltins.length || orderedCustom.length > 0;
+    if (hasMoreRules && checkExpired(clock)) {
+      return finalizeTimeout(
+        matches,
+        hasEnforcingBuiltinFrom(i + 1) || hasEnforcingCustomFrom(0),
+        policy.mode,
+      );
+    }
   }
 
-  if (checkExpired(clock)) return timedOutResult();
+  for (let i = 0; i < orderedCustom.length; i++) {
+    if (checkExpired(clock)) {
+      return finalizeTimeout(matches, hasEnforcingCustomFrom(i), policy.mode);
+    }
+    const rule = orderedCustom[i]!;
+    if (!matchesScope(rule.scope, input)) continue;
+    const matched = matchesCustomRule(rule, input, clock);
+    if (matched) {
+      matches.push({
+        rule_id: rule.id,
+        name: rule.name,
+        message: rule.message || rule.name,
+        action: rule.action,
+        severity: rule.severity,
+        source: "custom",
+        ...(rule.approval ? { approval: rule.approval } : {}),
+      });
+      if (i + 1 < orderedCustom.length && checkExpired(clock)) {
+        return finalizeTimeout(
+          matches,
+          hasEnforcingCustomFrom(i + 1),
+          policy.mode,
+        );
+      }
+    } else if (clock.timedOut) {
+      return finalizeTimeout(matches, hasEnforcingCustomFrom(i), policy.mode);
+    }
+  }
 
   if (matches.length === 0) {
     return {

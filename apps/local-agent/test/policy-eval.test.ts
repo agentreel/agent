@@ -3,7 +3,9 @@ import { dirname, join, relative, resolve } from "node:path";
 import { fileURLToPath } from "node:url";
 import ts from "typescript";
 import { describe, expect, it } from "vitest";
+import { RULES } from "../src/guard/rules.js";
 import {
+  EVAL_TIMEOUT_REASON,
   evaluatePolicy,
   matchGlob,
   POLICY_EVAL_DEADLINE_MS,
@@ -177,6 +179,39 @@ describe("RE2-safe regex compiler, cache, and timeout guard", () => {
     expect(isRe2SafePattern("(https?://[a-z]+)?")).toBe(true);
   });
 
+  it("statically rejects multiple unbounded quantifiers (polynomial ReDoS) while keeping legitimate single-unbounded fixtures valid", () => {
+    const rejected = [
+      "a.*a.*b",
+      "a.*a.*a.*a.*a.*a.*a.*a.*b",
+      "(a+)+",
+      ".*x.*y",
+      "a+b+",
+      "a{1,}b{1,}",
+      "a.*b{2,}",
+      ".*?foo.*?bar",
+      "\\w+.*\\w+",
+    ];
+    for (const pat of rejected) {
+      expect(isRe2SafePattern(pat), `expected reject: ${pat}`).toBe(false);
+      expect(compileSafeRegex(pat), `expected null compile: ${pat}`).toBeNull();
+    }
+
+    const accepted = [
+      "^https://[a-z0-9-]+\\.internal\\.corp/admin",
+      "^deploy-service-0 --env=(prod|staging) --region=[a-z0-9-]+$",
+      "https?://example\\.com/[a-z0-9/_-]+",
+      "[a*+]+",
+      "a\\*b\\+.*c",
+      "^rule_1_[0-9]{1,4}_[a-z]+$",
+    ];
+    for (const pat of accepted) {
+      expect(isRe2SafePattern(pat), `expected accept: ${pat}`).toBe(true);
+      expect(compileSafeRegex(pat), `expected compiled: ${pat}`).toBeInstanceOf(
+        RegExp,
+      );
+    }
+  });
+
   it("caches compiled regexes by pattern+flags and bounds cache size at 256 entries", () => {
     clearRegexCache();
     const r1 = compileSafeRegex("^deploy-[a-z]+$", { caseSensitive: false });
@@ -201,7 +236,7 @@ describe("RE2-safe regex compiler, cache, and timeout guard", () => {
   });
 });
 
-describe("evaluation deadline and latency budget", () => {
+describe("evaluation deadline, ordering, and fail-closed timeout semantics", () => {
   it("keeps p95 evaluation under 50ms with 20 regex custom rules", () => {
     clearRegexCache();
     const customRules = Array.from({ length: 20 }, (_, i) => ({
@@ -214,7 +249,7 @@ describe("evaluation deadline and latency budget", () => {
         {
           field: "command" as const,
           op: "regex" as const,
-          value: `^deploy-service-${i}\\s+--env=(prod|staging)\\s+--region=[a-z0-9-]+$`,
+          value: `^deploy-service-${i} --env=(prod|staging) --region=[a-z0-9-]+$`,
         },
       ],
       action: "block" as const,
@@ -254,18 +289,22 @@ describe("evaluation deadline and latency budget", () => {
     expect(p95).toBeLessThan(POLICY_EVAL_DEADLINE_MS);
   });
 
-  it("stops evaluating and fails open to allow when a pathological regex or slow rule hits the 50ms deadline", () => {
+  it("repro: preserves GIT001 block match when a later regex rule is pathological or times out", () => {
     clearRegexCache();
-    // Polynomial backtracking pattern that passes static RE2 checks
     const pathological = "a.*a.*a.*a.*a.*a.*a.*a.*b";
-    const policy: Policy = {
+    const reproCommand = "git push --force " + "a".repeat(35) + "z";
+
+    // 1. Pathological regex is statically rejected and GIT001 block still fires immediately
+    const policyPathological: Policy = {
       version: 1,
-      etag: "etag-deadline",
+      etag: "etag-repro-static",
       workspace_id: "ws_perf",
       updated_at: "2026-11-25T00:00:00Z",
       mode: "enforce",
       offline: "last_known",
-      builtin: {},
+      builtin: {
+        GIT001: { enabled: true, action: "block" },
+      },
       custom: [
         {
           id: "slow_regex",
@@ -274,36 +313,311 @@ describe("evaluation deadline and latency budget", () => {
           version: 1,
           message: "Slow",
           when: [{ field: "command", op: "regex", value: pathological }],
-          action: "block",
+          action: "flag",
           severity: "high",
-        },
-        {
-          id: "after_slow",
-          name: "Rule after slow regex",
-          enabled: true,
-          version: 1,
-          message: "Should not run after deadline",
-          when: [{ field: "command", op: "contains", value: "aaaa" }],
-          action: "block",
-          severity: "critical",
         },
       ],
       allow: { commands: [], paths: [], repos: [] },
     };
 
-    const t0 = performance.now();
-    const res = evaluatePolicy(
-      {
-        tool: "claude-code",
-        toolName: "Bash",
-        command: "a".repeat(35) + "z",
+    const staticRes = evaluatePolicy(
+      { tool: "claude-code", toolName: "Bash", command: reproCommand },
+      policyPathological,
+    );
+    expect(staticRes.action).toBe("block");
+    expect(staticRes.rule_ids).toContain("GIT001");
+    expect(staticRes.matches.some((m) => m.rule_id === "GIT001")).toBe(true);
+
+    // 2. Deterministic timeout via injectable clock after GIT001 matches and before a later regex rule finishes
+    const enabledBuiltinCount = RULES.filter((r) => {
+      const ov = r.id === "GIT001" ? { enabled: true } : undefined;
+      return ov !== undefined ? ov.enabled : r.enabled;
+    }).length;
+    let tick = 0;
+    const stepClock = (): number => {
+      tick += 1;
+      // Call 1 sets deadline (0 + 50). Builtins consume 2 ticks each; expire right before custom regex.
+      if (tick === 1) return 0;
+      return tick <= 1 + enabledBuiltinCount * 2 ? 10 : 100;
+    };
+
+    const policyTimeout: Policy = {
+      version: 1,
+      etag: "etag-repro-timeout",
+      workspace_id: "ws_perf",
+      updated_at: "2026-11-25T00:00:00Z",
+      mode: "enforce",
+      offline: "last_known",
+      builtin: {
+        GIT001: { enabled: true, action: "block" },
       },
+      custom: [
+        {
+          id: "later_regex",
+          name: "Later regex rule",
+          enabled: true,
+          version: 1,
+          message: "Later regex",
+          when: [{ field: "command", op: "regex", value: "^deploy-[a-z]+$" }],
+          action: "flag",
+          severity: "warn",
+        },
+      ],
+      allow: { commands: [], paths: [], repos: [] },
+    };
+
+    const timedRes = evaluatePolicy(
+      { tool: "claude-code", toolName: "Bash", command: reproCommand },
+      policyTimeout,
+      undefined,
+      { deadlineMs: 50, nowMs: stepClock },
+    );
+    expect(timedRes.timed_out).toBe(true);
+    expect(timedRes.action).toBe("block");
+    expect(timedRes.rule_ids).toContain("GIT001");
+    expect(timedRes.matches.some((m) => m.rule_id === "GIT001")).toBe(true);
+    expect(timedRes.reason).toBe(EVAL_TIMEOUT_REASON);
+  });
+
+  it("evaluates builtins and cheap custom matchers before regex rules, and enforcing regex before flag regex", () => {
+    clearRegexCache();
+    // Policy intentionally lists regex flag FIRST, then regex block, then cheap contains block.
+    const policy: Policy = {
+      version: 1,
+      etag: "etag-order",
+      workspace_id: "ws_order",
+      updated_at: "2026-11-25T00:00:00Z",
+      mode: "enforce",
+      offline: "last_known",
+      builtin: {
+        GIT001: { enabled: true, action: "block" },
+      },
+      custom: [
+        {
+          id: "regex_flag_first_in_list",
+          name: "Regex flag listed first",
+          enabled: true,
+          version: 1,
+          message: "Regex flag",
+          when: [{ field: "command", op: "regex", value: "git push.*" }],
+          action: "flag",
+          severity: "warn",
+        },
+        {
+          id: "regex_block_second_in_list",
+          name: "Regex block listed second",
+          enabled: true,
+          version: 1,
+          message: "Regex block",
+          when: [{ field: "command", op: "regex", value: "push --force" }],
+          action: "block",
+          severity: "high",
+        },
+        {
+          id: "cheap_contains_last_in_list",
+          name: "Cheap contains listed last",
+          enabled: true,
+          version: 1,
+          message: "Cheap block",
+          when: [{ field: "command", op: "contains", value: "--force" }],
+          action: "block",
+          severity: "high",
+        },
+      ],
+      allow: { commands: [], paths: [], repos: [] },
+    };
+
+    const full = evaluatePolicy(
+      { tool: "claude-code", toolName: "Bash", command: "git push --force origin main" },
       policy,
     );
-    const elapsed = performance.now() - t0;
-    expect(res.action).toBe("allow");
+    expect(full.action).toBe("block");
+    // Builtins first, then cheap custom, then enforcing regex, then flag regex.
+    const idxBuiltin = full.rule_ids.indexOf("GIT001");
+    const idxCheap = full.rule_ids.indexOf("cheap_contains_last_in_list");
+    const idxRegexBlock = full.rule_ids.indexOf("regex_block_second_in_list");
+    const idxRegexFlag = full.rule_ids.indexOf("regex_flag_first_in_list");
+    expect(idxBuiltin).toBeGreaterThanOrEqual(0);
+    expect(idxCheap).toBeGreaterThan(idxBuiltin);
+    expect(idxRegexBlock).toBeGreaterThan(idxCheap);
+    expect(idxRegexFlag).toBeGreaterThan(idxRegexBlock);
+  });
+
+  it("fails closed with eval_timeout when a block or require_approval rule is unevaluated on timeout", () => {
+    clearRegexCache();
+    for (const enforcingAction of ["block", "require_approval"] as const) {
+      let calls = 0;
+      // First call sets deadline = 0 + 50 = 50; next call immediately expires (60 >= 50)
+      const instantTimeoutClock = (): number => (calls++ === 0 ? 0 : 60);
+
+      const policy: Policy = {
+        version: 1,
+        etag: `etag-uneval-${enforcingAction}`,
+        workspace_id: "ws_timeout",
+        updated_at: "2026-11-25T00:00:00Z",
+        mode: "enforce",
+        offline: "last_known",
+        builtin: {},
+        custom: [
+          {
+            id: `uneval_${enforcingAction}`,
+            name: `Unevaluated ${enforcingAction}`,
+            enabled: true,
+            version: 1,
+            message: "Must fail closed if not evaluated",
+            when: [{ field: "command", op: "regex", value: "^never-matches-[0-9]+$" }],
+            action: enforcingAction,
+            severity: "high",
+          },
+        ],
+        allow: { commands: [], paths: [], repos: [] },
+      };
+
+      const res = evaluatePolicy(
+        { tool: "claude-code", toolName: "Bash", command: "echo safe" },
+        policy,
+        [],
+        { deadlineMs: 50, nowMs: instantTimeoutClock },
+      );
+
+      expect(res.timed_out).toBe(true);
+      expect(res.action).toBe("block");
+      expect(res.reason).toBe(EVAL_TIMEOUT_REASON);
+      expect(res.unevaluated_enforcing).toBe(true);
+    }
+  });
+
+  it("returns strictest result so far plus eval_timeout flag when only flag rules remain unevaluated", () => {
+    clearRegexCache();
+    // Case A: no prior matches, only a flag rule remains unevaluated -> flag + eval_timeout
+    let callsA = 0;
+    const clockA = (): number => (callsA++ === 0 ? 0 : 60);
+    const policyFlagOnly: Policy = {
+      version: 1,
+      etag: "etag-flag-only",
+      workspace_id: "ws_timeout",
+      updated_at: "2026-11-25T00:00:00Z",
+      mode: "enforce",
+      offline: "last_known",
+      builtin: {},
+      custom: [
+        {
+          id: "uneval_flag",
+          name: "Unevaluated flag",
+          enabled: true,
+          version: 1,
+          message: "Flag only",
+          when: [{ field: "command", op: "regex", value: "^audit-[a-z]+$" }],
+          action: "flag",
+          severity: "warn",
+        },
+      ],
+      allow: { commands: [], paths: [], repos: [] },
+    };
+
+    const resA = evaluatePolicy(
+      { tool: "claude-code", toolName: "Bash", command: "echo safe" },
+      policyFlagOnly,
+      [],
+      { deadlineMs: 50, nowMs: clockA },
+    );
+    expect(resA.timed_out).toBe(true);
+    expect(resA.action).toBe("flag");
+    expect(resA.reason).toBe(EVAL_TIMEOUT_REASON);
+    expect(resA.unevaluated_enforcing).toBe(false);
+
+    // Case B: cheap require_approval rule matches, then clock expires before remaining flag regex
+    let callsB = 0;
+    // Call 1 sets deadline=50. Calls 2..6 evaluate cheap_approval; call 7 expires right before later_flag_regex.
+    const clockB = (): number => {
+      callsB += 1;
+      if (callsB === 1) return 0;
+      return callsB <= 6 ? 10 : 60;
+    };
+    const policyApprovalThenFlag: Policy = {
+      version: 1,
+      etag: "etag-approval-then-flag",
+      workspace_id: "ws_timeout",
+      updated_at: "2026-11-25T00:00:00Z",
+      mode: "enforce",
+      offline: "last_known",
+      builtin: {},
+      custom: [
+        {
+          id: "cheap_approval",
+          name: "Cheap approval",
+          enabled: true,
+          version: 1,
+          message: "Needs approval",
+          when: [{ field: "command", op: "contains", value: "deploy" }],
+          action: "require_approval",
+          severity: "high",
+        },
+        {
+          id: "later_flag_regex",
+          name: "Later flag regex",
+          enabled: true,
+          version: 1,
+          message: "Flag regex",
+          when: [{ field: "command", op: "regex", value: "^audit-[a-z]+$" }],
+          action: "flag",
+          severity: "warn",
+        },
+      ],
+      allow: { commands: [], paths: [], repos: [] },
+    };
+
+    const resB = evaluatePolicy(
+      { tool: "claude-code", toolName: "Bash", command: "deploy staging" },
+      policyApprovalThenFlag,
+      [],
+      { deadlineMs: 50, nowMs: clockB },
+    );
+    expect(resB.timed_out).toBe(true);
+    expect(resB.action).toBe("require_approval");
+    expect(resB.rule_ids).toEqual(["cheap_approval"]);
+    expect(resB.reason).toBe(EVAL_TIMEOUT_REASON);
+    expect(resB.unevaluated_enforcing).toBe(false);
+  });
+
+  it("downgrades eval_timeout fail-closed block to flag in observe mode", () => {
+    clearRegexCache();
+    let calls = 0;
+    const clock = (): number => (calls++ === 0 ? 0 : 60);
+    const policyObserve: Policy = {
+      version: 1,
+      etag: "etag-observe-timeout",
+      workspace_id: "ws_timeout",
+      updated_at: "2026-11-25T00:00:00Z",
+      mode: "observe",
+      offline: "last_known",
+      builtin: {},
+      custom: [
+        {
+          id: "uneval_block",
+          name: "Unevaluated block",
+          enabled: true,
+          version: 1,
+          message: "Would block in enforce mode",
+          when: [{ field: "command", op: "regex", value: "^deploy-[a-z]+$" }],
+          action: "block",
+          severity: "high",
+        },
+      ],
+      allow: { commands: [], paths: [], repos: [] },
+    };
+
+    const res = evaluatePolicy(
+      { tool: "claude-code", toolName: "Bash", command: "echo safe" },
+      policyObserve,
+      [],
+      { deadlineMs: 50, nowMs: clock },
+    );
     expect(res.timed_out).toBe(true);
-    expect(elapsed).toBeLessThanOrEqual(POLICY_EVAL_DEADLINE_MS + 15);
+    expect(res.action).toBe("flag");
+    expect(res.downgraded).toBe(true);
+    expect(res.original_action).toBe("block");
+    expect(res.reason).toBe(EVAL_TIMEOUT_REASON);
   });
 });
 
