@@ -5,6 +5,7 @@ export const REGEX_TIMEOUT_MS = 50;
 export const MAX_REGEX_CACHE_SIZE = 256;
 const MAX_QUANTIFIER_BOUND = 100;
 const MAX_GROUP_DEPTH = 16;
+const MAX_UNICODE_CODE_POINT = 0x10ffff;
 
 const CHARSET_SIZE = 130; // 0..127 ASCII, 128 = non-ASCII space, 129 = non-ASCII non-space
 const NON_ASCII_SPACE = 128;
@@ -15,6 +16,10 @@ type CharSet = Uint8Array;
 interface GroupFrame {
   hasQuantifier: boolean;
   hasAlternation: boolean;
+  allBranchesLiteralOnly: boolean;
+  currentBranchLiteralOnly: boolean;
+  currentBranchTokenCount: number;
+  lastTokenIsLiteralLike: boolean;
 }
 
 interface SeqToken {
@@ -23,6 +28,20 @@ interface SeqToken {
   min: number;
   unbounded: boolean;
   isWhitespaceEscape: boolean;
+  isLiteral: boolean;
+  isLiteralOnlyGroup: boolean;
+  isCaret: boolean;
+}
+
+interface ParsedEscape {
+  end: number;
+  set: CharSet;
+  isWhitespaceEscape: boolean;
+  isAssertion: boolean;
+  isShorthandClass: boolean;
+  isLiteral: boolean;
+  singleCode: number | null;
+  exactNonAscii: boolean;
 }
 
 function emptyCharSet(): CharSet {
@@ -46,18 +65,23 @@ function addAsciiCode(set: CharSet, code: number): void {
   }
 }
 
-function addChar(set: CharSet, ch: string): { exactNonAscii: boolean } {
-  const code = ch.charCodeAt(0);
-  if (code < 128) {
+function addCodePoint(set: CharSet, code: number): { exactNonAscii: boolean } {
+  if (code >= 0 && code < 128) {
     addAsciiCode(set, code);
     return { exactNonAscii: true };
   }
+  const ch = String.fromCodePoint(code);
   if (/\s/.test(ch)) {
     set[NON_ASCII_SPACE] = 1;
   } else {
     set[NON_ASCII_NON_SPACE] = 1;
   }
   return { exactNonAscii: false };
+}
+
+function addChar(set: CharSet, ch: string): { exactNonAscii: boolean } {
+  const code = ch.codePointAt(0) ?? ch.charCodeAt(0);
+  return addCodePoint(set, code);
 }
 
 function unionInto(target: CharSet, src: CharSet): void {
@@ -118,77 +142,209 @@ const CONTROL_ESCAPES: Record<string, number> = {
   "0": 0,
 };
 
-function escapeToCharSet(
-  next: string,
+function isHexDigit(ch: string | undefined): boolean {
+  if (ch === undefined) return false;
+  return (
+    (ch >= "0" && ch <= "9") ||
+    (ch >= "a" && ch <= "f") ||
+    (ch >= "A" && ch <= "F")
+  );
+}
+
+/**
+ * Parses an escape sequence starting at pattern[start] === '\\'.
+ * Returns null if the escape is forbidden (\p, \P, \c, backreferences) or malformed.
+ */
+function parseEscape(
+  pattern: string,
+  start: number,
   inCharClass: boolean,
-): {
-  set: CharSet;
-  isWhitespaceEscape: boolean;
-  isAssertion: boolean;
-  isShorthandClass: boolean;
-  singleCode: number | null;
-} {
+): ParsedEscape | null {
+  const next = pattern[start + 1];
+  if (next === undefined) return null;
+
+  // Reject Unicode property escapes and control-letter escapes anywhere.
+  if (next === "p" || next === "P" || next === "c") {
+    return null;
+  }
+
+  // Reject backreferences outside character classes.
+  if (!inCharClass) {
+    if (next >= "1" && next <= "9") return null;
+    if (next === "k" && pattern[start + 2] === "<") return null;
+  }
+
+  // \xHH hex escape
+  if (next === "x") {
+    const h1 = pattern[start + 2];
+    const h2 = pattern[start + 3];
+    if (!isHexDigit(h1) || !isHexDigit(h2)) return null;
+    const code = parseInt(`${h1}${h2}`, 16);
+    const set = emptyCharSet();
+    const { exactNonAscii } = addCodePoint(set, code);
+    return {
+      end: start + 3,
+      set,
+      isWhitespaceEscape: false,
+      isAssertion: false,
+      isShorthandClass: false,
+      isLiteral: true,
+      singleCode: code,
+      exactNonAscii,
+    };
+  }
+
+  // \uHHHH or \u{H...} Unicode escape
+  if (next === "u") {
+    if (pattern[start + 2] === "{") {
+      const closeBrace = pattern.indexOf("}", start + 3);
+      if (closeBrace === -1) return null;
+      const hex = pattern.slice(start + 3, closeBrace);
+      if (hex.length === 0) return null;
+      for (let k = 0; k < hex.length; k++) {
+        if (!isHexDigit(hex[k])) return null;
+      }
+      const code = parseInt(hex, 16);
+      if (!Number.isFinite(code) || code > MAX_UNICODE_CODE_POINT) return null;
+      const set = emptyCharSet();
+      const { exactNonAscii } = addCodePoint(set, code);
+      return {
+        end: closeBrace,
+        set,
+        isWhitespaceEscape: false,
+        isAssertion: false,
+        isShorthandClass: false,
+        isLiteral: true,
+        singleCode: code,
+        exactNonAscii,
+      };
+    }
+
+    const h1 = pattern[start + 2];
+    const h2 = pattern[start + 3];
+    const h3 = pattern[start + 4];
+    const h4 = pattern[start + 5];
+    if (
+      !isHexDigit(h1) ||
+      !isHexDigit(h2) ||
+      !isHexDigit(h3) ||
+      !isHexDigit(h4)
+    ) {
+      return null;
+    }
+    const code = parseInt(`${h1}${h2}${h3}${h4}`, 16);
+    const set = emptyCharSet();
+    const { exactNonAscii } = addCodePoint(set, code);
+    return {
+      end: start + 5,
+      set,
+      isWhitespaceEscape: false,
+      isAssertion: false,
+      isShorthandClass: false,
+      isLiteral: true,
+      singleCode: code,
+      exactNonAscii,
+    };
+  }
+
   if (!inCharClass && (next === "b" || next === "B")) {
     return {
+      end: start + 1,
       set: emptyCharSet(),
       isWhitespaceEscape: false,
       isAssertion: true,
       isShorthandClass: false,
+      isLiteral: false,
       singleCode: null,
+      exactNonAscii: true,
     };
   }
+
+  if (inCharClass && next === "b") {
+    const set = emptyCharSet();
+    set[8] = 1;
+    return {
+      end: start + 1,
+      set,
+      isWhitespaceEscape: false,
+      isAssertion: false,
+      isShorthandClass: false,
+      isLiteral: true,
+      singleCode: 8,
+      exactNonAscii: true,
+    };
+  }
+
   if (next === "s") {
     return {
+      end: start + 1,
       set: SPACE_SET,
       isWhitespaceEscape: true,
       isAssertion: false,
       isShorthandClass: true,
+      isLiteral: false,
       singleCode: null,
+      exactNonAscii: true,
     };
   }
   if (next === "S") {
     return {
+      end: start + 1,
       set: NON_SPACE_SET,
       isWhitespaceEscape: false,
       isAssertion: false,
       isShorthandClass: true,
+      isLiteral: false,
       singleCode: null,
+      exactNonAscii: true,
     };
   }
   if (next === "d") {
     return {
+      end: start + 1,
       set: DIGIT_SET,
       isWhitespaceEscape: false,
       isAssertion: false,
       isShorthandClass: true,
+      isLiteral: false,
       singleCode: null,
+      exactNonAscii: true,
     };
   }
   if (next === "D") {
     return {
+      end: start + 1,
       set: NON_DIGIT_SET,
       isWhitespaceEscape: false,
       isAssertion: false,
       isShorthandClass: true,
+      isLiteral: false,
       singleCode: null,
+      exactNonAscii: true,
     };
   }
   if (next === "w") {
     return {
+      end: start + 1,
       set: WORD_SET,
       isWhitespaceEscape: false,
       isAssertion: false,
       isShorthandClass: true,
+      isLiteral: false,
       singleCode: null,
+      exactNonAscii: true,
     };
   }
   if (next === "W") {
     return {
+      end: start + 1,
       set: NON_WORD_SET,
       isWhitespaceEscape: false,
       isAssertion: false,
       isShorthandClass: true,
+      isLiteral: false,
       singleCode: null,
+      exactNonAscii: true,
     };
   }
   if (Object.prototype.hasOwnProperty.call(CONTROL_ESCAPES, next)) {
@@ -196,33 +352,42 @@ function escapeToCharSet(
     const set = emptyCharSet();
     set[code] = 1;
     return {
+      end: start + 1,
       set,
       isWhitespaceEscape: false,
       isAssertion: false,
       isShorthandClass: false,
+      isLiteral: true,
       singleCode: code,
+      exactNonAscii: true,
     };
   }
-  // Unmodeled escapes (\x, \u, \p, \P, \c, or unknown ASCII letters) conservatively overlap everything.
+  // Unknown ASCII letter escapes conservatively overlap everything.
   if ((next >= "a" && next <= "z") || (next >= "A" && next <= "Z")) {
     return {
+      end: start + 1,
       set: universalCharSet(),
       isWhitespaceEscape: false,
       isAssertion: false,
       isShorthandClass: true,
+      isLiteral: false,
       singleCode: null,
+      exactNonAscii: false,
     };
   }
   // Punctuation / literal escape (\|, \., \/, \-, \\, etc.)
   const set = emptyCharSet();
-  addChar(set, next);
-  const code = next.charCodeAt(0);
+  const { exactNonAscii } = addChar(set, next);
+  const code = next.codePointAt(0) ?? next.charCodeAt(0);
   return {
+    end: start + 1,
     set,
     isWhitespaceEscape: false,
     isAssertion: false,
     isShorthandClass: false,
-    singleCode: code < 128 ? code : null,
+    isLiteral: true,
+    singleCode: code,
+    exactNonAscii,
   };
 }
 
@@ -258,35 +423,39 @@ function parseCharClass(
     }
     firstItem = false;
 
-    // Range like a-z or 0-9 (only when preceded by a single literal and followed by non-']')
-    if (ch === "-" && prevSingleCode !== null && i + 1 < pattern.length && pattern[i + 1] !== "]") {
+    // Range like a-z, 0-9, or \x41-\x5A (only when preceded by a single literal and followed by non-']')
+    if (
+      ch === "-" &&
+      prevSingleCode !== null &&
+      i + 1 < pattern.length &&
+      pattern[i + 1] !== "]"
+    ) {
       i++;
       let endCode: number | null = null;
       if (pattern[i] === "\\") {
-        const next = pattern[i + 1];
-        if (next === undefined) return null;
-        const esc = escapeToCharSet(next, true);
+        const esc = parseEscape(pattern, i, true);
+        if (!esc) return null;
         if (esc.isShorthandClass || esc.singleCode === null) {
           unionInto(pos, universalCharSet());
           exactNonAscii = false;
         } else {
           endCode = esc.singleCode;
         }
-        i += 2;
+        i = esc.end + 1;
       } else {
-        const c = pattern[i]!.charCodeAt(0);
-        endCode = c < 128 ? c : null;
-        if (endCode === null) {
-          pos[NON_ASCII_SPACE] = 1;
-          pos[NON_ASCII_NON_SPACE] = 1;
-          exactNonAscii = false;
-        }
+        endCode = pattern[i]!.charCodeAt(0);
         i++;
       }
       if (endCode !== null) {
         if (endCode < prevSingleCode) return null;
-        for (let code = prevSingleCode; code <= endCode; code++) {
+        const asciiEnd = Math.min(endCode, 127);
+        for (let code = prevSingleCode; code <= asciiEnd; code++) {
           addAsciiCode(pos, code);
+        }
+        if (endCode >= 128) {
+          pos[NON_ASCII_SPACE] = 1;
+          pos[NON_ASCII_NON_SPACE] = 1;
+          exactNonAscii = false;
         }
       }
       prevSingleCode = null;
@@ -294,29 +463,42 @@ function parseCharClass(
     }
 
     if (ch === "\\") {
-      const next = pattern[i + 1];
-      if (next === undefined) return null;
-      const esc = escapeToCharSet(next, true);
+      const esc = parseEscape(pattern, i, true);
+      if (!esc) return null;
       unionInto(pos, esc.set);
-      if (esc.set[NON_ASCII_SPACE] && esc.set[NON_ASCII_NON_SPACE] && esc.singleCode === null && !esc.isShorthandClass) {
+      if (!esc.exactNonAscii) {
         exactNonAscii = false;
       }
       prevSingleCode = esc.isShorthandClass ? null : esc.singleCode;
-      i += 2;
+      i = esc.end + 1;
       continue;
     }
 
     const added = addChar(pos, ch);
     if (!added.exactNonAscii) exactNonAscii = false;
-    const code = ch.charCodeAt(0);
-    prevSingleCode = code < 128 ? code : null;
+    prevSingleCode = ch.charCodeAt(0);
     i++;
   }
 
   return null;
 }
 
+function hasMandatoryLeadingLiteral(tokens: SeqToken[]): boolean {
+  let idx = 0;
+  if (idx < tokens.length && tokens[idx]!.isCaret) {
+    idx++;
+  }
+  if (idx >= tokens.length) return false;
+  const first = tokens[idx]!;
+  if (first.unbounded || first.min < 1) return false;
+  if (first.kind === "atom" && first.isLiteral) return true;
+  if (first.kind === "group" && first.isLiteralOnlyGroup) return true;
+  return false;
+}
+
 function validateBranchUnboundedTokens(tokens: SeqToken[]): boolean {
+  if (!hasMandatoryLeadingLiteral(tokens)) return false;
+
   const unboundedIdx: number[] = [];
   for (let i = 0; i < tokens.length; i++) {
     if (tokens[i]!.unbounded) unboundedIdx.push(i);
@@ -375,6 +557,52 @@ function validateBranchUnboundedTokens(tokens: SeqToken[]): boolean {
   }
 
   return true;
+}
+
+/**
+ * Rewrites valid BMP \u{H...} escapes to \uHHHH so JS RegExp without the /u
+ * flag interprets them as the intended Unicode character rather than Annex B
+ * repetition of 'u'. Patterns using astral \u{10000}..code points request /u.
+ */
+function normalizePatternForRegExp(pattern: string): {
+  source: string;
+  needsUnicodeFlag: boolean;
+} {
+  let out = "";
+  let needsUnicodeFlag = false;
+  for (let i = 0; i < pattern.length; i++) {
+    const ch = pattern[i]!;
+    if (ch !== "\\") {
+      out += ch;
+      continue;
+    }
+    const next = pattern[i + 1];
+    if (next === "u" && pattern[i + 2] === "{") {
+      const closeBrace = pattern.indexOf("}", i + 3);
+      if (closeBrace !== -1) {
+        const hex = pattern.slice(i + 3, closeBrace);
+        const code = parseInt(hex, 16);
+        if (Number.isFinite(code) && code <= 0xffff) {
+          out += `\\u${code.toString(16).padStart(4, "0")}`;
+          i = closeBrace;
+          continue;
+        }
+        if (Number.isFinite(code) && code <= MAX_UNICODE_CODE_POINT) {
+          needsUnicodeFlag = true;
+          out += pattern.slice(i, closeBrace + 1);
+          i = closeBrace;
+          continue;
+        }
+      }
+    }
+    if (next !== undefined) {
+      out += ch + next;
+      i++;
+    } else {
+      out += ch;
+    }
+  }
+  return { source: out, needsUnicodeFlag };
 }
 
 const regexVmContext = vm.createContext({});
@@ -457,18 +685,28 @@ function parseBraceQuantifier(
   return { end: i, min, repeating, unbounded, tooLarge, invalidRange };
 }
 
+function createGroupFrame(): GroupFrame {
+  return {
+    hasQuantifier: false,
+    hasAlternation: false,
+    allBranchesLiteralOnly: true,
+    currentBranchLiteralOnly: true,
+    currentBranchTokenCount: 0,
+    lastTokenIsLiteralLike: false,
+  };
+}
+
 /**
  * Checks that a pattern stays within an RE2-safe subset without nested
  * repeating quantifiers, alternation-plus-quantifier groups, overlapping
- * multiple unbounded quantifiers, lookarounds, or backreferences.
+ * multiple unbounded quantifiers, unanchored/unprefixed multi-unbounded
+ * quantifiers, lookarounds, backreferences, or forbidden/malformed escapes.
  */
 export function isRe2SafePattern(pattern: string): boolean {
   if (typeof pattern !== "string") return false;
-  if (pattern.length > MAX_REGEX_LENGTH) return false;
+  if (pattern.length === 0 || pattern.length > MAX_REGEX_LENGTH) return false;
 
-  const stack: GroupFrame[] = [
-    { hasQuantifier: false, hasAlternation: false },
-  ];
+  const stack: GroupFrame[] = [createGroupFrame()];
   const topBranches: SeqToken[][] = [[]];
   let currentBranch = topBranches[0]!;
   let lastAtomWasQuantifiedGroup = false;
@@ -477,6 +715,17 @@ export function isRe2SafePattern(pattern: string): boolean {
   let justOpenedGroup = false;
   let totalUnbounded = 0;
   let hasUnboundedInsideGroup = false;
+
+  const recordGroupItem = (isLiteralLike: boolean): void => {
+    if (stack.length > 1) {
+      const frame = stack[stack.length - 1]!;
+      frame.currentBranchTokenCount++;
+      if (!isLiteralLike) {
+        frame.currentBranchLiteralOnly = false;
+      }
+      frame.lastTokenIsLiteralLike = isLiteralLike;
+    }
+  };
 
   const pushTopToken = (tok: SeqToken): void => {
     if (stack.length === 1) {
@@ -491,7 +740,12 @@ export function isRe2SafePattern(pattern: string): boolean {
         hasUnboundedInsideGroup = true;
       }
     }
-    if (stack.length === 1 && currentBranch.length > 0) {
+    if (stack.length > 1) {
+      const frame = stack[stack.length - 1]!;
+      if (unbounded || min < 1 || !frame.lastTokenIsLiteralLike) {
+        frame.currentBranchLiteralOnly = false;
+      }
+    } else if (currentBranch.length > 0) {
       const last = currentBranch[currentBranch.length - 1]!;
       last.min = min;
       if (unbounded) {
@@ -499,6 +753,7 @@ export function isRe2SafePattern(pattern: string): boolean {
         if (last.kind === "group") {
           last.charSet = universalCharSet();
           last.isWhitespaceEscape = false;
+          last.isLiteralOnlyGroup = false;
         }
       }
     }
@@ -521,45 +776,54 @@ export function isRe2SafePattern(pattern: string): boolean {
     }
 
     if (ch === "\\") {
-      const next = pattern[i + 1];
-      if (next === undefined) return false;
-      if (next >= "1" && next <= "9") return false;
-      if (next === "k" && pattern[i + 2] === "<") return false;
+      const esc = parseEscape(pattern, i, false);
+      if (!esc) return false;
 
-      const esc = escapeToCharSet(next, false);
       if (esc.isAssertion) {
+        recordGroupItem(false);
         pushTopToken({
           kind: "assertion",
           charSet: esc.set,
           min: 0,
           unbounded: false,
           isWhitespaceEscape: false,
+          isLiteral: false,
+          isLiteralOnlyGroup: false,
+          isCaret: false,
         });
       } else {
+        recordGroupItem(esc.isLiteral);
         pushTopToken({
           kind: "atom",
           charSet: esc.set,
           min: 1,
           unbounded: false,
           isWhitespaceEscape: esc.isWhitespaceEscape,
+          isLiteral: esc.isLiteral,
+          isLiteralOnlyGroup: false,
+          isCaret: false,
         });
       }
       lastAtomWasGroup = false;
       lastAtomWasQuantifiedGroup = false;
       lastAtomWasAlternationGroup = false;
-      i++;
+      i = esc.end;
       continue;
     }
 
     if (ch === "[") {
       const parsed = parseCharClass(pattern, i);
       if (!parsed) return false;
+      recordGroupItem(false);
       pushTopToken({
         kind: "atom",
         charSet: parsed.set,
         min: 1,
         unbounded: false,
         isWhitespaceEscape: false,
+        isLiteral: false,
+        isLiteralOnlyGroup: false,
+        isCaret: false,
       });
       i = parsed.end;
       lastAtomWasGroup = false;
@@ -569,8 +833,16 @@ export function isRe2SafePattern(pattern: string): boolean {
     }
 
     if (ch === "|") {
-      stack[stack.length - 1]!.hasAlternation = true;
-      if (stack.length === 1) {
+      const frame = stack[stack.length - 1]!;
+      frame.hasAlternation = true;
+      if (stack.length > 1) {
+        if (frame.currentBranchTokenCount === 0 || !frame.currentBranchLiteralOnly) {
+          frame.allBranchesLiteralOnly = false;
+        }
+        frame.currentBranchLiteralOnly = true;
+        frame.currentBranchTokenCount = 0;
+        frame.lastTokenIsLiteralLike = false;
+      } else {
         currentBranch = [];
         topBranches.push(currentBranch);
       }
@@ -592,7 +864,7 @@ export function isRe2SafePattern(pattern: string): boolean {
           return false;
         }
       }
-      stack.push({ hasQuantifier: false, hasAlternation: false });
+      stack.push(createGroupFrame());
       justOpenedGroup = true;
       lastAtomWasGroup = false;
       lastAtomWasQuantifiedGroup = false;
@@ -610,12 +882,20 @@ export function isRe2SafePattern(pattern: string): boolean {
       if (closed.hasAlternation) {
         parent.hasAlternation = true;
       }
+      const closedLiteralOnly =
+        closed.allBranchesLiteralOnly &&
+        closed.currentBranchLiteralOnly &&
+        closed.currentBranchTokenCount > 0;
+      recordGroupItem(closedLiteralOnly);
       pushTopToken({
         kind: "group",
         charSet: universalCharSet(),
         min: 1,
         unbounded: false,
         isWhitespaceEscape: false,
+        isLiteral: false,
+        isLiteralOnlyGroup: closedLiteralOnly,
+        isCaret: false,
       });
       lastAtomWasGroup = true;
       lastAtomWasQuantifiedGroup = closed.hasQuantifier;
@@ -673,30 +953,42 @@ export function isRe2SafePattern(pattern: string): boolean {
     }
 
     if (ch === "^" || ch === "$") {
+      recordGroupItem(false);
       pushTopToken({
         kind: "assertion",
         charSet: emptyCharSet(),
         min: 0,
         unbounded: false,
         isWhitespaceEscape: false,
+        isLiteral: false,
+        isLiteralOnlyGroup: false,
+        isCaret: ch === "^",
       });
     } else if (ch === ".") {
+      recordGroupItem(false);
       pushTopToken({
         kind: "atom",
         charSet: universalCharSet(),
         min: 1,
         unbounded: false,
         isWhitespaceEscape: false,
+        isLiteral: false,
+        isLiteralOnlyGroup: false,
+        isCaret: false,
       });
     } else {
       const set = emptyCharSet();
       addChar(set, ch);
+      recordGroupItem(true);
       pushTopToken({
         kind: "atom",
         charSet: set,
         min: 1,
         unbounded: false,
         isWhitespaceEscape: false,
+        isLiteral: true,
+        isLiteralOnlyGroup: false,
+        isCaret: false,
       });
     }
 
@@ -716,7 +1008,8 @@ export function isRe2SafePattern(pattern: string): boolean {
 
   try {
     // Syntax check only (never executes regex matching).
-    new RegExp(pattern);
+    const normalized = normalizePatternForRegExp(pattern);
+    new RegExp(normalized.source, normalized.needsUnicodeFlag ? "u" : "");
   } catch {
     return false;
   }
@@ -739,10 +1032,10 @@ export function compileSafeRegex(
   opts: SafeRegexOptions = {},
 ): RegExp | null {
   if (typeof pattern !== "string") return null;
-  if (pattern.length > MAX_REGEX_LENGTH) return null;
+  if (pattern.length === 0 || pattern.length > MAX_REGEX_LENGTH) return null;
 
-  const flags = opts.caseSensitive ? "" : "i";
-  const cacheKey = `${flags}\0${pattern}`;
+  const baseFlags = opts.caseSensitive ? "" : "i";
+  const cacheKey = `${baseFlags}\0${pattern}`;
   if (compiledRegexCache.has(cacheKey)) {
     const cached = compiledRegexCache.get(cacheKey) ?? null;
     setCachedRegex(cacheKey, cached);
@@ -754,14 +1047,17 @@ export function compileSafeRegex(
     return null;
   }
 
+  const normalized = normalizePatternForRegExp(pattern);
+  const flags = normalized.needsUnicodeFlag ? `${baseFlags}u` : baseFlags;
+
   const timeoutMs = opts.timeoutMs ?? REGEX_TIMEOUT_MS;
   try {
-    regexVmContext.pattern = pattern;
+    regexVmContext.pattern = normalized.source;
     regexVmContext.flags = flags;
     compileScript.runInContext(regexVmContext, {
       timeout: timeoutMs,
     });
-    const compiled = new RegExp(pattern, flags);
+    const compiled = new RegExp(normalized.source, flags);
     setCachedRegex(cacheKey, compiled);
     return compiled;
   } catch (err) {

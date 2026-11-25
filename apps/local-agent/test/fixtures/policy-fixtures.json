@@ -1261,6 +1261,129 @@
         "action": "block",
         "rule_ids": ["cust_curl_pipe_sh"]
       }
+    },
+    {
+      "name": "hex-escaped overlapping unbounded quantifiers are rejected by validatePolicy and fail closed in eval",
+      "expected_valid": false,
+      "expected_rejected_rule_id": "cust_hex_escape_regex",
+      "expected_rejected_condition_index": 0,
+      "policy": {
+        "version": 1,
+        "etag": "etag-35",
+        "workspace_id": "ws_test",
+        "updated_at": "2026-11-25T00:00:00Z",
+        "mode": "enforce",
+        "offline": "last_known",
+        "builtin": {},
+        "custom": [
+          {
+            "id": "cust_hex_escape_regex",
+            "name": "Hex-escaped A+B+ regex",
+            "enabled": true,
+            "version": 1,
+            "message": "Decoded escape quantifiers without barrier must be rejected",
+            "when": [
+              { "field": "command", "op": "regex", "value": "\\x41+\\x42+" }
+            ],
+            "action": "block",
+            "severity": "high",
+            "scope": {}
+          }
+        ],
+        "allow": { "commands": [], "paths": [], "repos": [] }
+      },
+      "input": {
+        "tool": "claude-code",
+        "toolName": "Bash",
+        "command": "echo AABB"
+      },
+      "expected": {
+        "action": "block",
+        "rule_ids": [],
+        "reason": "invalid_rule",
+        "invalid_rule_ids": ["cust_hex_escape_regex"]
+      }
+    },
+    {
+      "name": "multi-quantifier regex without mandatory leading literal is rejected by validatePolicy and fails closed in eval",
+      "expected_valid": false,
+      "expected_rejected_rule_id": "cust_no_leading_literal",
+      "expected_rejected_condition_index": 0,
+      "policy": {
+        "version": 1,
+        "etag": "etag-36",
+        "workspace_id": "ws_test",
+        "updated_at": "2026-11-25T00:00:00Z",
+        "mode": "enforce",
+        "offline": "last_known",
+        "builtin": {},
+        "custom": [
+          {
+            "id": "cust_no_leading_literal",
+            "name": "Unprefixed word whitespace word regex",
+            "enabled": true,
+            "version": 1,
+            "message": "Multi-unbounded regex must start with a mandatory literal",
+            "when": [
+              { "field": "command", "op": "regex", "value": "\\w+\\s+\\w+" }
+            ],
+            "action": "block",
+            "severity": "high",
+            "scope": {}
+          }
+        ],
+        "allow": { "commands": [], "paths": [], "repos": [] }
+      },
+      "input": {
+        "tool": "claude-code",
+        "toolName": "Bash",
+        "command": "echo hello"
+      },
+      "expected": {
+        "action": "block",
+        "rule_ids": [],
+        "reason": "invalid_rule",
+        "invalid_rule_ids": ["cust_no_leading_literal"]
+      }
+    },
+    {
+      "name": "anchored multi-quantifier org regex with leading literal passes validatePolicy and blocks",
+      "policy": {
+        "version": 1,
+        "etag": "etag-37",
+        "workspace_id": "ws_test",
+        "updated_at": "2026-11-25T00:00:00Z",
+        "mode": "enforce",
+        "offline": "last_known",
+        "builtin": {
+          "GIT001": { "enabled": false, "action": "flag" }
+        },
+        "custom": [
+          {
+            "id": "cust_git_force_push",
+            "name": "Block anchored git push --force",
+            "enabled": true,
+            "version": 1,
+            "message": "Force push is blocked",
+            "when": [
+              { "field": "command", "op": "regex", "value": "^git\\s+push\\s+--force" }
+            ],
+            "action": "block",
+            "severity": "critical",
+            "scope": {}
+          }
+        ],
+        "allow": { "commands": [], "paths": [], "repos": [] }
+      },
+      "input": {
+        "tool": "claude-code",
+        "toolName": "Bash",
+        "command": "git push --force origin main"
+      },
+      "expected": {
+        "action": "block",
+        "rule_ids": ["cust_git_force_push"]
+      }
     }
   ]
 }
