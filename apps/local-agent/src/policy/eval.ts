@@ -15,6 +15,7 @@ import type {
 
 export const POLICY_EVAL_DEADLINE_MS = 50;
 export const EVAL_TIMEOUT_REASON = "eval_timeout";
+export const INVALID_RULE_REASON = "invalid_rule";
 
 export interface PolicyEvalInput {
   tool: PolicyTool;
@@ -46,6 +47,8 @@ export interface PolicyEvalResult {
   downgraded: boolean;
   original_action?: PolicyAction;
   timed_out?: boolean;
+  invalid_rule?: boolean;
+  invalid_rule_ids?: string[];
   reason?: string;
   unevaluated_enforcing?: boolean;
 }
@@ -334,10 +337,15 @@ function extractFieldCandidates(
   }
 }
 
+interface RuleEvalState {
+  compileFailed: boolean;
+}
+
 function matchConditionAgainstCandidate(
   cond: CustomRuleCondition,
   candidate: FieldCandidate,
   clock: EvalClock,
+  state: RuleEvalState,
 ): boolean {
   if (checkExpired(clock)) return false;
 
@@ -372,8 +380,12 @@ function matchConditionAgainstCandidate(
           clock.timedOut = true;
         },
       });
+      if (clock.timedOut) return false;
+      if (!re) {
+        state.compileFailed = true;
+        return false;
+      }
       if (checkExpired(clock)) return false;
-      if (!re) return false;
       const remainingBeforeTest = clock.deadline - clock.nowMs();
       if (remainingBeforeTest <= 0) {
         clock.timedOut = true;
@@ -398,14 +410,15 @@ function matchesCondition(
   cond: CustomRuleCondition,
   input: PolicyEvalInput,
   clock: EvalClock,
+  state: RuleEvalState,
 ): boolean {
   if (checkExpired(clock)) return false;
   const candidates = extractFieldCandidates(cond.field, input);
   if (candidates.length === 0) return false;
   for (const c of candidates) {
     if (checkExpired(clock)) return false;
-    if (matchConditionAgainstCandidate(cond, c, clock)) return true;
-    if (clock.timedOut) return false;
+    if (matchConditionAgainstCandidate(cond, c, clock, state)) return true;
+    if (clock.timedOut || state.compileFailed) return false;
   }
   return false;
 }
@@ -414,14 +427,15 @@ function matchesCustomRule(
   rule: CustomRule,
   input: PolicyEvalInput,
   clock: EvalClock,
+  state: RuleEvalState,
 ): boolean {
   if (checkExpired(clock)) return false;
   if (!rule.enabled) return false;
   if (!rule.when || rule.when.length === 0) return false;
   if (!matchesScope(rule.scope, input)) return false;
   for (const cond of rule.when) {
-    if (!matchesCondition(cond, input, clock)) return false;
-    if (clock.timedOut) return false;
+    if (!matchesCondition(cond, input, clock, state)) return false;
+    if (clock.timedOut || state.compileFailed) return false;
   }
   return true;
 }
@@ -510,6 +524,56 @@ function finalizeTimeout(
     downgraded: false,
     timed_out: true,
     reason: EVAL_TIMEOUT_REASON,
+    unevaluated_enforcing: unevaluatedEnforcing,
+  };
+}
+
+function finalizeInvalidRule(
+  matches: PolicyRuleMatch[],
+  invalidRuleIds: string[],
+  unevaluatedEnforcing: boolean,
+  mode: Policy["mode"],
+): PolicyEvalResult {
+  let strictest: PolicyAction | null = null;
+  for (const m of matches) {
+    if (strictest === null || ACTION_RANK[m.action] > ACTION_RANK[strictest]) {
+      strictest = m.action;
+    }
+  }
+
+  let effective: PolicyAction;
+  if (unevaluatedEnforcing) {
+    effective = "block";
+  } else if (strictest !== null && ACTION_RANK[strictest] > ACTION_RANK.flag) {
+    effective = strictest;
+  } else {
+    effective = "flag";
+  }
+
+  const ruleIds = matches.map((m) => m.rule_id);
+
+  if (mode === "observe" && isEnforcingAction(effective)) {
+    return {
+      action: "flag",
+      rule_ids: ruleIds,
+      matches,
+      downgraded: true,
+      original_action: effective,
+      invalid_rule: true,
+      invalid_rule_ids: invalidRuleIds,
+      reason: INVALID_RULE_REASON,
+      unevaluated_enforcing: unevaluatedEnforcing,
+    };
+  }
+
+  return {
+    action: effective,
+    rule_ids: ruleIds,
+    matches,
+    downgraded: false,
+    invalid_rule: true,
+    invalid_rule_ids: invalidRuleIds,
+    reason: INVALID_RULE_REASON,
     unevaluated_enforcing: unevaluatedEnforcing,
   };
 }
@@ -616,13 +680,21 @@ export function evaluatePolicy(
     }
   }
 
+  const invalidRuleIds: string[] = [];
+  let invalidEnforcing = false;
+
   for (let i = 0; i < orderedCustom.length; i++) {
     if (checkExpired(clock)) {
-      return finalizeTimeout(matches, hasEnforcingCustomFrom(i), policy.mode);
+      return finalizeTimeout(
+        matches,
+        invalidEnforcing || hasEnforcingCustomFrom(i),
+        policy.mode,
+      );
     }
     const rule = orderedCustom[i]!;
     if (!matchesScope(rule.scope, input)) continue;
-    const matched = matchesCustomRule(rule, input, clock);
+    const state: RuleEvalState = { compileFailed: false };
+    const matched = matchesCustomRule(rule, input, clock, state);
     if (matched) {
       matches.push({
         rule_id: rule.id,
@@ -636,13 +708,31 @@ export function evaluatePolicy(
       if (i + 1 < orderedCustom.length && checkExpired(clock)) {
         return finalizeTimeout(
           matches,
-          hasEnforcingCustomFrom(i + 1),
+          invalidEnforcing || hasEnforcingCustomFrom(i + 1),
           policy.mode,
         );
       }
     } else if (clock.timedOut) {
-      return finalizeTimeout(matches, hasEnforcingCustomFrom(i), policy.mode);
+      return finalizeTimeout(
+        matches,
+        invalidEnforcing || hasEnforcingCustomFrom(i),
+        policy.mode,
+      );
+    } else if (state.compileFailed) {
+      invalidRuleIds.push(rule.id);
+      if (isEnforcingAction(rule.action)) {
+        invalidEnforcing = true;
+      }
     }
+  }
+
+  if (invalidRuleIds.length > 0) {
+    return finalizeInvalidRule(
+      matches,
+      invalidRuleIds,
+      invalidEnforcing,
+      policy.mode,
+    );
   }
 
   if (matches.length === 0) {

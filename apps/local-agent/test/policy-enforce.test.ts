@@ -3000,4 +3000,117 @@ describe("pause and AGENTREEL_DISABLE=1 keep enforcing org policy without captur
     expect(formatted).toContain("paused (recording stopped; org policy still enforced)");
     expect(formatted).toContain("active (enforce)");
   });
+
+  it("defense in depth: forced uncompilable regex in cache denies with invalid_rule for block and records flag for flag", async () => {
+    const makeCachedBadRegexPolicy = (action: "block" | "flag"): Policy => ({
+      version: 1,
+      etag: `etag-forced-bad-${action}`,
+      workspace_id: "ws_acme",
+      org_name: "Acme Corp",
+      org_slug: "acme",
+      updated_at: "2026-11-25T00:00:00Z",
+      mode: "enforce",
+      offline: "last_known",
+      builtin: {},
+      custom: [
+        {
+          id: `cust_cached_bad_${action}`,
+          name: `Forced bad ${action} rule`,
+          enabled: true,
+          version: 1,
+          message: "Forced uncompilable regex in cache",
+          when: [
+            { field: "command", op: "regex", value: "a.*a.*a.*a.*a.*a.*a.*a.*b" },
+          ],
+          action,
+          severity: action === "block" ? "critical" : "warn",
+          scope: {},
+        },
+      ],
+      allow: { commands: [], paths: [], repos: [] },
+    });
+
+    // 1. Forced bad block rule written directly to policy.json cache -> deny with reason invalid_rule
+    writeFileSync(
+      cachePath,
+      JSON.stringify({
+        policy: makeCachedBadRegexPolicy("block"),
+        etag: "etag-forced-bad-block",
+        fetched_at: Date.now(),
+      }),
+      { mode: 0o600 },
+    );
+
+    const blockDecisions: AgentEvent[] = [];
+    const blockLogs: string[] = [];
+    const blockOutcome = await enforce.enforcePreExec(
+      {
+        sessionId: "sess-bad-regex-block",
+        tool: "claude-code",
+        toolName: "Bash",
+        command: "echo hello",
+      },
+      {
+        cachePath,
+        guardConfigPath,
+        config: makeConfig("http://127.0.0.1:1"),
+        recordDecision: (e) => blockDecisions.push(e),
+        log: (m) => blockLogs.push(m),
+      },
+    );
+
+    expect(blockOutcome.permitted).toBe(false);
+    expect(blockOutcome.action).toBe("block");
+    expect(blockOutcome.enforced).toBe(true);
+    expect(blockOutcome.reason).toBe(enforce.INVALID_RULE_REASON);
+    expect(blockOutcome.message).toContain("Blocked by Acme Corp policy");
+    expect(blockOutcome.message).toContain("cust_cached_bad_block");
+    expect(blockOutcome.message).toContain("unsupported regex");
+    expect(blockDecisions.length).toBe(1);
+    const blockPayload = blockDecisions[0]!.payload as Record<string, unknown>;
+    expect(blockPayload.action).toBe("block");
+    expect(blockPayload.enforced).toBe(true);
+    expect(blockPayload.reason).toBe("invalid_rule");
+    expect(blockPayload.rule_id).toBe("cust_cached_bad_block");
+    expect(blockLogs.some((l) => l.includes("cust_cached_bad_block"))).toBe(true);
+
+    // 2. Forced bad flag rule written directly to policy.json cache -> permit + recorded flag with invalid_rule
+    writeFileSync(
+      cachePath,
+      JSON.stringify({
+        policy: makeCachedBadRegexPolicy("flag"),
+        etag: "etag-forced-bad-flag",
+        fetched_at: Date.now(),
+      }),
+      { mode: 0o600 },
+    );
+
+    const flagDecisions: AgentEvent[] = [];
+    const flagOutcome = await enforce.enforcePreExec(
+      {
+        sessionId: "sess-bad-regex-flag",
+        tool: "claude-code",
+        toolName: "Bash",
+        command: "echo hello",
+      },
+      {
+        cachePath,
+        guardConfigPath,
+        config: makeConfig("http://127.0.0.1:1"),
+        recordDecision: (e) => flagDecisions.push(e),
+        log: () => {},
+      },
+    );
+
+    expect(flagOutcome.permitted).toBe(true);
+    expect(flagOutcome.action).toBe("flag");
+    expect(flagOutcome.enforced).toBe(false);
+    expect(flagOutcome.reason).toBe(enforce.INVALID_RULE_REASON);
+    expect(flagDecisions.length).toBe(1);
+    const flagPayload = flagDecisions[0]!.payload as Record<string, unknown>;
+    expect(flagPayload.action).toBe("flag");
+    expect(flagPayload.enforced).toBe(false);
+    expect(flagPayload.reason).toBe("invalid_rule");
+    expect(flagPayload.rule_id).toBe("cust_cached_bad_flag");
+  });
 });

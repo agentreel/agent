@@ -36,6 +36,88 @@ export interface PolicyAgeInfo {
   clockSkewed: boolean;
 }
 
+export interface PolicyRejectionRecord {
+  ts: number;
+  error: string;
+  rule_id?: string;
+  condition_index?: number;
+  reason: "unsupported_regex" | "invalid_policy";
+}
+
+export function policyRejectionPath(cachePath: string = POLICY_PATH): string {
+  return `${cachePath}.rejected.json`;
+}
+
+export function readPolicyRejection(
+  cachePath: string = POLICY_PATH,
+): PolicyRejectionRecord | null {
+  try {
+    const p = policyRejectionPath(cachePath);
+    if (!existsSync(p)) return null;
+    const parsed = JSON.parse(readFileSync(p, "utf8")) as Record<string, unknown>;
+    if (!parsed || typeof parsed !== "object" || Array.isArray(parsed)) {
+      return null;
+    }
+    if (
+      typeof parsed.ts !== "number" ||
+      typeof parsed.error !== "string" ||
+      (parsed.reason !== "unsupported_regex" && parsed.reason !== "invalid_policy")
+    ) {
+      return null;
+    }
+    return {
+      ts: parsed.ts,
+      error: parsed.error,
+      reason: parsed.reason,
+      ...(typeof parsed.rule_id === "string" ? { rule_id: parsed.rule_id } : {}),
+      ...(typeof parsed.condition_index === "number"
+        ? { condition_index: parsed.condition_index }
+        : {}),
+    };
+  } catch {
+    return null;
+  }
+}
+
+export function writePolicyRejectionAtomic(
+  record: PolicyRejectionRecord,
+  cachePath: string = POLICY_PATH,
+): void {
+  const target = policyRejectionPath(cachePath);
+  const dir = dirname(target);
+  mkdirSync(dir, { recursive: true });
+  const suffix = randomBytes(6).toString("hex");
+  const tmpPath = `${target}.tmp.${process.pid}.${suffix}`;
+  const serialized = JSON.stringify(record, null, 2) + "\n";
+  try {
+    writeFileSync(tmpPath, serialized, { encoding: "utf8", mode: 0o600 });
+    try {
+      chmodSync(tmpPath, 0o600);
+    } catch {
+      // Best effort on non-Unix filesystems.
+    }
+    renameSync(tmpPath, target);
+  } catch (err) {
+    try {
+      unlinkSync(tmpPath);
+    } catch {
+      // Ignore cleanup failures.
+    }
+    throw err;
+  }
+}
+
+export function clearPolicyRejection(cachePath: string = POLICY_PATH): void {
+  try {
+    const target = policyRejectionPath(cachePath);
+    if (existsSync(target)) {
+      unlinkSync(target);
+    }
+  } catch {
+    // Never throw on rejection sidecar cleanup.
+  }
+}
+
 /**
  * Reads and validates ~/.agentreel/policy.json.
  * Corrupt, invalid, or unreadable cache files are treated as no cache and never throw.

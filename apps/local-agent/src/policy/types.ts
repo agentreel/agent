@@ -1,4 +1,5 @@
 import type { Severity } from "../guard/types.js";
+import { isRe2SafePattern } from "./regex.js";
 
 export type PolicyMode = "observe" | "enforce";
 export type PolicyOfflineMode = "last_known" | "fail_open";
@@ -166,7 +167,17 @@ export interface CachedPolicyFile {
 
 export type ValidationResult<T> =
   | { ok: true; value: T }
-  | { ok: false; error: string };
+  | {
+      ok: false;
+      error: string;
+      rejectedRuleId?: string;
+      rejectedConditionIndex?: number;
+    };
+
+export interface ValidatePolicyOptions {
+  /** Skip regex subset checks (used only when reading already-cached files so defense-in-depth eval handles them). */
+  skipRegexValidation?: boolean;
+}
 
 const POLICY_MODES = new Set<string>(["observe", "enforce"]);
 const OFFLINE_MODES = new Set<string>(["last_known", "fail_open"]);
@@ -245,6 +256,9 @@ export function isValidSeverity(v: unknown): v is Severity {
 function validateCondition(
   input: unknown,
   path: string,
+  ruleId: string,
+  condIndex: number,
+  skipRegexValidation: boolean,
 ): ValidationResult<CustomRuleCondition> {
   if (!isPlainObject(input)) {
     return { ok: false, error: `${path} must be an object` };
@@ -263,6 +277,18 @@ function validateCondition(
     typeof input.case_sensitive !== "boolean"
   ) {
     return { ok: false, error: `${path}.case_sensitive must be a boolean` };
+  }
+  if (
+    input.op === "regex" &&
+    !skipRegexValidation &&
+    !isRe2SafePattern(input.value)
+  ) {
+    return {
+      ok: false,
+      error: `rule ${ruleId} has an unsupported regex at when[${condIndex}]`,
+      rejectedRuleId: ruleId,
+      rejectedConditionIndex: condIndex,
+    };
   }
   return {
     ok: true,
@@ -321,6 +347,7 @@ function validateScope(
 function validateCustomRule(
   input: unknown,
   index: number,
+  skipRegexValidation: boolean,
 ): ValidationResult<CustomRule> {
   const path = `custom[${index}]`;
   if (!isPlainObject(input)) {
@@ -350,7 +377,13 @@ function validateCustomRule(
   }
   const when: CustomRuleCondition[] = [];
   for (let i = 0; i < input.when.length; i++) {
-    const cond = validateCondition(input.when[i], `${path}.when[${i}]`);
+    const cond = validateCondition(
+      input.when[i],
+      `${path}.when[${i}]`,
+      input.id,
+      i,
+      skipRegexValidation,
+    );
     if (!cond.ok) return cond;
     when.push(cond.value);
   }
@@ -389,7 +422,10 @@ function validateCustomRule(
   };
 }
 
-export function validatePolicy(input: unknown): ValidationResult<Policy> {
+export function validatePolicy(
+  input: unknown,
+  opts: ValidatePolicyOptions = {},
+): ValidationResult<Policy> {
   if (!isPlainObject(input)) {
     return { ok: false, error: "policy must be an object" };
   }
@@ -485,8 +521,9 @@ export function validatePolicy(input: unknown): ValidationResult<Policy> {
     return { ok: false, error: "policy.custom must be an array" };
   }
   const custom: CustomRule[] = [];
+  const skipRegexValidation = opts.skipRegexValidation === true;
   for (let i = 0; i < input.custom.length; i++) {
-    const r = validateCustomRule(input.custom[i], i);
+    const r = validateCustomRule(input.custom[i], i, skipRegexValidation);
     if (!r.ok) return r;
     custom.push(r.value);
   }
@@ -549,7 +586,9 @@ export function validateCachedPolicyFile(
       error: "cached policy fetched_at must be a finite non-negative number",
     };
   }
-  const validatedPolicy = validatePolicy(input.policy);
+  const validatedPolicy = validatePolicy(input.policy, {
+    skipRegexValidation: true,
+  });
   if (!validatedPolicy.ok) {
     return validatedPolicy;
   }

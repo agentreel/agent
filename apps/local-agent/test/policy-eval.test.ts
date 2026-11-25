@@ -7,6 +7,7 @@ import { RULES } from "../src/guard/rules.js";
 import {
   EVAL_TIMEOUT_REASON,
   evaluatePolicy,
+  INVALID_RULE_REASON,
   matchGlob,
   POLICY_EVAL_DEADLINE_MS,
   type PolicyEvalInput,
@@ -24,11 +25,16 @@ import { validatePolicy, type Policy, type PolicyDecisionAction } from "../src/p
 
 interface PolicyFixtureCase {
   name: string;
+  expected_valid?: boolean;
+  expected_rejected_rule_id?: string;
+  expected_rejected_condition_index?: number;
   policy: Policy;
   input: PolicyEvalInput;
   expected: {
     action: PolicyDecisionAction;
     rule_ids: string[];
+    reason?: string;
+    invalid_rule_ids?: string[];
   };
 }
 
@@ -52,11 +58,40 @@ describe("shared policy-fixtures.json parity", () => {
 
   it.each(fixtures.cases)("$name", (fixtureCase) => {
     const validated = validatePolicy(fixtureCase.policy);
-    expect(validated.ok).toBe(true);
+    if (fixtureCase.expected_valid === false) {
+      expect(validated.ok).toBe(false);
+      if (!validated.ok) {
+        if (fixtureCase.expected_rejected_rule_id) {
+          expect(validated.error).toContain(fixtureCase.expected_rejected_rule_id);
+          expect(validated.rejectedRuleId).toBe(
+            fixtureCase.expected_rejected_rule_id,
+          );
+        }
+        if (fixtureCase.expected_rejected_condition_index !== undefined) {
+          expect(validated.error).toContain(
+            `when[${fixtureCase.expected_rejected_condition_index}]`,
+          );
+          expect(validated.rejectedConditionIndex).toBe(
+            fixtureCase.expected_rejected_condition_index,
+          );
+        }
+      }
+    } else {
+      expect(validated.ok).toBe(true);
+    }
 
     const result = evaluatePolicy(fixtureCase.input, fixtureCase.policy);
     expect(result.action).toBe(fixtureCase.expected.action);
     expect(result.rule_ids).toEqual(fixtureCase.expected.rule_ids);
+    if (fixtureCase.expected.reason !== undefined) {
+      expect(result.reason).toBe(fixtureCase.expected.reason);
+    }
+    if (fixtureCase.expected.invalid_rule_ids !== undefined) {
+      expect(result.invalid_rule).toBe(true);
+      expect(result.invalid_rule_ids).toEqual(
+        fixtureCase.expected.invalid_rule_ids,
+      );
+    }
 
     // Every match carries rule_id and name/message
     expect(result.matches.length).toBe(fixtureCase.expected.rule_ids.length);
@@ -892,5 +927,149 @@ describe("transitive hook import graph network isolation", () => {
         dynamic: true,
       },
     ]);
+  });
+});
+
+describe("validatePolicy regex safety and eval invalid_rule defense in depth", () => {
+  it("validatePolicy rejects fixture 33 shape naming rule id and condition index", () => {
+    const fixture33 = fixtures.cases.find((c) => c.policy.etag === "etag-33");
+    expect(fixture33).toBeDefined();
+    const res = validatePolicy(fixture33!.policy);
+    expect(res.ok).toBe(false);
+    if (!res.ok) {
+      expect(res.error).toContain("cust_multi_unbounded_regex");
+      expect(res.error).toContain("when[0]");
+      expect(res.rejectedRuleId).toBe("cust_multi_unbounded_regex");
+      expect(res.rejectedConditionIndex).toBe(0);
+    }
+  });
+
+  it("validatePolicy reports the exact condition index for multi-condition rules", () => {
+    const policy: Policy = {
+      version: 1,
+      etag: "etag-cond-idx",
+      workspace_id: "ws_1",
+      updated_at: "2026-11-25T00:00:00Z",
+      mode: "enforce",
+      offline: "last_known",
+      builtin: {},
+      custom: [
+        {
+          id: "cust_second_cond_bad",
+          name: "Second condition has unsupported regex",
+          enabled: true,
+          version: 1,
+          message: "Bad second condition",
+          when: [
+            { field: "command", op: "contains", value: "curl" },
+            { field: "command", op: "regex", value: "curl.*\\|\\s*(ba)?sh" },
+          ],
+          action: "block",
+          severity: "high",
+          scope: {},
+        },
+      ],
+      allow: { commands: [], paths: [], repos: [] },
+    };
+    const res = validatePolicy(policy);
+    expect(res.ok).toBe(false);
+    if (!res.ok) {
+      expect(res.error).toContain("cust_second_cond_bad");
+      expect(res.error).toContain("when[1]");
+      expect(res.rejectedRuleId).toBe("cust_second_cond_bad");
+      expect(res.rejectedConditionIndex).toBe(1);
+    }
+  });
+
+  it("evaluatePolicy treats uncompilable regex in a flag rule as flag with invalid_rule", () => {
+    const policy: Policy = {
+      version: 1,
+      etag: "etag-bad-flag",
+      workspace_id: "ws_1",
+      updated_at: "2026-11-25T00:00:00Z",
+      mode: "enforce",
+      offline: "last_known",
+      builtin: {},
+      custom: [
+        {
+          id: "cust_bad_flag",
+          name: "Bad flag regex",
+          enabled: true,
+          version: 1,
+          message: "Bad flag",
+          when: [{ field: "command", op: "regex", value: "(a+)+" }],
+          action: "flag",
+          severity: "warn",
+          scope: {},
+        },
+      ],
+      allow: { commands: [], paths: [], repos: [] },
+    };
+
+    const result = evaluatePolicy(
+      { tool: "claude-code", toolName: "Bash", command: "echo hi" },
+      policy,
+    );
+    expect(result.action).toBe("flag");
+    expect(result.invalid_rule).toBe(true);
+    expect(result.invalid_rule_ids).toEqual(["cust_bad_flag"]);
+    expect(result.reason).toBe(INVALID_RULE_REASON);
+    expect(result.unevaluated_enforcing).toBe(false);
+  });
+
+  it("evaluatePolicy fails closed with invalid_rule for block and require_approval rules, downgraded in observe mode", () => {
+    const makePolicy = (
+      action: "block" | "require_approval",
+      mode: "enforce" | "observe",
+    ): Policy => ({
+      version: 1,
+      etag: `etag-bad-${action}-${mode}`,
+      workspace_id: "ws_1",
+      updated_at: "2026-11-25T00:00:00Z",
+      mode,
+      offline: "last_known",
+      builtin: {},
+      custom: [
+        {
+          id: `cust_bad_${action}`,
+          name: "Bad enforcing regex",
+          enabled: true,
+          version: 1,
+          message: "Bad enforcing",
+          when: [{ field: "command", op: "regex", value: "(a+)+" }],
+          action,
+          severity: "critical",
+          scope: {},
+        },
+      ],
+      allow: { commands: [], paths: [], repos: [] },
+    });
+
+    const blockRes = evaluatePolicy(
+      { tool: "claude-code", toolName: "Bash", command: "echo hi" },
+      makePolicy("block", "enforce"),
+    );
+    expect(blockRes.action).toBe("block");
+    expect(blockRes.reason).toBe(INVALID_RULE_REASON);
+    expect(blockRes.invalid_rule_ids).toEqual(["cust_bad_block"]);
+    expect(blockRes.unevaluated_enforcing).toBe(true);
+
+    const approvalRes = evaluatePolicy(
+      { tool: "claude-code", toolName: "Bash", command: "echo hi" },
+      makePolicy("require_approval", "enforce"),
+    );
+    expect(approvalRes.action).toBe("block");
+    expect(approvalRes.reason).toBe(INVALID_RULE_REASON);
+    expect(approvalRes.invalid_rule_ids).toEqual(["cust_bad_require_approval"]);
+    expect(approvalRes.unevaluated_enforcing).toBe(true);
+
+    const observeRes = evaluatePolicy(
+      { tool: "claude-code", toolName: "Bash", command: "echo hi" },
+      makePolicy("block", "observe"),
+    );
+    expect(observeRes.action).toBe("flag");
+    expect(observeRes.downgraded).toBe(true);
+    expect(observeRes.original_action).toBe("block");
+    expect(observeRes.reason).toBe(INVALID_RULE_REASON);
   });
 });

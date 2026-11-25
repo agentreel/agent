@@ -18,6 +18,8 @@ import {
   getPolicyCacheAgeMs,
   isPolicyCacheStale,
   loadEffectivePolicy,
+  readPolicyRejection,
+  type PolicyRejectionRecord,
   type PolicySource,
 } from "../policy/cache.js";
 import {
@@ -58,6 +60,7 @@ export interface DoctorReport {
   stale: boolean;
   capturePaused: boolean;
   enforcementActive: boolean;
+  lastRejection: PolicyRejectionRecord | null;
   expectedPreExecTimeoutS: number;
   maxPolicyApprovalExpiresS: number | null;
   needsReinit: boolean;
@@ -113,6 +116,7 @@ export function inspectDoctorState(opts: DoctorInspectOptions = {}): DoctorRepor
       : false;
 
   const capturePaused = isCapturePaused(cfg);
+  const lastRejection = readPolicyRejection(opts.cachePath ?? POLICY_PATH);
 
   const enforcementActive =
     loaded.source === "server_cache" &&
@@ -166,6 +170,7 @@ export function inspectDoctorState(opts: DoctorInspectOptions = {}): DoctorRepor
     stale,
     capturePaused,
     enforcementActive,
+    lastRejection,
     expectedPreExecTimeoutS,
     maxPolicyApprovalExpiresS,
     needsReinit: claudeNeedsReinit || cursorNeedsReinit,
@@ -255,6 +260,15 @@ export function formatDoctorReport(report: DoctorReport): string {
         ? pc.green(`ok (${h.timeoutS}s)`)
         : pc.yellow(`timeout ${formatTimeoutLabel(h.timeoutS)} < ${report.expectedPreExecTimeoutS}s`);
     lines.push(`    - ${h.event.padEnd(21)} ${status}`);
+  }
+
+  if (report.lastRejection) {
+    const rejectionMsg =
+      report.lastRejection.reason === "unsupported_regex" &&
+      report.lastRejection.rule_id
+        ? `policy rejected by agent: rule ${report.lastRejection.rule_id} has an unsupported regex; last known policy still in use`
+        : `policy rejected by agent: ${report.lastRejection.error}; last known policy still in use`;
+    lines.push("", pc.yellow(`  warning:        ${rejectionMsg}`));
   }
 
   if (report.needsReinit && report.maxPolicyApprovalExpiresS !== null) {
