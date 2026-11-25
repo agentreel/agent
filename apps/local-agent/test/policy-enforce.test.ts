@@ -2065,4 +2065,392 @@ describe("hook deadline enforcement, timeout pre-check, init recording, and doct
     expect(okReport.cursor.needsReinitForApproval).toBe(false);
     expect(doctor.formatDoctorReport(okReport)).not.toContain("warning:");
   });
+
+  it("denies as timeout (never offline_allow) when POST resolves with 500 after the deadline", async () => {
+    await import("../src/policy/approval.js");
+    vi.useFakeTimers();
+    const baseTime = 1_764_400_000_000;
+    vi.setSystemTime(baseTime);
+
+    const policy = makeEnforcePolicy({
+      etag: "etag-post-late-500",
+      builtin: {
+        GIT001: {
+          enabled: true,
+          action: "require_approval",
+          approval: { expires_s: 30, offline_fallback: "allow" },
+        },
+      },
+    });
+    cache.writeCachedPolicyAtomic(
+      { policy, etag: policy.etag, fetched_at: baseTime },
+      cachePath,
+    );
+
+    const deadlineMs = baseTime + 4_000;
+    // Resolves with HTTP 500 after deadline without rejecting as AbortError (abortedByTimeout=false).
+    const fetchImpl: typeof fetch = () =>
+      new Promise<Response>((resolve) => {
+        setTimeout(() => {
+          resolve(new Response(JSON.stringify({ error: "server error" }), { status: 500 }));
+        }, 4_050);
+      });
+
+    const outcomePromise = enforce.enforcePreExec(
+      {
+        sessionId: "sess-post-late-500",
+        tool: "claude-code",
+        toolName: "Bash",
+        command: "git push --force origin main",
+      },
+      {
+        cachePath,
+        guardConfigPath,
+        config: makeConfig("https://api.agentreel.dev", "ar_live_key", {
+          installedHookTimeouts: { claude: 40, cursor: 40 },
+        }),
+        hookDeadlineMs: deadlineMs,
+        fetchImpl,
+        onWaiting: () => {},
+        recordDecision: () => {},
+      },
+    );
+
+    await vi.advanceTimersByTimeAsync(4_050);
+    const outcome = await outcomePromise;
+    expect(outcome.permitted).toBe(false);
+    expect(outcome.enforced).toBe(true);
+    expect(outcome.downgraded).toBe(false);
+    expect(outcome.decision?.approval_status).toBe("timeout");
+  });
+
+  it("denies as timeout (never offline_allow) when poll resolves with 503 after the deadline", async () => {
+    await import("../src/policy/approval.js");
+    vi.useFakeTimers();
+    const baseTime = 1_764_410_000_000;
+    vi.setSystemTime(baseTime);
+
+    const policy = makeEnforcePolicy({
+      etag: "etag-poll-late-503",
+      builtin: {
+        GIT001: {
+          enabled: true,
+          action: "require_approval",
+          approval: { expires_s: 30, offline_fallback: "allow" },
+        },
+      },
+    });
+    cache.writeCachedPolicyAtomic(
+      { policy, etag: policy.etag, fetched_at: baseTime },
+      cachePath,
+    );
+
+    const deadlineMs = baseTime + 5_000;
+    const fetchImpl: typeof fetch = (_input, init) => {
+      if ((init?.method ?? "GET").toUpperCase() === "POST") {
+        return Promise.resolve(
+          new Response(
+            JSON.stringify({
+              approval_id: "apr_late_503",
+              status: "pending",
+              poll_after_ms: 0,
+            }),
+            { status: 200, headers: { "content-type": "application/json" } },
+          ),
+        );
+      }
+      // Poll resolves with 503 after the deadline (abortedByTimeout=false).
+      return new Promise<Response>((resolve) => {
+        setTimeout(() => {
+          resolve(new Response(JSON.stringify({ error: "unavailable" }), { status: 503 }));
+        }, 5_050);
+      });
+    };
+
+    const outcomePromise = enforce.enforcePreExec(
+      {
+        sessionId: "sess-poll-late-503",
+        tool: "cursor",
+        toolName: "Shell",
+        command: "git push --force origin main",
+      },
+      {
+        cachePath,
+        guardConfigPath,
+        config: makeConfig("https://api.agentreel.dev", "ar_live_key", {
+          installedHookTimeouts: { claude: 40, cursor: 40 },
+        }),
+        hookDeadlineMs: deadlineMs,
+        fetchImpl,
+        onWaiting: () => {},
+        recordDecision: () => {},
+        minPollDelayMs: 0,
+      },
+    );
+
+    await vi.advanceTimersByTimeAsync(5_050);
+    const outcome = await outcomePromise;
+    expect(outcome.permitted).toBe(false);
+    expect(outcome.enforced).toBe(true);
+    expect(outcome.downgraded).toBe(false);
+    expect(outcome.decision?.approval_status).toBe("timeout");
+  });
+
+  it("denies as timeout (never offline_allow) when a network error is thrown after the deadline", async () => {
+    await import("../src/policy/approval.js");
+    vi.useFakeTimers();
+    const baseTime = 1_764_420_000_000;
+    vi.setSystemTime(baseTime);
+
+    const policy = makeEnforcePolicy({
+      etag: "etag-neterr-after-deadline",
+      builtin: {
+        GIT001: {
+          enabled: true,
+          action: "require_approval",
+          approval: { expires_s: 30, offline_fallback: "allow" },
+        },
+      },
+    });
+    cache.writeCachedPolicyAtomic(
+      { policy, etag: policy.etag, fetched_at: baseTime },
+      cachePath,
+    );
+
+    const deadlineMs = baseTime + 5_000;
+    // Simulates clock advancing past deadline before rejection arrives without AbortError.
+    const fetchImpl: typeof fetch = () =>
+      new Promise<Response>((_resolve, reject) => {
+        setTimeout(() => {
+          vi.setSystemTime(deadlineMs + 50);
+          reject(new TypeError("socket hang up"));
+        }, 1_000);
+      });
+
+    const outcomePromise = enforce.enforcePreExec(
+      {
+        sessionId: "sess-neterr-after-deadline",
+        tool: "claude-code",
+        toolName: "Bash",
+        command: "git push --force origin main",
+      },
+      {
+        cachePath,
+        guardConfigPath,
+        config: makeConfig("https://api.agentreel.dev", "ar_live_key", {
+          installedHookTimeouts: { claude: 40, cursor: 40 },
+        }),
+        hookDeadlineMs: deadlineMs,
+        fetchImpl,
+        onWaiting: () => {},
+        recordDecision: () => {},
+      },
+    );
+
+    await vi.advanceTimersByTimeAsync(1_000);
+    const outcome = await outcomePromise;
+    expect(outcome.permitted).toBe(false);
+    expect(outcome.enforced).toBe(true);
+    expect(outcome.downgraded).toBe(false);
+    expect(outcome.decision?.approval_status).toBe("timeout");
+  });
+
+  it("still applies offline_fallback allow when a 500 arrives before the deadline (control case)", async () => {
+    await import("../src/policy/approval.js");
+    vi.useFakeTimers();
+    const baseTime = 1_764_430_000_000;
+    vi.setSystemTime(baseTime);
+
+    const policy = makeEnforcePolicy({
+      etag: "etag-500-before-deadline",
+      builtin: {
+        GIT001: {
+          enabled: true,
+          action: "require_approval",
+          approval: { expires_s: 30, offline_fallback: "allow" },
+        },
+      },
+    });
+    cache.writeCachedPolicyAtomic(
+      { policy, etag: policy.etag, fetched_at: baseTime },
+      cachePath,
+    );
+
+    const deadlineMs = baseTime + 10_000;
+    let attempts = 0;
+    const fetchImpl: typeof fetch = () => {
+      attempts++;
+      return new Promise<Response>((resolve) => {
+        setTimeout(() => {
+          resolve(new Response(JSON.stringify({ error: "server error" }), { status: 500 }));
+        }, 50);
+      });
+    };
+
+    const outcomePromise = enforce.enforcePreExec(
+      {
+        sessionId: "sess-500-before-deadline",
+        tool: "claude-code",
+        toolName: "Bash",
+        command: "git push --force origin main",
+      },
+      {
+        cachePath,
+        guardConfigPath,
+        config: makeConfig("https://api.agentreel.dev", "ar_live_key", {
+          installedHookTimeouts: { claude: 40, cursor: 40 },
+        }),
+        hookDeadlineMs: deadlineMs,
+        fetchImpl,
+        onWaiting: () => {},
+        recordDecision: () => {},
+        retryDelayMs: 50,
+      },
+    );
+
+    await vi.advanceTimersByTimeAsync(500);
+    const outcome = await outcomePromise;
+    expect(attempts).toBe(2);
+    expect(outcome.permitted).toBe(true);
+    expect(outcome.enforced).toBe(false);
+    expect(outcome.downgraded).toBe(true);
+    expect(outcome.decision?.approval_status).toBe("offline_allow");
+  });
+
+  it("pins the 5s hook deadline margin boundary (installedTimeoutS=130: expires_s=126 denies with no POST, expires_s=125 proceeds, doctor boundary)", async () => {
+    const start = 1_764_500_000_000;
+    expect(types.computeHookDeadlineMs(130, start)).toBe(start + 125_000);
+
+    const cfg = makeConfig("https://api.agentreel.dev", "ar_live_key", {
+      installedHookTimeouts: { claude: 130, cursor: 130 },
+    });
+
+    // 1. expires_s=126 (> 130 - 5 = 125) -> immediate deny with init message and NO POST
+    const policy126 = makeEnforcePolicy({
+      etag: "etag-boundary-126",
+      builtin: {
+        GIT001: {
+          enabled: true,
+          action: "require_approval",
+          approval: { expires_s: 126, offline_fallback: "allow" },
+        },
+      },
+    });
+    cache.writeCachedPolicyAtomic(
+      { policy: policy126, etag: policy126.etag, fetched_at: start },
+      cachePath,
+    );
+
+    const fetchSpy126 = vi.fn();
+    const res126 = await enforce.enforcePreExec(
+      {
+        sessionId: "sess-boundary-126",
+        tool: "claude-code",
+        toolName: "Bash",
+        command: "git push --force origin main",
+      },
+      {
+        cachePath,
+        guardConfigPath,
+        config: cfg,
+        fetchImpl: fetchSpy126 as unknown as typeof fetch,
+        onWaiting: () => {},
+        recordDecision: () => {},
+      },
+    );
+    expect(fetchSpy126).not.toHaveBeenCalled();
+    expect(res126.permitted).toBe(false);
+    expect(res126.enforced).toBe(true);
+    expect(res126.reason).toBe(enforce.HOOK_TIMEOUT_TOO_SHORT_REASON);
+    expect(res126.message).toBe(
+      "Admin approval for Force push to main branch needs a longer hook timeout than is installed. Run `npx @agentreel/agent init` to update hook timeouts.",
+    );
+
+    // 2. expires_s=125 (=== 130 - 5) -> proceeds to POST
+    const policy125 = makeEnforcePolicy({
+      etag: "etag-boundary-125",
+      builtin: {
+        GIT001: {
+          enabled: true,
+          action: "require_approval",
+          approval: { expires_s: 125, offline_fallback: "deny" },
+        },
+      },
+    });
+    cache.writeCachedPolicyAtomic(
+      { policy: policy125, etag: policy125.etag, fetched_at: start },
+      cachePath,
+    );
+
+    const fetchSpy125 = vi.fn(async () =>
+      new Response(
+        JSON.stringify({
+          approval_id: "apr_boundary_125",
+          status: "approved",
+          decided_by: "admin@acme.com",
+        }),
+        { status: 200, headers: { "content-type": "application/json" } },
+      ),
+    );
+    const res125 = await enforce.enforcePreExec(
+      {
+        sessionId: "sess-boundary-125",
+        tool: "claude-code",
+        toolName: "Bash",
+        command: "git push --force origin main",
+      },
+      {
+        cachePath,
+        guardConfigPath,
+        config: cfg,
+        fetchImpl: fetchSpy125 as unknown as typeof fetch,
+        onWaiting: () => {},
+        recordDecision: () => {},
+      },
+    );
+    expect(fetchSpy125).toHaveBeenCalledTimes(1);
+    expect(res125.permitted).toBe(true);
+    expect(res125.decision?.approval_status).toBe("approved");
+
+    // 3. Doctor boundary: 126 warns, 125 does not warn
+    const claudePath = join(workDir, "boundary-claude.json");
+    const cursorPath = join(workDir, "boundary-cursor.json");
+    claudeInstall.installClaudeCodeHooks("/usr/local/bin/agentreel", {
+      settingsPath: claudePath,
+      preExecTimeoutS: 130,
+    });
+    cursorInstall.installCursorHooks("/usr/local/bin/agentreel", cursorPath, {
+      preExecTimeoutS: 130,
+    });
+
+    cache.writeCachedPolicyAtomic(
+      { policy: policy126, etag: policy126.etag, fetched_at: start },
+      cachePath,
+    );
+    const doc126 = doctor.inspectDoctorState({
+      cachePath,
+      guardConfigPath,
+      claudeSettingsPath: claudePath,
+      cursorHooksPath: cursorPath,
+      config: cfg,
+      now: start + 1000,
+    });
+    expect(doc126.needsReinit).toBe(true);
+    expect(doctor.formatDoctorReport(doc126)).toContain("warning:");
+
+    cache.writeCachedPolicyAtomic(
+      { policy: policy125, etag: policy125.etag, fetched_at: start },
+      cachePath,
+    );
+    const doc125 = doctor.inspectDoctorState({
+      cachePath,
+      guardConfigPath,
+      claudeSettingsPath: claudePath,
+      cursorHooksPath: cursorPath,
+      config: cfg,
+      now: start + 1000,
+    });
+    expect(doc125.needsReinit).toBe(false);
+    expect(doctor.formatDoctorReport(doc125)).not.toContain("warning:");
+  });
 });
