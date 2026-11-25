@@ -1,15 +1,20 @@
-import { readFileSync } from "node:fs";
-import { dirname, join } from "node:path";
+import { existsSync, readFileSync } from "node:fs";
+import { dirname, join, relative, resolve } from "node:path";
 import { fileURLToPath } from "node:url";
+import ts from "typescript";
 import { describe, expect, it } from "vitest";
 import {
   evaluatePolicy,
   matchGlob,
+  POLICY_EVAL_DEADLINE_MS,
   type PolicyEvalInput,
 } from "../src/policy/eval.js";
 import {
+  clearRegexCache,
   compileSafeRegex,
+  getRegexCacheSize,
   isRe2SafePattern,
+  MAX_REGEX_CACHE_SIZE,
   MAX_REGEX_LENGTH,
   testSafeRegex,
 } from "../src/policy/regex.js";
@@ -127,16 +132,20 @@ describe("observe mode never blocks or requires approval", () => {
   });
 });
 
-describe("RE2-safe regex compiler and timeout guard", () => {
-  it("accepts safe RE2 patterns up to 300 chars", () => {
+describe("RE2-safe regex compiler, cache, and timeout guard", () => {
+  it("accepts safe RE2 patterns up to 300 chars and benign alternations without repeating quantifiers", () => {
     const pat = "a".repeat(MAX_REGEX_LENGTH);
     expect(isRe2SafePattern(pat)).toBe(true);
     const re = compileSafeRegex(pat);
     expect(re).toBeInstanceOf(RegExp);
     expect(testSafeRegex(re!, pat)).toBe(true);
+
+    expect(isRe2SafePattern("^https://(api|admin)\\.example\\.com")).toBe(true);
+    expect(isRe2SafePattern("(foo|bar)?baz")).toBe(true);
+    expect(compileSafeRegex("^https://(api|admin)\\.example\\.com")).toBeInstanceOf(RegExp);
   });
 
-  it("rejects over-length, invalid, lookaround, backreference, and nested-quantifier patterns without throwing", () => {
+  it("statically rejects over-length, invalid, lookaround, backreference, nested-quantifier, and alternation-plus-quantifier patterns", () => {
     expect(compileSafeRegex("a".repeat(MAX_REGEX_LENGTH + 1))).toBeNull();
     expect(compileSafeRegex("[unclosed(")).toBeNull();
     expect(compileSafeRegex("foo(?=bar)")).toBeNull();
@@ -148,16 +157,153 @@ describe("RE2-safe regex compiler and timeout guard", () => {
     expect(compileSafeRegex("(a+)+b")).toBeNull();
     expect(compileSafeRegex("([a-z]*)*$")).toBeNull();
     expect(compileSafeRegex("a{1,500}")).toBeNull();
+    // Alternation-plus-quantifier ReDoS patterns statically rejected
+    expect(isRe2SafePattern("(a|aa)+$")).toBe(false);
+    expect(isRe2SafePattern("(a|a?)+")).toBe(false);
+    expect(isRe2SafePattern("(x|xy)*")).toBe(false);
+    expect(isRe2SafePattern("((a|aa))+$")).toBe(false);
+    expect(isRe2SafePattern("(foo|foobar){2,10}")).toBe(false);
+    expect(compileSafeRegex("(a|aa)+$")).toBeNull();
+    expect(compileSafeRegex("(a|a?)+")).toBeNull();
+    expect(compileSafeRegex("(x|xy)*")).toBeNull();
+  });
+
+  it("statically rejects optional-quantifier-in-repeating-group ReDoS while allowing safe optional patterns", () => {
+    expect(isRe2SafePattern("(a?a)+$")).toBe(false);
+    expect(isRe2SafePattern("(a{0,1}a)+$")).toBe(false);
+    expect(isRe2SafePattern("(\\w+-?)+$")).toBe(false);
+    expect(isRe2SafePattern("https?://example\\.com")).toBe(true);
+    expect(isRe2SafePattern("(foo|bar)?")).toBe(true);
+    expect(isRe2SafePattern("(https?://[a-z]+)?")).toBe(true);
+  });
+
+  it("caches compiled regexes by pattern+flags and bounds cache size at 256 entries", () => {
+    clearRegexCache();
+    const r1 = compileSafeRegex("^deploy-[a-z]+$", { caseSensitive: false });
+    const r2 = compileSafeRegex("^deploy-[a-z]+$", { caseSensitive: false });
+    const r3 = compileSafeRegex("^deploy-[a-z]+$", { caseSensitive: true });
+    expect(r1).toBe(r2);
+    expect(r1).not.toBe(r3);
+
+    for (let i = 0; i < MAX_REGEX_CACHE_SIZE + 50; i++) {
+      compileSafeRegex(`^rule_${i}_[0-9]+$`);
+    }
+    expect(getRegexCacheSize()).toBe(MAX_REGEX_CACHE_SIZE);
   });
 
   it("interrupts slow backtracking patterns via VM timeout without throwing", () => {
-    const re = compileSafeRegex("(a|aa)+$");
-    expect(re).not.toBeNull();
+    const slowRe = new RegExp("(a+)+$");
     const t0 = performance.now();
-    const matched = testSafeRegex(re!, "a".repeat(30) + "b", 40);
+    const matched = testSafeRegex(slowRe, "a".repeat(30) + "b", 30);
     const elapsed = performance.now() - t0;
     expect(matched).toBe(false);
-    expect(elapsed).toBeLessThan(500);
+    expect(elapsed).toBeLessThan(250);
+  });
+});
+
+describe("evaluation deadline and latency budget", () => {
+  it("keeps p95 evaluation under 50ms with 20 regex custom rules", () => {
+    clearRegexCache();
+    const customRules = Array.from({ length: 20 }, (_, i) => ({
+      id: `regex_rule_${i}`,
+      name: `Regex Rule ${i}`,
+      enabled: true,
+      version: 1,
+      message: `Matched regex rule ${i}`,
+      when: [
+        {
+          field: "command" as const,
+          op: "regex" as const,
+          value: `^deploy-service-${i}\\s+--env=(prod|staging)\\s+--region=[a-z0-9-]+$`,
+        },
+      ],
+      action: "block" as const,
+      severity: "high" as const,
+    }));
+
+    const policy: Policy = {
+      version: 1,
+      etag: "etag-latency",
+      workspace_id: "ws_perf",
+      updated_at: "2026-11-25T00:00:00Z",
+      mode: "enforce",
+      offline: "last_known",
+      builtin: {},
+      custom: customRules,
+      allow: { commands: [], paths: [], repos: [] },
+    };
+
+    const input: PolicyEvalInput = {
+      tool: "claude-code",
+      toolName: "Bash",
+      command: "pnpm vitest run test/policy-eval.test.ts --reporter=verbose",
+    };
+
+    const samples: number[] = [];
+    for (let i = 0; i < 40; i++) {
+      const t0 = performance.now();
+      const res = evaluatePolicy(input, policy);
+      const dt = performance.now() - t0;
+      expect(res.action).toBe("allow");
+      expect(res.timed_out).toBeUndefined();
+      samples.push(dt);
+    }
+
+    samples.sort((a, b) => a - b);
+    const p95 = samples[Math.floor(samples.length * 0.95)]!;
+    expect(p95).toBeLessThan(POLICY_EVAL_DEADLINE_MS);
+  });
+
+  it("stops evaluating and fails open to allow when a pathological regex or slow rule hits the 50ms deadline", () => {
+    clearRegexCache();
+    // Polynomial backtracking pattern that passes static RE2 checks
+    const pathological = "a.*a.*a.*a.*a.*a.*a.*a.*b";
+    const policy: Policy = {
+      version: 1,
+      etag: "etag-deadline",
+      workspace_id: "ws_perf",
+      updated_at: "2026-11-25T00:00:00Z",
+      mode: "enforce",
+      offline: "last_known",
+      builtin: {},
+      custom: [
+        {
+          id: "slow_regex",
+          name: "Pathological regex",
+          enabled: true,
+          version: 1,
+          message: "Slow",
+          when: [{ field: "command", op: "regex", value: pathological }],
+          action: "block",
+          severity: "high",
+        },
+        {
+          id: "after_slow",
+          name: "Rule after slow regex",
+          enabled: true,
+          version: 1,
+          message: "Should not run after deadline",
+          when: [{ field: "command", op: "contains", value: "aaaa" }],
+          action: "block",
+          severity: "critical",
+        },
+      ],
+      allow: { commands: [], paths: [], repos: [] },
+    };
+
+    const t0 = performance.now();
+    const res = evaluatePolicy(
+      {
+        tool: "claude-code",
+        toolName: "Bash",
+        command: "a".repeat(35) + "z",
+      },
+      policy,
+    );
+    const elapsed = performance.now() - t0;
+    expect(res.action).toBe("allow");
+    expect(res.timed_out).toBe(true);
+    expect(elapsed).toBeLessThan(200);
   });
 });
 
@@ -183,24 +329,203 @@ describe("linear-time glob matching", () => {
   });
 });
 
-describe("hook network isolation for policy modules", () => {
-  const srcRoot = join(here, "..", "src");
+describe("transitive hook import graph network isolation", () => {
+  const srcRoot = resolve(here, "..", "src");
+  const APPROVAL_CLIENT_REL = "policy/approval.ts";
+  const ENFORCE_REL = "policy/enforce.ts";
 
-  it("hooks and local policy modules do not import policy/fetch.ts", () => {
-    const filesToCheck = [
-      join(srcRoot, "hooks", "handler.ts"),
-      join(srcRoot, "cursor", "hook-runner.ts"),
-      join(srcRoot, "policy", "eval.ts"),
-      join(srcRoot, "policy", "cache.ts"),
-      join(srcRoot, "policy", "types.ts"),
-      join(srcRoot, "policy", "regex.ts"),
+  interface ImportEdge {
+    from: string;
+    specifier: string;
+    resolvedRel: string | null;
+    dynamic: boolean;
+  }
+
+  function resolveLocalTs(fromAbs: string, specifier: string): string | null {
+    if (!specifier.startsWith(".")) return null;
+    const raw = resolve(dirname(fromAbs), specifier);
+    const candidates = [
+      raw.replace(/\.js$/, ".ts"),
+      raw.replace(/\.mjs$/, ".mts"),
+      `${raw}.ts`,
+      join(raw, "index.ts"),
     ];
-
-    for (const file of filesToCheck) {
-      const content = readFileSync(file, "utf8");
-      expect(content).not.toMatch(/policy\/fetch/);
-      expect(content).not.toMatch(/\.\/fetch\.js/);
-      expect(content).not.toMatch(/\bfetch\s*\(/);
+    for (const c of candidates) {
+      if (existsSync(c)) return relative(srcRoot, c).replace(/\\/g, "/");
     }
+    return null;
+  }
+
+  function analyzeFile(relPath: string): {
+    edges: ImportEdge[];
+    referencesFetch: boolean;
+  } {
+    const absPath = join(srcRoot, relPath);
+    const sourceText = readFileSync(absPath, "utf8");
+    const sf = ts.createSourceFile(
+      absPath,
+      sourceText,
+      ts.ScriptTarget.Latest,
+      true,
+      ts.ScriptKind.TS,
+    );
+
+    const edges: ImportEdge[] = [];
+    let referencesFetch = false;
+
+    const visit = (node: ts.Node): void => {
+      if (ts.isImportDeclaration(node) && ts.isStringLiteral(node.moduleSpecifier)) {
+        const isTypeOnly = Boolean(node.importClause?.isTypeOnly);
+        if (!isTypeOnly) {
+          const spec = node.moduleSpecifier.text;
+          edges.push({
+            from: relPath,
+            specifier: spec,
+            resolvedRel: resolveLocalTs(absPath, spec),
+            dynamic: false,
+          });
+        }
+      } else if (
+        ts.isExportDeclaration(node) &&
+        node.moduleSpecifier &&
+        ts.isStringLiteral(node.moduleSpecifier) &&
+        !node.isTypeOnly
+      ) {
+        const spec = node.moduleSpecifier.text;
+        edges.push({
+          from: relPath,
+          specifier: spec,
+          resolvedRel: resolveLocalTs(absPath, spec),
+          dynamic: false,
+        });
+      } else if (ts.isCallExpression(node)) {
+        // Dynamic import("...")
+        if (
+          node.expression.kind === ts.SyntaxKind.ImportKeyword &&
+          node.arguments.length > 0 &&
+          ts.isStringLiteral(node.arguments[0]!)
+        ) {
+          const spec = node.arguments[0]!.text;
+          edges.push({
+            from: relPath,
+            specifier: spec,
+            resolvedRel: resolveLocalTs(absPath, spec),
+            dynamic: true,
+          });
+        }
+        // require("...")
+        if (
+          ts.isIdentifier(node.expression) &&
+          node.expression.text === "require" &&
+          node.arguments.length > 0 &&
+          ts.isStringLiteral(node.arguments[0]!)
+        ) {
+          const spec = node.arguments[0]!.text;
+          edges.push({
+            from: relPath,
+            specifier: spec,
+            resolvedRel: resolveLocalTs(absPath, spec),
+            dynamic: true,
+          });
+        }
+      }
+
+      // Detect runtime references to global `fetch` (direct call or globalThis.fetch)
+      if (ts.isIdentifier(node) && node.text === "fetch") {
+        const parent = node.parent;
+        const isTypeNode =
+          ts.isTypeQueryNode(parent) ||
+          ts.isTypeReferenceNode(parent) ||
+          ts.isPropertySignature(parent);
+        const isPropertyKey =
+          (ts.isPropertyAccessExpression(parent) &&
+            parent.name === node &&
+            !(
+              ts.isIdentifier(parent.expression) &&
+              parent.expression.text === "globalThis"
+            )) ||
+          (ts.isPropertyAssignment(parent) && parent.name === node);
+        if (!isTypeNode && !isPropertyKey) {
+          referencesFetch = true;
+        }
+      }
+
+      ts.forEachChild(node, visit);
+    };
+
+    visit(sf);
+    return { edges, referencesFetch };
+  }
+
+  it("walks the full transitive import graph from hooks/handler.ts, cursor/hook-runner.ts, and cursor/hook-normalize.ts", () => {
+    const entrypoints = [
+      "hooks/handler.ts",
+      "cursor/hook-runner.ts",
+      "cursor/hook-normalize.ts",
+    ];
+    const visited = new Set<string>();
+    const allEdges: ImportEdge[] = [];
+    const filesReferencingFetch: string[] = [];
+    const queue = [...entrypoints];
+
+    while (queue.length > 0) {
+      const current = queue.shift()!;
+      if (visited.has(current)) continue;
+      visited.add(current);
+
+      const { edges, referencesFetch } = analyzeFile(current);
+      if (referencesFetch) {
+        filesReferencingFetch.push(current);
+      }
+      for (const edge of edges) {
+        allEdges.push(edge);
+        if (edge.resolvedRel && !visited.has(edge.resolvedRel)) {
+          queue.push(edge.resolvedRel);
+        }
+      }
+    }
+
+    // Sanity check: confirm the walker traversed the real hook and policy modules
+    expect(visited.has("hooks/handler.ts")).toBe(true);
+    expect(visited.has("cursor/hook-runner.ts")).toBe(true);
+    expect(visited.has("cursor/hook-normalize.ts")).toBe(true);
+    expect(visited.has("policy/eval.ts")).toBe(true);
+    expect(visited.has("policy/cache.ts")).toBe(true);
+    expect(visited.has("policy/types.ts")).toBe(true);
+    expect(visited.has("policy/regex.ts")).toBe(true);
+    expect(visited.has(ENFORCE_REL)).toBe(true);
+
+    // policy/fetch.ts must never be reachable from any hook
+    expect(visited.has("policy/fetch.ts")).toBe(false);
+
+    // No reachable module may import http, https, or net (node:* or bare)
+    const forbiddenBuiltins = new Set([
+      "http",
+      "node:http",
+      "https",
+      "node:https",
+      "net",
+      "node:net",
+    ]);
+    for (const edge of allEdges) {
+      expect(forbiddenBuiltins.has(edge.specifier)).toBe(false);
+    }
+
+    // Only the approval client may reference fetch
+    expect(filesReferencingFetch).toEqual([APPROVAL_CLIENT_REL]);
+
+    // Documented single allowed edge into the approval client:
+    // policy/enforce.ts dynamically imports ./approval.js solely on the require_approval branch.
+    const approvalEdges = allEdges.filter(
+      (e) => e.resolvedRel === APPROVAL_CLIENT_REL,
+    );
+    expect(approvalEdges).toEqual([
+      {
+        from: ENFORCE_REL,
+        specifier: "./approval.js",
+        resolvedRel: APPROVAL_CLIENT_REL,
+        dynamic: true,
+      },
+    ]);
   });
 });

@@ -90,9 +90,92 @@ async function startMockServer(
 }
 
 describe("policy validation", () => {
-  it("accepts a valid Policy object", () => {
-    const res = validatePolicy(makePolicy());
+  it("accepts a valid Policy object including optional approval and org metadata", () => {
+    const res = validatePolicy(
+      makePolicy({
+        org_name: "Acme",
+        org_slug: "acme",
+        builtin: {
+          CLOUD001: {
+            enabled: true,
+            action: "require_approval",
+            severity: "critical",
+            approval: { expires_s: 180, offline_fallback: "deny" },
+          },
+        },
+        custom: [
+          {
+            id: "cust_approval",
+            name: "Approve deploy",
+            enabled: true,
+            version: 1,
+            message: "Needs approval",
+            when: [{ field: "command", op: "starts_with", value: "./deploy" }],
+            action: "require_approval",
+            severity: "high",
+            approval: { expires_s: 60, offline_fallback: "allow" },
+          },
+        ],
+      }),
+    );
     expect(res.ok).toBe(true);
+    if (res.ok) {
+      expect(res.value.org_name).toBe("Acme");
+      expect(res.value.org_slug).toBe("acme");
+      expect(res.value.builtin.CLOUD001?.approval).toEqual({
+        expires_s: 180,
+        offline_fallback: "deny",
+      });
+      expect(res.value.custom[0]?.approval).toEqual({
+        expires_s: 60,
+        offline_fallback: "allow",
+      });
+    }
+  });
+
+  it("rejects invalid approval config on builtin overrides and custom rules", () => {
+    expect(
+      validatePolicy({
+        ...makePolicy(),
+        builtin: {
+          CLOUD001: {
+            enabled: true,
+            action: "require_approval",
+            approval: { expires_s: 0 },
+          },
+        },
+      }).ok,
+    ).toBe(false);
+    expect(
+      validatePolicy({
+        ...makePolicy(),
+        builtin: {
+          CLOUD001: {
+            enabled: true,
+            action: "require_approval",
+            approval: { offline_fallback: "flag" },
+          },
+        },
+      }).ok,
+    ).toBe(false);
+    expect(
+      validatePolicy({
+        ...makePolicy(),
+        custom: [
+          {
+            id: "c_bad_approval",
+            name: "Bad approval",
+            enabled: true,
+            version: 1,
+            message: "m",
+            when: [{ field: "command", op: "contains", value: "x" }],
+            action: "require_approval",
+            severity: "high",
+            approval: { expires_s: -5 },
+          },
+        ],
+      }).ok,
+    ).toBe(false);
   });
 
   it("rejects wrong version, invalid mode, invalid offline, or missing allowlists", () => {
@@ -511,6 +594,29 @@ describe("policy fetch and cache", () => {
     mono = 300 * 1000;
     await refresh();
     expect(fetchSpy).toHaveBeenCalledTimes(2);
+  });
+
+  it("createPolicyRefresher swallows a throwing fetchFn without rejecting", async () => {
+    let mono = 0;
+    const throwingFetch = vi.fn(async () => {
+      throw new Error("unexpected network failure");
+    });
+    const refresh = createPolicyRefresher(
+      POLICY_REFRESH_INTERVAL_MS,
+      throwingFetch,
+      () => mono,
+    );
+
+    await expect(refresh()).resolves.toBeNull();
+    expect(throwingFetch).toHaveBeenCalledTimes(1);
+
+    mono = 30_000;
+    await expect(refresh()).resolves.toBeNull();
+    expect(throwingFetch).toHaveBeenCalledTimes(1);
+
+    mono = POLICY_REFRESH_INTERVAL_MS;
+    await expect(refresh()).resolves.toBeNull();
+    expect(throwingFetch).toHaveBeenCalledTimes(2);
   });
 });
 
