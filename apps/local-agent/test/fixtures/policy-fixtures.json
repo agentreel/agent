@@ -1,0 +1,1168 @@
+{
+  "_note": "PROVISIONAL shared fixtures for AgentReel Govern PR C2. The web repo will author the canonical policy-fixtures.json later and replace this file.",
+  "cases": [
+    {
+      "name": "clean command produces allow with no matching rules",
+      "policy": {
+        "version": 1,
+        "etag": "etag-1",
+        "workspace_id": "ws_test",
+        "updated_at": "2026-11-25T00:00:00Z",
+        "mode": "enforce",
+        "offline": "last_known",
+        "builtin": {},
+        "custom": [],
+        "allow": { "commands": [], "paths": [], "repos": [] }
+      },
+      "input": {
+        "tool": "claude-code",
+        "toolName": "Bash",
+        "command": "git status"
+      },
+      "expected": {
+        "action": "allow",
+        "rule_ids": []
+      }
+    },
+    {
+      "name": "builtin rule matches with default flag action when not overridden",
+      "policy": {
+        "version": 1,
+        "etag": "etag-2",
+        "workspace_id": "ws_test",
+        "updated_at": "2026-11-25T00:00:00Z",
+        "mode": "enforce",
+        "offline": "last_known",
+        "builtin": {},
+        "custom": [],
+        "allow": { "commands": [], "paths": [], "repos": [] }
+      },
+      "input": {
+        "tool": "claude-code",
+        "toolName": "Bash",
+        "command": "terraform destroy -auto-approve"
+      },
+      "expected": {
+        "action": "flag",
+        "rule_ids": ["CLOUD001"]
+      }
+    },
+    {
+      "name": "builtin override disables matching builtin rule",
+      "policy": {
+        "version": 1,
+        "etag": "etag-3",
+        "workspace_id": "ws_test",
+        "updated_at": "2026-11-25T00:00:00Z",
+        "mode": "enforce",
+        "offline": "last_known",
+        "builtin": {
+          "CLOUD001": { "enabled": false, "action": "flag" }
+        },
+        "custom": [],
+        "allow": { "commands": [], "paths": [], "repos": [] }
+      },
+      "input": {
+        "tool": "claude-code",
+        "toolName": "Bash",
+        "command": "terraform destroy"
+      },
+      "expected": {
+        "action": "allow",
+        "rule_ids": []
+      }
+    },
+    {
+      "name": "builtin override escalates rule to block",
+      "policy": {
+        "version": 1,
+        "etag": "etag-4",
+        "workspace_id": "ws_test",
+        "updated_at": "2026-11-25T00:00:00Z",
+        "mode": "enforce",
+        "offline": "last_known",
+        "builtin": {
+          "CLOUD001": { "enabled": true, "action": "block", "severity": "critical" }
+        },
+        "custom": [],
+        "allow": { "commands": [], "paths": [], "repos": [] }
+      },
+      "input": {
+        "tool": "claude-code",
+        "toolName": "Bash",
+        "command": "terraform destroy"
+      },
+      "expected": {
+        "action": "block",
+        "rule_ids": ["CLOUD001"]
+      }
+    },
+    {
+      "name": "builtin override escalates rule to require_approval",
+      "policy": {
+        "version": 1,
+        "etag": "etag-5",
+        "workspace_id": "ws_test",
+        "updated_at": "2026-11-25T00:00:00Z",
+        "mode": "enforce",
+        "offline": "last_known",
+        "builtin": {
+          "GIT001": { "enabled": true, "action": "require_approval" }
+        },
+        "custom": [],
+        "allow": { "commands": [], "paths": [], "repos": [] }
+      },
+      "input": {
+        "tool": "cursor",
+        "toolName": "Shell",
+        "command": "git push --force origin main"
+      },
+      "expected": {
+        "action": "require_approval",
+        "rule_ids": ["GIT001"]
+      }
+    },
+    {
+      "name": "observe mode downgrades block to flag",
+      "policy": {
+        "version": 1,
+        "etag": "etag-6",
+        "workspace_id": "ws_test",
+        "updated_at": "2026-11-25T00:00:00Z",
+        "mode": "observe",
+        "offline": "last_known",
+        "builtin": {
+          "CLOUD001": { "enabled": true, "action": "block" }
+        },
+        "custom": [],
+        "allow": { "commands": [], "paths": [], "repos": [] }
+      },
+      "input": {
+        "tool": "claude-code",
+        "toolName": "Bash",
+        "command": "terraform destroy"
+      },
+      "expected": {
+        "action": "flag",
+        "rule_ids": ["CLOUD001"]
+      }
+    },
+    {
+      "name": "observe mode downgrades require_approval to flag",
+      "policy": {
+        "version": 1,
+        "etag": "etag-7",
+        "workspace_id": "ws_test",
+        "updated_at": "2026-11-25T00:00:00Z",
+        "mode": "observe",
+        "offline": "last_known",
+        "builtin": {},
+        "custom": [
+          {
+            "id": "cust_approval_1",
+            "name": "Require approval for npm publish",
+            "enabled": true,
+            "version": 1,
+            "message": "Publishing packages requires approval",
+            "when": [
+              { "field": "command", "op": "starts_with", "value": "npm publish" }
+            ],
+            "action": "require_approval",
+            "severity": "high",
+            "scope": {}
+          }
+        ],
+        "allow": { "commands": [], "paths": [], "repos": [] }
+      },
+      "input": {
+        "tool": "claude-code",
+        "toolName": "Bash",
+        "command": "npm publish --access public"
+      },
+      "expected": {
+        "action": "flag",
+        "rule_ids": ["cust_approval_1"]
+      }
+    },
+    {
+      "name": "custom rule op contains matches case-insensitively by default",
+      "policy": {
+        "version": 1,
+        "etag": "etag-8",
+        "workspace_id": "ws_test",
+        "updated_at": "2026-11-25T00:00:00Z",
+        "mode": "enforce",
+        "offline": "last_known",
+        "builtin": {},
+        "custom": [
+          {
+            "id": "cust_contains",
+            "name": "Block internal secret token flag",
+            "enabled": true,
+            "version": 1,
+            "message": "Do not pass internal_admin_token on the CLI",
+            "when": [
+              { "field": "command", "op": "contains", "value": "INTERNAL_ADMIN_TOKEN" }
+            ],
+            "action": "block",
+            "severity": "critical",
+            "scope": {}
+          }
+        ],
+        "allow": { "commands": [], "paths": [], "repos": [] }
+      },
+      "input": {
+        "tool": "claude-code",
+        "toolName": "Bash",
+        "command": "export internal_admin_token=abc123"
+      },
+      "expected": {
+        "action": "block",
+        "rule_ids": ["cust_contains"]
+      }
+    },
+    {
+      "name": "custom rule op starts_with matches command prefix",
+      "policy": {
+        "version": 1,
+        "etag": "etag-9",
+        "workspace_id": "ws_test",
+        "updated_at": "2026-11-25T00:00:00Z",
+        "mode": "enforce",
+        "offline": "last_known",
+        "builtin": {},
+        "custom": [
+          {
+            "id": "cust_sudo",
+            "name": "Block sudo commands",
+            "enabled": true,
+            "version": 1,
+            "message": "sudo is disallowed",
+            "when": [
+              { "field": "command", "op": "starts_with", "value": "sudo " }
+            ],
+            "action": "block",
+            "severity": "high",
+            "scope": {}
+          }
+        ],
+        "allow": { "commands": [], "paths": [], "repos": [] }
+      },
+      "input": {
+        "tool": "claude-code",
+        "toolName": "Bash",
+        "command": "sudo apt-get update"
+      },
+      "expected": {
+        "action": "block",
+        "rule_ids": ["cust_sudo"]
+      }
+    },
+    {
+      "name": "custom rule op equals matches toolName",
+      "policy": {
+        "version": 1,
+        "etag": "etag-10",
+        "workspace_id": "ws_test",
+        "updated_at": "2026-11-25T00:00:00Z",
+        "mode": "enforce",
+        "offline": "last_known",
+        "builtin": {},
+        "custom": [
+          {
+            "id": "cust_webfetch",
+            "name": "Flag WebFetch usage",
+            "enabled": true,
+            "version": 1,
+            "message": "WebFetch logged for review",
+            "when": [
+              { "field": "tool", "op": "equals", "value": "WebFetch" }
+            ],
+            "action": "flag",
+            "severity": "info",
+            "scope": {}
+          }
+        ],
+        "allow": { "commands": [], "paths": [], "repos": [] }
+      },
+      "input": {
+        "tool": "claude-code",
+        "toolName": "WebFetch",
+        "url": "https://docs.example.com/api"
+      },
+      "expected": {
+        "action": "flag",
+        "rule_ids": ["cust_webfetch"]
+      }
+    },
+    {
+      "name": "custom rule op glob matches nested file_path",
+      "policy": {
+        "version": 1,
+        "etag": "etag-11",
+        "workspace_id": "ws_test",
+        "updated_at": "2026-11-25T00:00:00Z",
+        "mode": "enforce",
+        "offline": "last_known",
+        "builtin": {},
+        "custom": [
+          {
+            "id": "cust_pem_glob",
+            "name": "Block editing PEM keys",
+            "enabled": true,
+            "version": 1,
+            "message": "PEM key files cannot be modified",
+            "when": [
+              { "field": "file_path", "op": "glob", "value": "**/*.pem" }
+            ],
+            "action": "block",
+            "severity": "critical",
+            "scope": {}
+          }
+        ],
+        "allow": { "commands": [], "paths": [], "repos": [] }
+      },
+      "input": {
+        "tool": "cursor",
+        "toolName": "Edit",
+        "file_path": "infra/certs/prod/server.pem"
+      },
+      "expected": {
+        "action": "block",
+        "rule_ids": ["cust_pem_glob"]
+      }
+    },
+    {
+      "name": "custom rule op regex matches url",
+      "policy": {
+        "version": 1,
+        "etag": "etag-12",
+        "workspace_id": "ws_test",
+        "updated_at": "2026-11-25T00:00:00Z",
+        "mode": "enforce",
+        "offline": "last_known",
+        "builtin": {},
+        "custom": [
+          {
+            "id": "cust_internal_url",
+            "name": "Require approval for internal admin URL",
+            "enabled": true,
+            "version": 1,
+            "message": "Internal admin endpoints require approval",
+            "when": [
+              {
+                "field": "url",
+                "op": "regex",
+                "value": "^https://[a-z0-9-]+\\.internal\\.corp/admin"
+              }
+            ],
+            "action": "require_approval",
+            "severity": "high",
+            "scope": {}
+          }
+        ],
+        "allow": { "commands": [], "paths": [], "repos": [] }
+      },
+      "input": {
+        "tool": "claude-code",
+        "toolName": "WebFetch",
+        "url": "https://billing-1.internal.corp/admin/users"
+      },
+      "expected": {
+        "action": "require_approval",
+        "rule_ids": ["cust_internal_url"]
+      }
+    },
+    {
+      "name": "custom rule matches mcp_tool field",
+      "policy": {
+        "version": 1,
+        "etag": "etag-13",
+        "workspace_id": "ws_test",
+        "updated_at": "2026-11-25T00:00:00Z",
+        "mode": "enforce",
+        "offline": "last_known",
+        "builtin": {},
+        "custom": [
+          {
+            "id": "cust_mcp_delete",
+            "name": "Require approval for destructive MCP tool",
+            "enabled": true,
+            "version": 1,
+            "message": "Destructive MCP tools need approval",
+            "when": [
+              { "field": "mcp_tool", "op": "starts_with", "value": "linear__delete_" }
+            ],
+            "action": "require_approval",
+            "severity": "high",
+            "scope": {}
+          }
+        ],
+        "allow": { "commands": [], "paths": [], "repos": [] }
+      },
+      "input": {
+        "tool": "cursor",
+        "toolName": "MCP:linear__delete_issue",
+        "mcp_tool": "linear__delete_issue"
+      },
+      "expected": {
+        "action": "require_approval",
+        "rule_ids": ["cust_mcp_delete"]
+      }
+    },
+    {
+      "name": "custom rule field any matches across populated fields",
+      "policy": {
+        "version": 1,
+        "etag": "etag-14",
+        "workspace_id": "ws_test",
+        "updated_at": "2026-11-25T00:00:00Z",
+        "mode": "enforce",
+        "offline": "last_known",
+        "builtin": {},
+        "custom": [
+          {
+            "id": "cust_any_pastebin",
+            "name": "Block pastebin references anywhere",
+            "enabled": true,
+            "version": 1,
+            "message": "Pastebin endpoints are blocked",
+            "when": [
+              { "field": "any", "op": "contains", "value": "pastebin.com" }
+            ],
+            "action": "block",
+            "severity": "high",
+            "scope": {}
+          }
+        ],
+        "allow": { "commands": [], "paths": [], "repos": [] }
+      },
+      "input": {
+        "tool": "claude-code",
+        "toolName": "WebFetch",
+        "url": "https://pastebin.com/raw/abc123"
+      },
+      "expected": {
+        "action": "block",
+        "rule_ids": ["cust_any_pastebin"]
+      }
+    },
+    {
+      "name": "case_sensitive true rejects mismatching case",
+      "policy": {
+        "version": 1,
+        "etag": "etag-15",
+        "workspace_id": "ws_test",
+        "updated_at": "2026-11-25T00:00:00Z",
+        "mode": "enforce",
+        "offline": "last_known",
+        "builtin": {},
+        "custom": [
+          {
+            "id": "cust_case_strict",
+            "name": "Block uppercase PROD_KEY",
+            "enabled": true,
+            "version": 1,
+            "message": "PROD_KEY cannot appear in commands",
+            "when": [
+              {
+                "field": "command",
+                "op": "contains",
+                "value": "PROD_KEY",
+                "case_sensitive": true
+              }
+            ],
+            "action": "block",
+            "severity": "high",
+            "scope": {}
+          }
+        ],
+        "allow": { "commands": [], "paths": [], "repos": [] }
+      },
+      "input": {
+        "tool": "claude-code",
+        "toolName": "Bash",
+        "command": "echo prod_key"
+      },
+      "expected": {
+        "action": "allow",
+        "rule_ids": []
+      }
+    },
+    {
+      "name": "case_sensitive true matches exact case",
+      "policy": {
+        "version": 1,
+        "etag": "etag-16",
+        "workspace_id": "ws_test",
+        "updated_at": "2026-11-25T00:00:00Z",
+        "mode": "enforce",
+        "offline": "last_known",
+        "builtin": {},
+        "custom": [
+          {
+            "id": "cust_case_strict",
+            "name": "Block uppercase PROD_KEY",
+            "enabled": true,
+            "version": 1,
+            "message": "PROD_KEY cannot appear in commands",
+            "when": [
+              {
+                "field": "command",
+                "op": "contains",
+                "value": "PROD_KEY",
+                "case_sensitive": true
+              }
+            ],
+            "action": "block",
+            "severity": "high",
+            "scope": {}
+          }
+        ],
+        "allow": { "commands": [], "paths": [], "repos": [] }
+      },
+      "input": {
+        "tool": "claude-code",
+        "toolName": "Bash",
+        "command": "echo $PROD_KEY"
+      },
+      "expected": {
+        "action": "block",
+        "rule_ids": ["cust_case_strict"]
+      }
+    },
+    {
+      "name": "multi-condition when requires all conditions to match",
+      "policy": {
+        "version": 1,
+        "etag": "etag-17",
+        "workspace_id": "ws_test",
+        "updated_at": "2026-11-25T00:00:00Z",
+        "mode": "enforce",
+        "offline": "last_known",
+        "builtin": {},
+        "custom": [
+          {
+            "id": "cust_multi_when",
+            "name": "Block Write on lockfile",
+            "enabled": true,
+            "version": 1,
+            "message": "Do not overwrite pnpm-lock.yaml directly",
+            "when": [
+              { "field": "tool", "op": "equals", "value": "Write" },
+              { "field": "file_path", "op": "glob", "value": "**/pnpm-lock.yaml" }
+            ],
+            "action": "block",
+            "severity": "warn",
+            "scope": {}
+          }
+        ],
+        "allow": { "commands": [], "paths": [], "repos": [] }
+      },
+      "input": {
+        "tool": "claude-code",
+        "toolName": "Read",
+        "file_path": "apps/web/pnpm-lock.yaml"
+      },
+      "expected": {
+        "action": "allow",
+        "rule_ids": []
+      }
+    },
+    {
+      "name": "scope repos matches glob and triggers rule",
+      "policy": {
+        "version": 1,
+        "etag": "etag-18",
+        "workspace_id": "ws_test",
+        "updated_at": "2026-11-25T00:00:00Z",
+        "mode": "enforce",
+        "offline": "last_known",
+        "builtin": {},
+        "custom": [
+          {
+            "id": "cust_scope_repo",
+            "name": "Protect prod repos from deploy script",
+            "enabled": true,
+            "version": 1,
+            "message": "Direct deploy blocked on prod repos",
+            "when": [
+              { "field": "command", "op": "starts_with", "value": "./deploy.sh" }
+            ],
+            "action": "block",
+            "severity": "critical",
+            "scope": {
+              "repos": ["acme/prod-*"]
+            }
+          }
+        ],
+        "allow": { "commands": [], "paths": [], "repos": [] }
+      },
+      "input": {
+        "tool": "claude-code",
+        "toolName": "Bash",
+        "command": "./deploy.sh --region us-east-1",
+        "repo": "acme/prod-payments"
+      },
+      "expected": {
+        "action": "block",
+        "rule_ids": ["cust_scope_repo"]
+      }
+    },
+    {
+      "name": "scope repos excludes non-matching repo",
+      "policy": {
+        "version": 1,
+        "etag": "etag-19",
+        "workspace_id": "ws_test",
+        "updated_at": "2026-11-25T00:00:00Z",
+        "mode": "enforce",
+        "offline": "last_known",
+        "builtin": {},
+        "custom": [
+          {
+            "id": "cust_scope_repo",
+            "name": "Protect prod repos from deploy script",
+            "enabled": true,
+            "version": 1,
+            "message": "Direct deploy blocked on prod repos",
+            "when": [
+              { "field": "command", "op": "starts_with", "value": "./deploy.sh" }
+            ],
+            "action": "block",
+            "severity": "critical",
+            "scope": {
+              "repos": ["acme/prod-*"]
+            }
+          }
+        ],
+        "allow": { "commands": [], "paths": [], "repos": [] }
+      },
+      "input": {
+        "tool": "claude-code",
+        "toolName": "Bash",
+        "command": "./deploy.sh --region us-east-1",
+        "repo": "acme/staging-payments"
+      },
+      "expected": {
+        "action": "allow",
+        "rule_ids": []
+      }
+    },
+    {
+      "name": "scope branches matches release glob",
+      "policy": {
+        "version": 1,
+        "etag": "etag-20",
+        "workspace_id": "ws_test",
+        "updated_at": "2026-11-25T00:00:00Z",
+        "mode": "enforce",
+        "offline": "last_known",
+        "builtin": {},
+        "custom": [
+          {
+            "id": "cust_scope_branch",
+            "name": "Require approval for migration on release branches",
+            "enabled": true,
+            "version": 1,
+            "message": "Migrations on release branches require approval",
+            "when": [
+              { "field": "command", "op": "contains", "value": "db:migrate" }
+            ],
+            "action": "require_approval",
+            "severity": "high",
+            "scope": {
+              "branches": ["main", "release/*"]
+            }
+          }
+        ],
+        "allow": { "commands": [], "paths": [], "repos": [] }
+      },
+      "input": {
+        "tool": "claude-code",
+        "toolName": "Bash",
+        "command": "pnpm db:migrate",
+        "branch": "release/2026-11"
+      },
+      "expected": {
+        "action": "require_approval",
+        "rule_ids": ["cust_scope_branch"]
+      }
+    },
+    {
+      "name": "scope branches skips non-matching feature branch",
+      "policy": {
+        "version": 1,
+        "etag": "etag-21",
+        "workspace_id": "ws_test",
+        "updated_at": "2026-11-25T00:00:00Z",
+        "mode": "enforce",
+        "offline": "last_known",
+        "builtin": {},
+        "custom": [
+          {
+            "id": "cust_scope_branch",
+            "name": "Require approval for migration on release branches",
+            "enabled": true,
+            "version": 1,
+            "message": "Migrations on release branches require approval",
+            "when": [
+              { "field": "command", "op": "contains", "value": "db:migrate" }
+            ],
+            "action": "require_approval",
+            "severity": "high",
+            "scope": {
+              "branches": ["main", "release/*"]
+            }
+          }
+        ],
+        "allow": { "commands": [], "paths": [], "repos": [] }
+      },
+      "input": {
+        "tool": "claude-code",
+        "toolName": "Bash",
+        "command": "pnpm db:migrate",
+        "branch": "feat/local-dev"
+      },
+      "expected": {
+        "action": "allow",
+        "rule_ids": []
+      }
+    },
+    {
+      "name": "scope members targets specific userId only",
+      "policy": {
+        "version": 1,
+        "etag": "etag-22",
+        "workspace_id": "ws_test",
+        "updated_at": "2026-11-25T00:00:00Z",
+        "mode": "enforce",
+        "offline": "last_known",
+        "builtin": {},
+        "custom": [
+          {
+            "id": "cust_scope_member",
+            "name": "Require approval for contractor deploys",
+            "enabled": true,
+            "version": 1,
+            "message": "Contractor deploys require approval",
+            "when": [
+              { "field": "command", "op": "starts_with", "value": "vercel deploy" }
+            ],
+            "action": "require_approval",
+            "severity": "high",
+            "scope": {
+              "members": ["usr_contractor_1"]
+            }
+          }
+        ],
+        "allow": { "commands": [], "paths": [], "repos": [] }
+      },
+      "input": {
+        "tool": "claude-code",
+        "toolName": "Bash",
+        "command": "vercel deploy --prod",
+        "member": "usr_contractor_1"
+      },
+      "expected": {
+        "action": "require_approval",
+        "rule_ids": ["cust_scope_member"]
+      }
+    },
+    {
+      "name": "scope tools limits rule to cursor only",
+      "policy": {
+        "version": 1,
+        "etag": "etag-23",
+        "workspace_id": "ws_test",
+        "updated_at": "2026-11-25T00:00:00Z",
+        "mode": "enforce",
+        "offline": "last_known",
+        "builtin": {},
+        "custom": [
+          {
+            "id": "cust_cursor_only",
+            "name": "Flag docker exec in Cursor",
+            "enabled": true,
+            "version": 1,
+            "message": "Docker exec flagged in Cursor",
+            "when": [
+              { "field": "command", "op": "starts_with", "value": "docker exec" }
+            ],
+            "action": "flag",
+            "severity": "warn",
+            "scope": {
+              "tools": ["cursor"]
+            }
+          }
+        ],
+        "allow": { "commands": [], "paths": [], "repos": [] }
+      },
+      "input": {
+        "tool": "claude-code",
+        "toolName": "Bash",
+        "command": "docker exec -it app sh"
+      },
+      "expected": {
+        "action": "allow",
+        "rule_ids": []
+      }
+    },
+    {
+      "name": "allow.commands exempts matching builtin and custom rules",
+      "policy": {
+        "version": 1,
+        "etag": "etag-24",
+        "workspace_id": "ws_test",
+        "updated_at": "2026-11-25T00:00:00Z",
+        "mode": "enforce",
+        "offline": "last_known",
+        "builtin": {
+          "CLOUD001": { "enabled": true, "action": "block" }
+        },
+        "custom": [],
+        "allow": {
+          "commands": ["terraform destroy -target=module.ephemeral"],
+          "paths": [],
+          "repos": []
+        }
+      },
+      "input": {
+        "tool": "claude-code",
+        "toolName": "Bash",
+        "command": "terraform destroy -target=module.ephemeral"
+      },
+      "expected": {
+        "action": "allow",
+        "rule_ids": []
+      }
+    },
+    {
+      "name": "allow.paths exempts files inside allowed directory",
+      "policy": {
+        "version": 1,
+        "etag": "etag-25",
+        "workspace_id": "ws_test",
+        "updated_at": "2026-11-25T00:00:00Z",
+        "mode": "enforce",
+        "offline": "last_known",
+        "builtin": {},
+        "custom": [
+          {
+            "id": "cust_pem_block",
+            "name": "Block editing PEM keys",
+            "enabled": true,
+            "version": 1,
+            "message": "PEM key files cannot be modified",
+            "when": [
+              { "field": "file_path", "op": "glob", "value": "**/*.pem" }
+            ],
+            "action": "block",
+            "severity": "critical",
+            "scope": {}
+          }
+        ],
+        "allow": {
+          "commands": [],
+          "paths": ["test/fixtures"],
+          "repos": []
+        }
+      },
+      "input": {
+        "tool": "cursor",
+        "toolName": "Edit",
+        "file_path": "test/fixtures/dummy.pem"
+      },
+      "expected": {
+        "action": "allow",
+        "rule_ids": []
+      }
+    },
+    {
+      "name": "allow.repos exempts all rules in sandbox repo",
+      "policy": {
+        "version": 1,
+        "etag": "etag-26",
+        "workspace_id": "ws_test",
+        "updated_at": "2026-11-25T00:00:00Z",
+        "mode": "enforce",
+        "offline": "last_known",
+        "builtin": {
+          "CLOUD001": { "enabled": true, "action": "block" }
+        },
+        "custom": [],
+        "allow": {
+          "commands": [],
+          "paths": [],
+          "repos": ["acme/sandbox-*"]
+        }
+      },
+      "input": {
+        "tool": "claude-code",
+        "toolName": "Bash",
+        "command": "terraform destroy",
+        "repo": "acme/sandbox-lab"
+      },
+      "expected": {
+        "action": "allow",
+        "rule_ids": []
+      }
+    },
+    {
+      "name": "strictest action wins across builtin and multiple custom matches",
+      "policy": {
+        "version": 1,
+        "etag": "etag-27",
+        "workspace_id": "ws_test",
+        "updated_at": "2026-11-25T00:00:00Z",
+        "mode": "enforce",
+        "offline": "last_known",
+        "builtin": {
+          "CLOUD001": { "enabled": true, "action": "flag" }
+        },
+        "custom": [
+          {
+            "id": "cust_tf_approval",
+            "name": "Require approval for terraform",
+            "enabled": true,
+            "version": 1,
+            "message": "Terraform requires approval",
+            "when": [
+              { "field": "command", "op": "contains", "value": "terraform" }
+            ],
+            "action": "require_approval",
+            "severity": "high",
+            "scope": {}
+          },
+          {
+            "id": "cust_tf_auto_block",
+            "name": "Block auto-approve flag",
+            "enabled": true,
+            "version": 1,
+            "message": "Auto-approve is blocked",
+            "when": [
+              { "field": "command", "op": "contains", "value": "-auto-approve" }
+            ],
+            "action": "block",
+            "severity": "critical",
+            "scope": {}
+          }
+        ],
+        "allow": { "commands": [], "paths": [], "repos": [] }
+      },
+      "input": {
+        "tool": "claude-code",
+        "toolName": "Bash",
+        "command": "terraform destroy -auto-approve"
+      },
+      "expected": {
+        "action": "block",
+        "rule_ids": ["CLOUD001", "cust_tf_approval", "cust_tf_auto_block"]
+      }
+    },
+    {
+      "name": "strictest action picks require_approval over flag",
+      "policy": {
+        "version": 1,
+        "etag": "etag-28",
+        "workspace_id": "ws_test",
+        "updated_at": "2026-11-25T00:00:00Z",
+        "mode": "enforce",
+        "offline": "last_known",
+        "builtin": {
+          "GIT002": { "enabled": true, "action": "flag" }
+        },
+        "custom": [
+          {
+            "id": "cust_reset_approval",
+            "name": "Approve hard resets",
+            "enabled": true,
+            "version": 1,
+            "message": "Hard reset requires approval",
+            "when": [
+              { "field": "command", "op": "glob", "value": "git reset --hard*" }
+            ],
+            "action": "require_approval",
+            "severity": "high",
+            "scope": {}
+          }
+        ],
+        "allow": { "commands": [], "paths": [], "repos": [] }
+      },
+      "input": {
+        "tool": "claude-code",
+        "toolName": "Bash",
+        "command": "git reset --hard HEAD~1"
+      },
+      "expected": {
+        "action": "require_approval",
+        "rule_ids": ["GIT002", "cust_reset_approval"]
+      }
+    },
+    {
+      "name": "invalid regex is skipped without throwing while valid rules still evaluate",
+      "policy": {
+        "version": 1,
+        "etag": "etag-29",
+        "workspace_id": "ws_test",
+        "updated_at": "2026-11-25T00:00:00Z",
+        "mode": "enforce",
+        "offline": "last_known",
+        "builtin": {},
+        "custom": [
+          {
+            "id": "cust_bad_regex",
+            "name": "Broken regex rule",
+            "enabled": true,
+            "version": 1,
+            "message": "Should be skipped safely",
+            "when": [
+              { "field": "command", "op": "regex", "value": "[unclosed(group" }
+            ],
+            "action": "block",
+            "severity": "critical",
+            "scope": {}
+          },
+          {
+            "id": "cust_valid_after_bad",
+            "name": "Valid rule after invalid regex",
+            "enabled": true,
+            "version": 1,
+            "message": "Still fires cleanly",
+            "when": [
+              { "field": "command", "op": "contains", "value": "helm uninstall" }
+            ],
+            "action": "flag",
+            "severity": "warn",
+            "scope": {}
+          }
+        ],
+        "allow": { "commands": [], "paths": [], "repos": [] }
+      },
+      "input": {
+        "tool": "claude-code",
+        "toolName": "Bash",
+        "command": "helm uninstall api"
+      },
+      "expected": {
+        "action": "flag",
+        "rule_ids": ["cust_valid_after_bad"]
+      }
+    },
+    {
+      "name": "over-length regex over 300 chars is skipped without throwing",
+      "policy": {
+        "version": 1,
+        "etag": "etag-30",
+        "workspace_id": "ws_test",
+        "updated_at": "2026-11-25T00:00:00Z",
+        "mode": "enforce",
+        "offline": "last_known",
+        "builtin": {},
+        "custom": [
+          {
+            "id": "cust_long_regex",
+            "name": "Over-length regex",
+            "enabled": true,
+            "version": 1,
+            "message": "Pattern exceeds 300 characters",
+            "when": [
+              {
+                "field": "command",
+                "op": "regex",
+                "value": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"
+              }
+            ],
+            "action": "block",
+            "severity": "high",
+            "scope": {}
+          }
+        ],
+        "allow": { "commands": [], "paths": [], "repos": [] }
+      },
+      "input": {
+        "tool": "claude-code",
+        "toolName": "Bash",
+        "command": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"
+      },
+      "expected": {
+        "action": "allow",
+        "rule_ids": []
+      }
+    },
+    {
+      "name": "unsafe RE2-incompatible lookahead regex is skipped without throwing",
+      "policy": {
+        "version": 1,
+        "etag": "etag-31",
+        "workspace_id": "ws_test",
+        "updated_at": "2026-11-25T00:00:00Z",
+        "mode": "enforce",
+        "offline": "last_known",
+        "builtin": {},
+        "custom": [
+          {
+            "id": "cust_lookahead_regex",
+            "name": "Lookahead regex",
+            "enabled": true,
+            "version": 1,
+            "message": "Lookaheads are outside RE2 subset",
+            "when": [
+              { "field": "command", "op": "regex", "value": "deploy(?=.*prod)" }
+            ],
+            "action": "block",
+            "severity": "high",
+            "scope": {}
+          }
+        ],
+        "allow": { "commands": [], "paths": [], "repos": [] }
+      },
+      "input": {
+        "tool": "claude-code",
+        "toolName": "Bash",
+        "command": "deploy prod"
+      },
+      "expected": {
+        "action": "allow",
+        "rule_ids": []
+      }
+    },
+    {
+      "name": "disabled custom rule is skipped",
+      "policy": {
+        "version": 1,
+        "etag": "etag-32",
+        "workspace_id": "ws_test",
+        "updated_at": "2026-11-25T00:00:00Z",
+        "mode": "enforce",
+        "offline": "last_known",
+        "builtin": {},
+        "custom": [
+          {
+            "id": "cust_disabled",
+            "name": "Disabled rule",
+            "enabled": false,
+            "version": 1,
+            "message": "Should not fire",
+            "when": [
+              { "field": "command", "op": "contains", "value": "echo hello" }
+            ],
+            "action": "block",
+            "severity": "high",
+            "scope": {}
+          }
+        ],
+        "allow": { "commands": [], "paths": [], "repos": [] }
+      },
+      "input": {
+        "tool": "claude-code",
+        "toolName": "Bash",
+        "command": "echo hello"
+      },
+      "expected": {
+        "action": "allow",
+        "rule_ids": []
+      }
+    }
+  ]
+}
