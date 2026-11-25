@@ -179,8 +179,9 @@ describe("RE2-safe regex compiler, cache, and timeout guard", () => {
     expect(isRe2SafePattern("(https?://[a-z]+)?")).toBe(true);
   });
 
-  it("statically rejects multiple unbounded quantifiers (polynomial ReDoS) while keeping legitimate single-unbounded fixtures valid", () => {
+  it("statically rejects overlapping multiple unbounded quantifiers while accepting disjoint-separated org patterns", () => {
     const rejected = [
+      // Round 4 existing rejects (all preserved)
       "a.*a.*b",
       "a.*a.*a.*a.*a.*a.*a.*a.*b",
       "(a+)+",
@@ -190,6 +191,18 @@ describe("RE2-safe regex compiler, cache, and timeout guard", () => {
       "a.*b{2,}",
       ".*?foo.*?bar",
       "\\w+.*\\w+",
+      // Round 5 required overlapping rejects
+      "curl.*\\|\\s*(ba)?sh",
+      ".*passwd.*",
+      "kubectl\\s+delete\\s+.*prod",
+      "\\w+\\s*\\w+",
+      // Extra conservative boundary rejects
+      "\\s+[a-z]*\\s+",
+      "a+x?a+",
+      "a+Ab+",
+      "\\s+\\s+",
+      "a+^a+",
+      "a+\\ba+",
     ];
     for (const pat of rejected) {
       expect(isRe2SafePattern(pat), `expected reject: ${pat}`).toBe(false);
@@ -197,18 +210,56 @@ describe("RE2-safe regex compiler, cache, and timeout guard", () => {
     }
 
     const accepted = [
+      // Single-unbounded legitimate fixtures
       "^https://[a-z0-9-]+\\.internal\\.corp/admin",
       "^deploy-service-0 --env=(prod|staging) --region=[a-z0-9-]+$",
       "https?://example\\.com/[a-z0-9/_-]+",
       "[a*+]+",
       "a\\*b\\+.*c",
       "^rule_1_[0-9]{1,4}_[a-z]+$",
+      // Round 5 required multi-quantifier org patterns
+      "rm\\s+-rf\\s+/",
+      "curl\\s+\\|\\s*sh",
+      "curl\\s*\\|\\s*(ba)?sh",
+      "(DROP|TRUNCATE)\\s+TABLE\\s+\\w+",
+      "aws\\s+s3\\s+rb",
+      "curl[^|]*\\|\\s*(ba)?sh",
+      // Extra valid disjoint-separated patterns
+      "\\w+\\s+\\w+",
+      "\\S+\\s+\\S+",
+      "^deploy-service-0\\s+--env=(prod|staging)\\s+--region=[a-z0-9-]+$",
     ];
     for (const pat of accepted) {
       expect(isRe2SafePattern(pat), `expected accept: ${pat}`).toBe(true);
       expect(compileSafeRegex(pat), `expected compiled: ${pat}`).toBeInstanceOf(
         RegExp,
       );
+    }
+  });
+
+  it("evaluates every accepted multi-quantifier org pattern against adversarial 10KB inputs well under 50ms", () => {
+    clearRegexCache();
+    const cases: Array<{ pattern: string; adversarial: string }> = [
+      { pattern: "rm\\s+-rf\\s+/", adversarial: "rm" + " ".repeat(10_000) + "x" },
+      { pattern: "curl\\s+\\|\\s*sh", adversarial: "curl" + " ".repeat(10_000) },
+      { pattern: "curl\\s*\\|\\s*(ba)?sh", adversarial: "curl" + " ".repeat(10_000) + "|" + " ".repeat(10_000) + "x" },
+      { pattern: "(DROP|TRUNCATE)\\s+TABLE\\s+\\w+", adversarial: "DROP" + " ".repeat(10_000) + "TABLE" + " ".repeat(10_000) + "!" },
+      { pattern: "aws\\s+s3\\s+rb", adversarial: "aws" + " ".repeat(10_000) + "s3" + " ".repeat(10_000) + "x" },
+      { pattern: "curl[^|]*\\|\\s*(ba)?sh", adversarial: "curl" + "a".repeat(10_000) },
+    ];
+
+    for (const c of cases) {
+      const re = compileSafeRegex(c.pattern);
+      expect(re, `expected compiled: ${c.pattern}`).toBeInstanceOf(RegExp);
+      let timedOut = false;
+      const t0 = performance.now();
+      const matched = testSafeRegex(re!, c.adversarial, POLICY_EVAL_DEADLINE_MS, () => {
+        timedOut = true;
+      });
+      const elapsed = performance.now() - t0;
+      expect(matched, `should not match: ${c.pattern}`).toBe(false);
+      expect(timedOut, `should not time out: ${c.pattern}`).toBe(false);
+      expect(elapsed, `too slow (${elapsed.toFixed(2)}ms): ${c.pattern}`).toBeLessThan(POLICY_EVAL_DEADLINE_MS);
     }
   });
 
