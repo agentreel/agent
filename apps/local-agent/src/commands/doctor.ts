@@ -1,5 +1,11 @@
 import pc from "picocolors";
-import { isCapturePaused } from "../config.js";
+import {
+  getInstalledPreExecTimeoutS,
+  getRecordedPreExecTimeoutS,
+  isCapturePaused,
+  readConfig,
+  type AgentConfig,
+} from "../config.js";
 import { inspectCursorPreExecHooks } from "../cursor/hooks-install.js";
 import { inspectClaudePreExecHook } from "../hooks/install.js";
 import {
@@ -14,7 +20,11 @@ import {
   loadEffectivePolicy,
   type PolicySource,
 } from "../policy/cache.js";
-import { computePreExecTimeoutS } from "../policy/types.js";
+import {
+  computeMaxPolicyApprovalExpiresS,
+  computePreExecTimeoutS,
+  HOOK_DEADLINE_MARGIN_S,
+} from "../policy/types.js";
 
 function formatDuration(ms: number): string {
   const totalSec = Math.floor(ms / 1000);
@@ -32,6 +42,7 @@ export interface DoctorInspectOptions {
   guardConfigPath?: string;
   claudeSettingsPath?: string;
   cursorHooksPath?: string;
+  config?: AgentConfig;
   now?: number;
 }
 
@@ -48,11 +59,16 @@ export interface DoctorReport {
   capturePaused: boolean;
   enforcementActive: boolean;
   expectedPreExecTimeoutS: number;
+  maxPolicyApprovalExpiresS: number | null;
+  needsReinit: boolean;
   claude: {
     fileExists: boolean;
     preToolUseInstalled: boolean;
     preToolUseTimeoutS: number | null;
     timeoutOk: boolean;
+    recordedTimeoutS: number | null;
+    effectiveInstalledTimeoutS: number;
+    needsReinitForApproval: boolean;
   };
   cursor: {
     fileExists: boolean;
@@ -64,11 +80,15 @@ export interface DoctorReport {
     }>;
     allInstalled: boolean;
     allTimeoutsOk: boolean;
+    recordedTimeoutS: number | null;
+    effectiveInstalledTimeoutS: number;
+    needsReinitForApproval: boolean;
   };
 }
 
 export function inspectDoctorState(opts: DoctorInspectOptions = {}): DoctorReport {
   const now = opts.now ?? Date.now();
+  const cfg = opts.config ?? readConfig();
   const loaded = loadEffectivePolicy({
     cachePath: opts.cachePath ?? POLICY_PATH,
     guardConfigPath: opts.guardConfigPath ?? GUARD_CONFIG_PATH,
@@ -92,7 +112,7 @@ export function inspectDoctorState(opts: DoctorInspectOptions = {}): DoctorRepor
       ? isPolicyCacheStale(loaded.fetchedAt, now)
       : false;
 
-  const capturePaused = isCapturePaused();
+  const capturePaused = isCapturePaused(cfg);
 
   const enforcementActive =
     !capturePaused &&
@@ -102,6 +122,19 @@ export function inspectDoctorState(opts: DoctorInspectOptions = {}): DoctorRepor
     !(policy.offline === "fail_open" && stale);
 
   const expectedPreExecTimeoutS = computePreExecTimeoutS(policy);
+  const maxPolicyApprovalExpiresS = computeMaxPolicyApprovalExpiresS(policy);
+
+  const claudeRecordedTimeoutS = getRecordedPreExecTimeoutS(cfg, "claude");
+  const claudeEffectiveTimeoutS = getInstalledPreExecTimeoutS(cfg, "claude");
+  const claudeNeedsReinit =
+    maxPolicyApprovalExpiresS !== null &&
+    maxPolicyApprovalExpiresS > claudeEffectiveTimeoutS - HOOK_DEADLINE_MARGIN_S;
+
+  const cursorRecordedTimeoutS = getRecordedPreExecTimeoutS(cfg, "cursor");
+  const cursorEffectiveTimeoutS = getInstalledPreExecTimeoutS(cfg, "cursor");
+  const cursorNeedsReinit =
+    maxPolicyApprovalExpiresS !== null &&
+    maxPolicyApprovalExpiresS > cursorEffectiveTimeoutS - HOOK_DEADLINE_MARGIN_S;
 
   const claudeRaw = inspectClaudePreExecHook(
     opts.claudeSettingsPath ?? CLAUDE_SETTINGS_PATH,
@@ -135,21 +168,36 @@ export function inspectDoctorState(opts: DoctorInspectOptions = {}): DoctorRepor
     capturePaused,
     enforcementActive,
     expectedPreExecTimeoutS,
+    maxPolicyApprovalExpiresS,
+    needsReinit: claudeNeedsReinit || cursorNeedsReinit,
     claude: {
       ...claudeRaw,
       timeoutOk: claudeTimeoutOk,
+      recordedTimeoutS: claudeRecordedTimeoutS,
+      effectiveInstalledTimeoutS: claudeEffectiveTimeoutS,
+      needsReinitForApproval: claudeNeedsReinit,
     },
     cursor: {
       fileExists: cursorRaw.fileExists,
       hooks: cursorHooks,
       allInstalled: cursorHooks.every((h) => h.installed),
       allTimeoutsOk: cursorHooks.every((h) => h.timeoutOk),
+      recordedTimeoutS: cursorRecordedTimeoutS,
+      effectiveInstalledTimeoutS: cursorEffectiveTimeoutS,
+      needsReinitForApproval: cursorNeedsReinit,
     },
   };
 }
 
 function formatTimeoutLabel(timeoutS: number | null): string {
   return timeoutS === null ? "unset" : `${timeoutS}s`;
+}
+
+function formatRecordedTimeoutLabel(
+  recordedS: number | null,
+  effectiveS: number,
+): string {
+  return recordedS === null ? `unset (assumed ${effectiveS}s)` : `${recordedS}s`;
 }
 
 export function formatDoctorReport(report: DoctorReport): string {
@@ -181,6 +229,8 @@ export function formatDoctorReport(report: DoctorReport): string {
         )
       : pc.yellow("missing hooks or short timeout (run `agentreel init`)");
 
+  const recordedSummary = `claude ${formatRecordedTimeoutLabel(report.claude.recordedTimeoutS, report.claude.effectiveInstalledTimeoutS)}, cursor ${formatRecordedTimeoutLabel(report.cursor.recordedTimeoutS, report.cursor.effectiveInstalledTimeoutS)}`;
+
   const lines = [
     pc.bold(pc.cyan("AgentReel doctor")),
     "",
@@ -191,6 +241,7 @@ export function formatDoctorReport(report: DoctorReport): string {
     `  etag:           ${report.etag ?? pc.dim("none")}`,
     `  etag age:       ${report.etagAgeMs !== null ? report.etagAgeLabel : pc.dim("none")}${report.stale ? pc.yellow(" (stale > 24h)") : ""}`,
     `  hook timeout:   expected >= ${report.expectedPreExecTimeoutS}s on pre-exec hooks`,
+    `  recorded:       ${recordedSummary}`,
     `  claude hooks:   ${claudeLine}`,
     `  cursor hooks:   ${cursorSummary}`,
   ];
@@ -202,6 +253,22 @@ export function formatDoctorReport(report: DoctorReport): string {
         ? pc.green(`ok (${h.timeoutS}s)`)
         : pc.yellow(`timeout ${formatTimeoutLabel(h.timeoutS)} < ${report.expectedPreExecTimeoutS}s`);
     lines.push(`    - ${h.event.padEnd(21)} ${status}`);
+  }
+
+  if (report.needsReinit && report.maxPolicyApprovalExpiresS !== null) {
+    const hosts: string[] = [];
+    if (report.claude.needsReinitForApproval) {
+      hosts.push(`claude (${report.claude.effectiveInstalledTimeoutS}s)`);
+    }
+    if (report.cursor.needsReinitForApproval) {
+      hosts.push(`cursor (${report.cursor.effectiveInstalledTimeoutS}s)`);
+    }
+    lines.push(
+      "",
+      pc.yellow(
+        `  warning:        policy max approval expires_s (${report.maxPolicyApprovalExpiresS}s) needs a longer hook timeout than installed for ${hosts.join(", ")}. Run \`npx @agentreel/agent init\` to update hook timeouts.`,
+      ),
+    );
   }
 
   return lines.join("\n");
