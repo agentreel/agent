@@ -296,8 +296,6 @@ describe("host and hook decision JSON shapes", () => {
       permission: "deny",
       user_message:
         "Blocked by Acme Corp policy: Secret or credential file read. Ask an admin or see agentreel.dev/org/acme",
-      agent_message:
-        "Blocked by Acme Corp policy: Secret or credential file read. Ask an admin or see agentreel.dev/org/acme",
     });
     // Ensure beforeReadFile never persists raw file content into SQLite
     const storedCursorPayloads = db

@@ -337,7 +337,9 @@ export function cursorHookResponse(
     }
     const body: Record<string, unknown> = { permission: decision.permission };
     if (decision.user_message) body.user_message = decision.user_message;
-    if (decision.agent_message) body.agent_message = decision.agent_message;
+    if (decision.agent_message && canonical !== "beforeReadFile") {
+      body.agent_message = decision.agent_message;
+    }
     return JSON.stringify(body);
   }
   return "{}";
