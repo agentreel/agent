@@ -7,6 +7,12 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Added
+
+- Organization policy cache and local evaluator (`src/policy/*`): fetches `GET /api/v1/policy` with Bearer auth and `If-None-Match`, validates the policy schema, writes `~/.agentreel/policy.json` atomically with mode `0600`, refreshes every 5 minutes in the daemon and once on `agentreel link` and linked `agentreel init`, and falls back offline to the last-known cache or local `guard-config.json` in observe mode.
+- Synchronous, network-free policy evaluator supporting built-in Guard rule overrides, scoped custom rules (`contains`, `starts_with`, `equals`, `glob`, and RE2-safe capped `regex`), allow-list exemptions, strictest-wins precedence, and observe-mode downgrading.
+- `agentreel policy` CLI command showing policy source, ETag, cache age (clock-skew safe), mode, offline setting, and rule/allow counts.
+
 ## [0.2.4] - 2026-11-21
 
 ### Fixed
