@@ -2126,6 +2126,64 @@ describe("hook deadline enforcement, timeout pre-check, init recording, and doct
     expect(outcome.decision?.approval_status).toBe("timeout");
   });
 
+  it("denies as timeout (never offline_allow) when expires_s (5s) is tighter than hook deadline (60s) and 500 arrives at 6s", async () => {
+    await import("../src/policy/approval.js");
+    vi.useFakeTimers();
+    const baseTime = 1_764_405_000_000;
+    vi.setSystemTime(baseTime);
+
+    const policy = makeEnforcePolicy({
+      etag: "etag-expiry-tighter-than-hook",
+      builtin: {
+        GIT001: {
+          enabled: true,
+          action: "require_approval",
+          approval: { expires_s: 5, offline_fallback: "allow" },
+        },
+      },
+    });
+    cache.writeCachedPolicyAtomic(
+      { policy, etag: policy.etag, fetched_at: baseTime },
+      cachePath,
+    );
+
+    const hookDeadlineMs = baseTime + 60_000;
+    // HTTP 500 arrives at 6s: past expires_s (5s), well before hookDeadlineMs (60s).
+    const fetchImpl: typeof fetch = () =>
+      new Promise<Response>((resolve) => {
+        setTimeout(() => {
+          resolve(new Response(JSON.stringify({ error: "server error" }), { status: 500 }));
+        }, 6_000);
+      });
+
+    const outcomePromise = enforce.enforcePreExec(
+      {
+        sessionId: "sess-expiry-tighter-500",
+        tool: "claude-code",
+        toolName: "Bash",
+        command: "git push --force origin main",
+      },
+      {
+        cachePath,
+        guardConfigPath,
+        config: makeConfig("https://api.agentreel.dev", "ar_live_key", {
+          installedHookTimeouts: { claude: 65, cursor: 65 },
+        }),
+        hookDeadlineMs,
+        fetchImpl,
+        onWaiting: () => {},
+        recordDecision: () => {},
+      },
+    );
+
+    await vi.advanceTimersByTimeAsync(6_000);
+    const outcome = await outcomePromise;
+    expect(outcome.permitted).toBe(false);
+    expect(outcome.enforced).toBe(true);
+    expect(outcome.downgraded).toBe(false);
+    expect(outcome.decision?.approval_status).toBe("timeout");
+  });
+
   it("denies as timeout (never offline_allow) when poll resolves with 503 after the deadline", async () => {
     await import("../src/policy/approval.js");
     vi.useFakeTimers();

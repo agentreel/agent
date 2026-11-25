@@ -8,7 +8,8 @@ AgentReel v0.3.0 introduces **AgentReel Govern**: organization policy syncing, l
 - **Claude Code (`PreToolUse`)**: evaluates every tool call locally against the cached organization policy before execution. `block` returns `hookSpecificOutput` with `permissionDecision: "deny"` and a clear organization policy message. `flag` and `allow` print nothing, preserving existing behavior.
 - **Cursor (`beforeShellExecution`, `beforeMCPExecution`, `beforeReadFile`, `preToolUse`)**: installs and evaluates pre-execution hooks and responds via `cursorHookResponse` with `permission` (`"allow"` or `"deny"`), `user_message`, and `agent_message`.
 - **Observe mode safety**: policies in `"observe"` mode never block execution and never trigger approval requests.
-- **Fail-open resilience**: any error thrown during evaluation or hook handling fails open to allow and writes a diagnostic line to `~/.agentreel/agent.log`. A hook crash never blocks an editor.
+- **Fail-open on crashes, fail-closed on evaluation timeouts**: any unexpected exception thrown during evaluation or hook handling still fails open to allow and writes a diagnostic line to `~/.agentreel/agent.log`. If local rule evaluation hits the 50ms deadline, all matches collected so far are preserved; if any `block` or `require_approval` rule was unevaluated or timed out, enforcement fails closed with reason `eval_timeout` and records a `policy_decision` (subject to `observe` and stale `fail_open` modifiers). If only `flag` rules remain unevaluated, the strictest collected result is returned alongside a recorded `eval_timeout` flag.
+- **Pause and `AGENTREEL_DISABLE=1` behavior**: `agentreel pause` and `AGENTREEL_DISABLE=1` stop local session recording and capture, while organization policy enforcement remains active on Claude Code and Cursor pre-execution hooks (no capture events are written beyond the `policy_decision` audit records required by enforcement).
 - **Expanded built-in detection**: adds `SECRET004` to catch direct reads of `.env` files, SSH keys, AWS credentials, and production credential files, and updates `FS001` to match `rm -rf ~` with or without a trailing slash.
 
 ### Remote Admin Approvals
@@ -26,7 +27,7 @@ AgentReel v0.3.0 introduces **AgentReel Govern**: organization policy syncing, l
 ### Policy Cache, Evaluator, and Performance Hardening
 - Fetches `GET /api/v1/policy` with Bearer authentication and `If-None-Match` ETag caching, atomically writing `~/.agentreel/policy.json` with mode `0600`.
 - Refreshes cached policy every 5 minutes in `agentreel daemon` and once on `agentreel link` and linked `agentreel init`.
-- Adds a bounded 256-entry regex compile cache, a 50ms total local evaluation deadline (fail-open when exceeded), and static rejection of alternation-plus-quantifier ReDoS patterns (`(a|aa)+$`, `(a|a?)+`, `(x|xy)*`).
+- Adds a bounded 256-entry regex compile cache, deterministic evaluation ordering (built-in rules and cheap matchers before regex rules, and enforcing regex rules before `flag` regex rules), a 50ms total local evaluation deadline that preserves collected matches and fails closed when enforcing rules are unevaluated, and a stricter RE2-safe regex subset that statically rejects alternation-plus-quantifier patterns (`(a|aa)+$`, `(a|a?)+`, `(x|xy)*`) and patterns with more than one unbounded quantifier (`*`, `+`, `{n,}` such as `a.*a.*b` or `.*x.*y`).
 
 ### Audit Trail (`policy_decisions` v2)
 - Writes every non-allow policy decision locally as a `policy_decision` event (`id`, `ts`, `session_id`, `rule_id`, `rule_ids`, `action`, `enforced`, `downgraded`, `policy_etag`, `tool`).
