@@ -22,6 +22,7 @@ import { runCursorHook } from "./cursor/hook-runner.js";
 import { configCommand } from "./commands/config.js";
 import { scanCommand } from "./commands/scan.js";
 import { policyCommand } from "./commands/policy.js";
+import { doctorCommand } from "./commands/doctor.js";
 
 const program = new Command();
 
@@ -86,7 +87,7 @@ program
 
 program
   .command("pause")
-  .description("pause local capture — hooks and watcher no-op until `resume`")
+  .description("pause local capture (stops recording until `resume`; org policy is still enforced)")
   .action(() => {
     pauseCommand();
   });
@@ -125,14 +126,16 @@ program
   .command("hook <event>")
   .description("internal: hook handler invoked by Claude Code (reads JSON from stdin)")
   .action(async (event: string) => {
-    await runHook(event);
+    // Measure hook deadline from Node process start (earliest available timestamp).
+    await runHook(event, { hookStartMs: Math.floor(performance.timeOrigin) });
   });
 
 program
   .command("cursor-hook <event>")
   .description("internal: hook handler invoked by Cursor (reads JSON from stdin)")
   .action(async (event: string) => {
-    await runCursorHook(event);
+    // Measure hook deadline from Node process start (earliest available timestamp).
+    await runCursorHook(event, { hookStartMs: Math.floor(performance.timeOrigin) });
   });
 
 program
@@ -154,6 +157,13 @@ program
   .description("show cached policy source, etag, age, mode, offline setting, and rule counts")
   .action(() => {
     policyCommand();
+  });
+
+program
+  .command("doctor")
+  .description("check policy enforcement state, etag age, and pre-exec hook timeouts")
+  .action(() => {
+    doctorCommand();
   });
 
 program.exitOverride();

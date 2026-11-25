@@ -1,21 +1,40 @@
 import { nanoid } from "nanoid";
 import { appendFileSync, existsSync, readFileSync } from "node:fs";
 import type { AgentEvent } from "@agentreel/shared-types";
-import { insertEvent, upsertSession } from "../db.js";
-import { CURSOR_HOOKS_PATH, LOG_PATH, ensureAgentreelDir } from "../paths.js";
-import { scrubAny } from "../redact/scrubber.js";
-import { isCapturePaused } from "../config.js";
+import type { Attribution } from "../attribution.js";
+import {
+  getInstalledPreExecTimeoutS,
+  isCapturePaused,
+  readConfig,
+} from "../config.js";
+import { getSessionAttribution, insertEvent, upsertSession } from "../db.js";
 import { applyIgnoreRules } from "../hooks/ignore-payload.js";
+import { CURSOR_HOOKS_PATH, LOG_PATH, ensureAgentreelDir } from "../paths.js";
+import {
+  enforcePreExec,
+  repoSlugFromRemoteUrl,
+  type PreExecDeps,
+  type PreExecOutcome,
+  type PreExecRequest,
+} from "../policy/enforce.js";
+import { computeHookDeadlineMs } from "../policy/types.js";
+import { scrubAny } from "../redact/scrubber.js";
 import { ensureSessionAttribution, recordSessionEndGit } from "../session-attribution.js";
 import { readStdin } from "../util/stdin.js";
 import {
+  CURSOR_HOOK_SUBCOMMAND,
   canonicalHookName,
+  cursorCwd,
   cursorHookResponse,
+  cursorSessionId,
+  isCursorPreExecHook,
   normalizeCursorHook,
+  parseMaybeJson,
   type CursorHookInput,
+  type CursorPermissionDecision,
 } from "./hook-normalize.js";
 
-export const CURSOR_HOOK_SUBCOMMAND = "cursor-hook";
+export { CURSOR_HOOK_SUBCOMMAND };
 
 function logError(err: unknown): void {
   try {
@@ -80,20 +99,224 @@ export function recordCursorHook(eventArg: string | undefined, input: CursorHook
   return n.sessionId;
 }
 
-/** `agentreel cursor-hook <event>`: read JSON on stdin, record, answer. */
-export async function runCursorHook(eventArg?: string): Promise<void> {
+export function extractCursorPreExecRequest(
+  hook: string,
+  input: CursorHookInput,
+  sessionId: string,
+  ts: number,
+  attribution?: Attribution | null,
+): PreExecRequest {
+  const cwd = cursorCwd(input);
+  const parsedToolInput = parseMaybeJson(input.tool_input);
+  const ti =
+    parsedToolInput && typeof parsedToolInput === "object" && !Array.isArray(parsedToolInput)
+      ? (parsedToolInput as Record<string, unknown>)
+      : undefined;
+
+  const repo = repoSlugFromRemoteUrl(attribution?.git?.remote_url);
+  const branch = attribution?.git?.branch_end ?? attribution?.git?.branch_start;
+  const member = attribution?.git?.user_email ?? attribution?.os_user;
+  const toolUseId = input.tool_use_id ?? input.generation_id;
+
+  if (hook === "beforeShellExecution") {
+    return {
+      sessionId,
+      tool: "cursor",
+      toolName: "Shell",
+      toolUseId,
+      cwd,
+      command: input.command,
+      toolInput: { command: input.command ?? "", cwd },
+      repo,
+      branch,
+      member,
+      ts,
+    };
+  }
+
+  if (hook === "beforeReadFile") {
+    return {
+      sessionId,
+      tool: "cursor",
+      toolName: "Read",
+      toolUseId,
+      cwd,
+      file_path: input.file_path,
+      toolInput: { file_path: input.file_path },
+      repo,
+      branch,
+      member,
+      ts,
+    };
+  }
+
+  if (hook === "beforeMCPExecution") {
+    const rawName = input.tool_name ?? "unknown";
+    const mcpTool =
+      input.mcp_server_name && !rawName.includes("__")
+        ? `${input.mcp_server_name}__${rawName}`
+        : rawName;
+    const filePath = [ti?.file_path, ti?.target_file, ti?.path, ti?.filePath, ti?.file].find(
+      (v): v is string => typeof v === "string" && v.length > 0,
+    );
+    return {
+      sessionId,
+      tool: "cursor",
+      toolName: `MCP:${rawName}`,
+      toolUseId,
+      cwd,
+      command: typeof ti?.command === "string" ? ti.command : undefined,
+      file_path: filePath,
+      url:
+        input.mcp_server_url ??
+        input.url ??
+        (typeof ti?.url === "string" ? ti.url : undefined),
+      mcp_tool: mcpTool,
+      toolInput: parsedToolInput,
+      repo,
+      branch,
+      member,
+      ts,
+    };
+  }
+
+  // preToolUse
+  const toolName = input.tool_name ?? "unknown";
+  const filePath = [
+    input.file_path,
+    ti?.file_path,
+    ti?.target_file,
+    ti?.path,
+    ti?.filePath,
+    ti?.file,
+  ].find((v): v is string => typeof v === "string" && v.length > 0);
+  const command =
+    typeof input.command === "string"
+      ? input.command
+      : typeof ti?.command === "string"
+        ? ti.command
+        : undefined;
+  const url =
+    input.mcp_server_url ??
+    input.url ??
+    (typeof ti?.url === "string" ? ti.url : undefined);
+  let mcpTool: string | undefined;
+  if (toolName.startsWith("MCP:")) {
+    mcpTool = toolName.slice(4);
+  } else if (toolName.startsWith("mcp__")) {
+    mcpTool = toolName.slice(5);
+  }
+
+  return {
+    sessionId,
+    tool: "cursor",
+    toolName,
+    toolUseId,
+    cwd,
+    command,
+    file_path: filePath,
+    url,
+    mcp_tool: mcpTool,
+    toolInput: parsedToolInput,
+    repo,
+    branch,
+    member,
+    ts,
+  };
+}
+
+export interface HandleCursorHookResult {
+  response: string;
+  decision?: CursorPermissionDecision;
+  outcome?: PreExecOutcome;
+}
+
+export async function handleCursorHookInput(
+  eventArg: string | undefined,
+  input: CursorHookInput,
+  deps: PreExecDeps = {},
+): Promise<HandleCursorHookResult> {
+  const hook = canonicalHookName(input.hook_event_name) ?? canonicalHookName(eventArg);
+  const ts = deps.now ? deps.now() : Date.now();
+  const capturePaused = isCapturePaused(deps.config ?? readConfig());
+  const sessionId = capturePaused
+    ? cursorSessionId(input)
+    : (recordCursorHook(eventArg, input, ts) ?? cursorSessionId(input));
+
+  let decision: CursorPermissionDecision | undefined;
+  let outcome: PreExecOutcome | undefined;
+
+  if (hook && isCursorPreExecHook(hook)) {
+    try {
+      let attribution: Attribution | null = null;
+      if (!capturePaused) {
+        try {
+          attribution = getSessionAttribution<Attribution>(sessionId);
+        } catch {
+          attribution = null;
+        }
+      }
+      const req = extractCursorPreExecRequest(hook, input, sessionId, ts, attribution);
+      outcome = await enforcePreExec(req, deps);
+      if (!outcome.permitted && outcome.message) {
+        decision = {
+          permission: "deny",
+          user_message: outcome.message,
+          agent_message: outcome.message,
+        };
+      } else {
+        decision = { permission: "allow" };
+      }
+    } catch (err) {
+      logError(err);
+      decision = { permission: "allow" };
+    }
+  }
+
+  return {
+    response: cursorHookResponse(hook, decision),
+    decision,
+    outcome,
+  };
+}
+
+export interface RunCursorHookOptions {
+  /** Hook start timestamp in ms (defaults to Date.now(); cli.ts passes process timeOrigin). */
+  hookStartMs?: number;
+  readStdin?: () => Promise<string>;
+  writeStdout?: (text: string) => void;
+}
+
+/** `agentreel cursor-hook <event>`: read JSON on stdin, record (unless paused), enforce if pre-exec, answer. */
+export async function runCursorHook(
+  eventArg?: string,
+  opts: RunCursorHookOptions = {},
+): Promise<void> {
+  const hookStartMs = opts.hookStartMs ?? Date.now();
+  const readInput = opts.readStdin ?? readStdin;
+  const writeOutput = opts.writeStdout ?? ((s: string) => process.stdout.write(s));
   let hook = canonicalHookName(eventArg);
+  let decision: CursorPermissionDecision | undefined;
   try {
-    const raw = await readStdin().catch(() => "");
-    if (!isCapturePaused() && raw.trim()) {
+    const raw = await readInput().catch(() => "");
+    const cfg = readConfig();
+    if (raw.trim()) {
       const input = JSON.parse(raw) as CursorHookInput;
       hook = canonicalHookName(input.hook_event_name) ?? hook;
-      recordCursorHook(eventArg, input);
+      const installedTimeoutS = getInstalledPreExecTimeoutS(cfg, "cursor");
+      const hookDeadlineMs = computeHookDeadlineMs(installedTimeoutS, hookStartMs);
+      const handled = await handleCursorHookInput(eventArg, input, {
+        config: cfg,
+        hookDeadlineMs,
+        installedTimeoutS,
+      });
+      decision = handled.decision;
     }
   } catch (err) {
     logError(err);
+    decision = undefined;
   } finally {
-    // Always answer, even on errors: observe-only hooks never block Cursor.
-    process.stdout.write(cursorHookResponse(hook) + "\n");
+    // Always answer, failing open to allow on pre-exec hooks if anything errored.
+    writeOutput(cursorHookResponse(hook, decision) + "\n");
   }
 }

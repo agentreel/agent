@@ -7,7 +7,9 @@ import { installCursorHooks } from "../cursor/hooks-install.js";
 import { readConfig, writeConfig } from "../config.js";
 import { getDb } from "../db.js";
 import { ensureAgentreelDir } from "../paths.js";
+import { loadEffectivePolicy } from "../policy/cache.js";
 import { fetchPolicy } from "../policy/fetch.js";
+import { computePreExecTimeoutS } from "../policy/types.js";
 
 const PACKAGE_NAME = "@agentreel/agent";
 
@@ -42,6 +44,10 @@ export interface InitOptions {
   /** commander maps --no-claude / --no-cursor to claude:false / cursor:false */
   claude?: boolean;
   cursor?: boolean;
+  claudeSettingsPath?: string;
+  cursorHooksPath?: string;
+  cachePath?: string;
+  guardConfigPath?: string;
 }
 
 export async function initCommand(opts: InitOptions = {}): Promise<void> {
@@ -56,13 +62,36 @@ export async function initCommand(opts: InitOptions = {}): Promise<void> {
   writeConfig(cfg);
 
   if (cfg.apiKey) {
-    await fetchPolicy({ config: cfg });
+    await fetchPolicy({ config: cfg, cachePath: opts.cachePath });
   }
+
+  const loadedPolicy = loadEffectivePolicy({
+    cachePath: opts.cachePath,
+    guardConfigPath: opts.guardConfigPath,
+  });
+  const preExecTimeoutS = computePreExecTimeoutS(loadedPolicy.policy);
 
   const binary = resolveAgentBinary();
   const { prefix, mode } = chooseHookPrefix(binary);
-  const result = opts.claude === false ? null : installClaudeCodeHooks(prefix);
-  const cursor = opts.cursor === false ? null : installCursorHooks(prefix);
+  const result =
+    opts.claude === false
+      ? null
+      : installClaudeCodeHooks(prefix, {
+          settingsPath: opts.claudeSettingsPath,
+          preExecTimeoutS,
+        });
+  const cursor =
+    opts.cursor === false
+      ? null
+      : installCursorHooks(prefix, opts.cursorHooksPath, { preExecTimeoutS });
+
+  if (result || cursor) {
+    const nextTimeouts = { ...(cfg.installedHookTimeouts ?? {}) };
+    if (result) nextTimeouts.claude = preExecTimeoutS;
+    if (cursor) nextTimeouts.cursor = preExecTimeoutS;
+    cfg.installedHookTimeouts = nextTimeouts;
+    writeConfig(cfg);
+  }
 
   console.log(pc.bold(pc.cyan("\n  AgentReel  ")) + pc.dim("Loom for AI coding sessions\n"));
   console.log(pc.green("✓") + " Created ~/.agentreel/sessions.db");
@@ -121,13 +150,13 @@ export async function initCommand(opts: InitOptions = {}): Promise<void> {
   console.log(
     pc.dim("Privacy: ") +
       pc.cyan("agentreel pause") +
-      pc.dim(" to stop capturing temporarily, ") +
+      pc.dim(" to stop recording temporarily (org policy is still enforced), ") +
       pc.cyan("agentreel forget --all") +
       pc.dim(" to wipe local sessions."),
   );
   console.log(
     pc.dim("         Or set ") +
       pc.cyan("AGENTREEL_DISABLE=1") +
-      pc.dim(" before launching Claude Code to skip a single session.\n"),
+      pc.dim(" before launching Claude Code to skip recording a single session (org policy is still enforced).\n"),
   );
 }

@@ -16,6 +16,7 @@ import {
   loadEffectivePolicy,
   POLICY_REFRESH_INTERVAL_MS,
   readCachedPolicy,
+  readPolicyRejection,
   shouldRefreshPolicy,
   writeCachedPolicyAtomic,
 } from "../src/policy/cache.js";
@@ -25,6 +26,7 @@ import {
   buildPolicySummary,
   formatPolicySummary,
 } from "../src/commands/policy.js";
+import { formatDoctorReport, inspectDoctorState } from "../src/commands/doctor.js";
 import { createPolicyRefresher } from "../src/commands/daemon.js";
 import type { AgentConfig } from "../src/config.js";
 
@@ -90,9 +92,92 @@ async function startMockServer(
 }
 
 describe("policy validation", () => {
-  it("accepts a valid Policy object", () => {
-    const res = validatePolicy(makePolicy());
+  it("accepts a valid Policy object including optional approval and org metadata", () => {
+    const res = validatePolicy(
+      makePolicy({
+        org_name: "Acme",
+        org_slug: "acme",
+        builtin: {
+          CLOUD001: {
+            enabled: true,
+            action: "require_approval",
+            severity: "critical",
+            approval: { expires_s: 180, offline_fallback: "deny" },
+          },
+        },
+        custom: [
+          {
+            id: "cust_approval",
+            name: "Approve deploy",
+            enabled: true,
+            version: 1,
+            message: "Needs approval",
+            when: [{ field: "command", op: "starts_with", value: "./deploy" }],
+            action: "require_approval",
+            severity: "high",
+            approval: { expires_s: 60, offline_fallback: "allow" },
+          },
+        ],
+      }),
+    );
     expect(res.ok).toBe(true);
+    if (res.ok) {
+      expect(res.value.org_name).toBe("Acme");
+      expect(res.value.org_slug).toBe("acme");
+      expect(res.value.builtin.CLOUD001?.approval).toEqual({
+        expires_s: 180,
+        offline_fallback: "deny",
+      });
+      expect(res.value.custom[0]?.approval).toEqual({
+        expires_s: 60,
+        offline_fallback: "allow",
+      });
+    }
+  });
+
+  it("rejects invalid approval config on builtin overrides and custom rules", () => {
+    expect(
+      validatePolicy({
+        ...makePolicy(),
+        builtin: {
+          CLOUD001: {
+            enabled: true,
+            action: "require_approval",
+            approval: { expires_s: 0 },
+          },
+        },
+      }).ok,
+    ).toBe(false);
+    expect(
+      validatePolicy({
+        ...makePolicy(),
+        builtin: {
+          CLOUD001: {
+            enabled: true,
+            action: "require_approval",
+            approval: { offline_fallback: "flag" },
+          },
+        },
+      }).ok,
+    ).toBe(false);
+    expect(
+      validatePolicy({
+        ...makePolicy(),
+        custom: [
+          {
+            id: "c_bad_approval",
+            name: "Bad approval",
+            enabled: true,
+            version: 1,
+            message: "m",
+            when: [{ field: "command", op: "contains", value: "x" }],
+            action: "require_approval",
+            severity: "high",
+            approval: { expires_s: -5 },
+          },
+        ],
+      }).ok,
+    ).toBe(false);
   });
 
   it("rejects wrong version, invalid mode, invalid offline, or missing allowlists", () => {
@@ -512,6 +597,29 @@ describe("policy fetch and cache", () => {
     await refresh();
     expect(fetchSpy).toHaveBeenCalledTimes(2);
   });
+
+  it("createPolicyRefresher swallows a throwing fetchFn without rejecting", async () => {
+    let mono = 0;
+    const throwingFetch = vi.fn(async () => {
+      throw new Error("unexpected network failure");
+    });
+    const refresh = createPolicyRefresher(
+      POLICY_REFRESH_INTERVAL_MS,
+      throwingFetch,
+      () => mono,
+    );
+
+    await expect(refresh()).resolves.toBeNull();
+    expect(throwingFetch).toHaveBeenCalledTimes(1);
+
+    mono = 30_000;
+    await expect(refresh()).resolves.toBeNull();
+    expect(throwingFetch).toHaveBeenCalledTimes(1);
+
+    mono = POLICY_REFRESH_INTERVAL_MS;
+    await expect(refresh()).resolves.toBeNull();
+    expect(throwingFetch).toHaveBeenCalledTimes(2);
+  });
 });
 
 describe("initCommand policy fetch behaviour", () => {
@@ -629,6 +737,139 @@ describe("initCommand policy fetch behaviour", () => {
       logSpy.mockRestore();
       await srv.close();
       process.env.HOME = prevHome;
+    }
+  });
+});
+
+describe("unsupported regex rejection on policy fetch and doctor output", () => {
+  let tmpDir: string;
+  let cachePath: string;
+  let guardConfigPath: string;
+
+  beforeEach(() => {
+    tmpDir = mkdtempSync(join(tmpdir(), "agentreel-regex-reject-"));
+    cachePath = join(tmpDir, "policy.json");
+    guardConfigPath = join(tmpDir, "guard.json");
+  });
+
+  afterEach(() => {
+    rmSync(tmpDir, { recursive: true, force: true });
+  });
+
+  it("rejects policy with unsupported regex, preserves last-known cache, logs, and surfaces in doctor", async () => {
+    const goodPolicy = makePolicy({ etag: "etag-good-v1" });
+    const t0 = 1_764_000_000_000;
+    writeCachedPolicyAtomic(
+      { policy: goodPolicy, etag: goodPolicy.etag, fetched_at: t0 },
+      cachePath,
+    );
+
+    const badPolicy = makePolicy({
+      etag: "etag-bad-v2",
+      custom: [
+        {
+          id: "cust_bad_regex_rule",
+          name: "Bad overlapping regex",
+          enabled: true,
+          version: 1,
+          message: "Bad regex",
+          when: [
+            { field: "command", op: "contains", value: "curl" },
+            { field: "command", op: "regex", value: "a.*a.*a.*a.*a.*a.*a.*a.*b" },
+          ],
+          action: "block",
+          severity: "critical",
+          scope: {},
+        },
+      ],
+    });
+
+    let serveBad = true;
+    const srv = await startMockServer((_req, res) => {
+      res.writeHead(200, { "content-type": "application/json" });
+      res.end(
+        JSON.stringify(
+          serveBad ? badPolicy : makePolicy({ etag: "etag-fixed-v3" }),
+        ),
+      );
+    });
+
+    const logs: string[] = [];
+    try {
+      const rejected = await fetchPolicy({
+        config: makeConfig(srv.url, "ar_live_key"),
+        cachePath,
+        now: () => t0 + 5_000,
+        log: (m) => logs.push(m),
+      });
+
+      expect(rejected.status).toBe("invalid_policy");
+      if (rejected.status === "invalid_policy") {
+        expect(rejected.keptCache).toBe(true);
+        expect(rejected.error).toContain("cust_bad_regex_rule");
+        expect(rejected.error).toContain("when[1]");
+      }
+
+      // Last-known cache must not be overwritten.
+      const cached = readCachedPolicy(cachePath);
+      expect(cached).toEqual({
+        policy: goodPolicy,
+        etag: "etag-good-v1",
+        fetched_at: t0,
+      });
+
+      // A log line was written.
+      expect(
+        logs.some(
+          (l) => l.includes("cust_bad_regex_rule") && l.includes("when[1]"),
+        ),
+      ).toBe(true);
+
+      // Rejection sidecar recorded and doctor shows exact warning string.
+      const rejection = readPolicyRejection(cachePath);
+      expect(rejection?.reason).toBe("unsupported_regex");
+      expect(rejection?.rule_id).toBe("cust_bad_regex_rule");
+      expect(rejection?.condition_index).toBe(1);
+
+      const report = inspectDoctorState({
+        cachePath,
+        guardConfigPath,
+        claudeSettingsPath: join(tmpDir, "missing-claude.json"),
+        cursorHooksPath: join(tmpDir, "missing-cursor.json"),
+        config: makeConfig(srv.url, "ar_live_key"),
+        now: () => t0 + 10_000,
+      });
+      expect(report.lastRejection?.rule_id).toBe("cust_bad_regex_rule");
+      const output = formatDoctorReport(report);
+      expect(output).toContain(
+        "policy rejected by agent: rule cust_bad_regex_rule has an unsupported regex; last known policy still in use",
+      );
+
+      // Next valid fetch overwrites cache and clears the rejection warning.
+      serveBad = false;
+      const recovered = await fetchPolicy({
+        config: makeConfig(srv.url, "ar_live_key"),
+        cachePath,
+        now: () => t0 + 20_000,
+        log: (m) => logs.push(m),
+      });
+      expect(recovered.status).toBe("updated");
+      expect(readCachedPolicy(cachePath)?.etag).toBe("etag-fixed-v3");
+      expect(readPolicyRejection(cachePath)).toBeNull();
+
+      const recoveredReport = inspectDoctorState({
+        cachePath,
+        guardConfigPath,
+        claudeSettingsPath: join(tmpDir, "missing-claude.json"),
+        cursorHooksPath: join(tmpDir, "missing-cursor.json"),
+        config: makeConfig(srv.url, "ar_live_key"),
+        now: () => t0 + 25_000,
+      });
+      expect(formatDoctorReport(recoveredReport)).not.toContain(
+        "policy rejected by agent:",
+      );
+    } finally {
+      await srv.close();
     }
   });
 });

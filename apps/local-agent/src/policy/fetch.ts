@@ -2,10 +2,12 @@ import { appendFileSync } from "node:fs";
 import { readConfig, type AgentConfig } from "../config.js";
 import { ensureAgentreelDir, LOG_PATH, POLICY_PATH } from "../paths.js";
 import {
+  clearPolicyRejection,
   POLICY_REFRESH_INTERVAL_MS,
   readCachedPolicy,
   shouldRefreshPolicy,
   writeCachedPolicyAtomic,
+  writePolicyRejectionAtomic,
 } from "./cache.js";
 import { validatePolicy, type Policy } from "./types.js";
 
@@ -117,6 +119,7 @@ export async function fetchPolicy(
         },
         cachePath,
       );
+      clearPolicyRejection(cachePath);
       return {
         status: "not_modified",
         policy: cached.policy,
@@ -131,6 +134,18 @@ export async function fetchPolicy(
         body = await res.json();
       } catch {
         log("received invalid JSON from policy endpoint; keeping last-known cache");
+        try {
+          writePolicyRejectionAtomic(
+            {
+              ts: nowFn(),
+              error: "invalid JSON body",
+              reason: "invalid_policy",
+            },
+            cachePath,
+          );
+        } catch {
+          // Never fail fetch on sidecar write error.
+        }
         return {
           status: "invalid_policy",
           error: "invalid JSON body",
@@ -141,6 +156,26 @@ export async function fetchPolicy(
       const validated = validatePolicy(body);
       if (!validated.ok) {
         log(`rejected invalid policy (${validated.error}); keeping last-known cache`);
+        try {
+          writePolicyRejectionAtomic(
+            {
+              ts: nowFn(),
+              error: validated.error,
+              reason: validated.rejectedRuleId
+                ? "unsupported_regex"
+                : "invalid_policy",
+              ...(validated.rejectedRuleId
+                ? { rule_id: validated.rejectedRuleId }
+                : {}),
+              ...(validated.rejectedConditionIndex !== undefined
+                ? { condition_index: validated.rejectedConditionIndex }
+                : {}),
+            },
+            cachePath,
+          );
+        } catch {
+          // Never fail fetch on sidecar write error.
+        }
         return {
           status: "invalid_policy",
           error: validated.error,
@@ -159,6 +194,7 @@ export async function fetchPolicy(
         },
         cachePath,
       );
+      clearPolicyRejection(cachePath);
       return {
         status: "updated",
         policy,

@@ -6,6 +6,7 @@ export type EventType =
   | "user_prompt_submit"
   | "tool_use_pre"
   | "tool_use_post"
+  | "policy_decision"
   | "notification"
   | "stop"
   | "subagent_stop"
@@ -38,6 +39,7 @@ export interface ClaudeCodeHookInput {
   cwd?: string;
   hook_event_name: string;
   tool_name?: string;
+  tool_use_id?: string;
   tool_input?: unknown;
   tool_response?: unknown;
   prompt?: string;

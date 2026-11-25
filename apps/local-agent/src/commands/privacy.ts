@@ -18,14 +18,14 @@ export function pauseCommand(): void {
   console.log(pc.yellow("⏸  capture paused"));
   console.log(
     pc.dim(
-      "  Claude Code hooks and the Cursor watcher will no-op until you " +
+      "  Session recording and the Cursor watcher are paused until you " +
         pc.cyan("agentreel resume") +
-        pc.dim("."),
+        pc.dim(". Org policy is still enforced."),
     ),
   );
   console.log(
     pc.dim(
-      "  Existing local events stay put. They won't upload while paused (the daemon still runs, but the queue won't grow).",
+      "  Existing local events stay put. Policy decisions may still be recorded as required by enforcement.",
     ),
   );
 }

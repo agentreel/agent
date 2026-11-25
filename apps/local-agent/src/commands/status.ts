@@ -74,10 +74,10 @@ export async function statusCommand(): Promise<void> {
   // Capture state — surfaced at the top so the privacy switch is impossible to miss.
   if (cfg.paused) {
     const since = cfg.pausedAt ? new Date(cfg.pausedAt).toLocaleString() : "?";
-    console.log("  capture:       " + pc.yellow(`paused (since ${since})`));
+    console.log("  capture:       " + pc.yellow(`paused (since ${since}; org policy still enforced)`));
     console.log(pc.dim("                 run `agentreel resume` to capture again"));
   } else if (isCaptureDisabledByEnv()) {
-    console.log("  capture:       " + pc.yellow("disabled (AGENTREEL_DISABLE in env)"));
+    console.log("  capture:       " + pc.yellow("disabled (AGENTREEL_DISABLE in env; org policy still enforced)"));
   } else {
     console.log("  capture:       " + pc.green("active"));
   }

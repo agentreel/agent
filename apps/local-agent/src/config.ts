@@ -1,14 +1,24 @@
 import { readFileSync, writeFileSync, existsSync, chmodSync } from "node:fs";
 import { CONFIG_PATH, ensureAgentreelDir } from "./paths.js";
+import { DEFAULT_HOOK_TIMEOUT_S, type HookHost } from "./policy/types.js";
 
 export type HostnameMode = "plain" | "hash" | "omit";
+
+export interface InstalledHookTimeouts {
+  claude?: number;
+  cursor?: number;
+}
 
 export interface AgentConfig {
   apiKey?: string;
   apiBaseUrl: string;
   workspaceId?: string;
+  orgName?: string;
+  orgSlug?: string;
   installedAt?: number;
   hooksInstalled?: boolean;
+  /** Pre-exec hook timeout (seconds) recorded by `agentreel init` per host. */
+  installedHookTimeouts?: InstalledHookTimeouts;
   /** When true, hooks + watcher no-op (don't capture). Toggled via
    *  `agentreel pause` / `agentreel resume`. Kept here so the state
    *  survives shell exits — pausing for an evening should hold until
@@ -55,6 +65,32 @@ export function readConfig(): AgentConfig {
   } catch {
     return { ...DEFAULT };
   }
+}
+
+/**
+ * Returns the recorded pre-exec hook timeout (seconds) for a host, or null if
+ * init has not recorded one yet (e.g. hooks installed by an older agent).
+ */
+export function getRecordedPreExecTimeoutS(
+  cfg: AgentConfig,
+  host: HookHost,
+): number | null {
+  const val = cfg.installedHookTimeouts?.[host];
+  if (typeof val === "number" && Number.isFinite(val) && val > 0) {
+    return val;
+  }
+  return null;
+}
+
+/**
+ * Returns the effective installed pre-exec hook timeout (seconds) for a host.
+ * Missing values default to 5s (the legacy pre-C3 hook timeout).
+ */
+export function getInstalledPreExecTimeoutS(
+  cfg: AgentConfig,
+  host: HookHost,
+): number {
+  return getRecordedPreExecTimeoutS(cfg, host) ?? DEFAULT_HOOK_TIMEOUT_S;
 }
 
 export function writeConfig(cfg: AgentConfig): void {

@@ -26,7 +26,7 @@ export const RULES: Rule[] = [
         if (!hasRecursiveDelete) return false;
 
         const dangerousPaths =
-          /(\~\/|\/home\/[^\/\s]+\/?|\/Users\/[^\/\s]+\/?|\$HOME|\/\s|[A-Z]:\\\s|[A-Z]:\\$)/;
+          /((?:^|\s)\~(?:\/|\s|$)|\/home\/[^\/\s]+\/?|\/Users\/[^\/\s]+\/?|\$HOME|\/\s|[A-Z]:\\\s|[A-Z]:\\$)/;
         return dangerousPaths.test(cmd);
       },
     },
@@ -489,6 +489,74 @@ export const RULES: Rule[] = [
              /\.(pem|ppk|key)\b/i.test(cmd));
         
         return curlWgetWithSecrets || scpSshSecrets;
+      },
+    },
+  },
+
+  {
+    id: "SECRET004",
+    version: 1,
+    severity: "high",
+    category: "secret-exfiltration",
+    name: "Secret or credential file read",
+    description:
+      "Detects direct reads of .env files, SSH keys, AWS credentials, or production credential files",
+    rationale:
+      "Reading credential files exposes secrets to model context and increases exfiltration risk.",
+    enabled: true,
+    matcher: {
+      type: "content-pattern",
+      customMatcher: (ctx) => {
+        const payload = ctx.payload;
+        if (!payload || typeof payload !== "object") return false;
+        const p = payload as Record<string, unknown>;
+        const toolName =
+          typeof p.tool_name === "string" ? p.tool_name.toLowerCase() : "";
+        if (
+          toolName &&
+          !/^(read|read_file|readfile|view|cat|beforereadfile)$/.test(toolName)
+        ) {
+          return false;
+        }
+        const ti =
+          p.tool_input && typeof p.tool_input === "object" && !Array.isArray(p.tool_input)
+            ? (p.tool_input as Record<string, unknown>)
+            : undefined;
+        const candidates = [
+          p.file_path,
+          ti?.file_path,
+          ti?.target_file,
+          ti?.path,
+          ti?.filePath,
+          ti?.file,
+        ].filter((v): v is string => typeof v === "string" && v.length > 0);
+        if (candidates.length === 0) return false;
+
+        return candidates.some((fp) => {
+          const normalized = fp.replace(/\\/g, "/");
+          if (/(^|\/)\.env(?:\.(?:example|sample|template|dist))$/i.test(normalized)) {
+            return false;
+          }
+          if (/(^|\/)\.env(?:\.[^/]+)?$/i.test(normalized)) return true;
+          if (/(^|\/)\.aws\/(credentials|config)$/i.test(normalized)) return true;
+          if (/(^|\/)\.ssh\/(id_[^/]+|config|authorized_keys)$/i.test(normalized)) return true;
+          if (/(^|\/)\.gnupg\//i.test(normalized)) return true;
+          if (/(^|\/)\.(netrc|npmrc|pypirc)$/i.test(normalized)) return true;
+          if (/(^|\/)\.(kube\/config|docker\/config\.json)$/i.test(normalized)) return true;
+          if (/\.(pem|ppk|p12|pfx)$/i.test(normalized)) return true;
+          if (/(^|\/)(credentials\.json|service-account[^/]*\.json)$/i.test(normalized)) {
+            return true;
+          }
+          if (
+            /(^|\/)[^/]*prod[^/]*(credential|secret|token|key)[^/]*(\.(json|ya?ml|toml|ini|conf|env|txt|key))?$/i.test(
+              normalized,
+            ) &&
+            !/\.(ts|tsx|js|jsx|mjs|cjs|py|go|rs|java|md)$/i.test(normalized)
+          ) {
+            return true;
+          }
+          return false;
+        });
       },
     },
   },

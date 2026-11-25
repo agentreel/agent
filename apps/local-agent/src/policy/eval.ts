@@ -10,7 +10,12 @@ import type {
   PolicyAction,
   PolicyDecisionAction,
   PolicyTool,
+  RuleApprovalConfig,
 } from "./types.js";
+
+export const POLICY_EVAL_DEADLINE_MS = 50;
+export const EVAL_TIMEOUT_REASON = "eval_timeout";
+export const INVALID_RULE_REASON = "invalid_rule";
 
 export interface PolicyEvalInput {
   tool: PolicyTool;
@@ -19,6 +24,7 @@ export interface PolicyEvalInput {
   file_path?: string;
   url?: string;
   mcp_tool?: string;
+  toolInput?: unknown;
   repo?: string;
   branch?: string;
   member?: string;
@@ -31,6 +37,7 @@ export interface PolicyRuleMatch {
   action: PolicyAction;
   severity: Severity;
   source: "builtin" | "custom";
+  approval?: RuleApprovalConfig;
 }
 
 export interface PolicyEvalResult {
@@ -39,6 +46,16 @@ export interface PolicyEvalResult {
   matches: PolicyRuleMatch[];
   downgraded: boolean;
   original_action?: PolicyAction;
+  timed_out?: boolean;
+  invalid_rule?: boolean;
+  invalid_rule_ids?: string[];
+  reason?: string;
+  unevaluated_enforcing?: boolean;
+}
+
+export interface PolicyEvalOptions {
+  deadlineMs?: number;
+  nowMs?: () => number;
 }
 
 const ACTION_RANK: Record<PolicyDecisionAction, number> = {
@@ -120,7 +137,6 @@ export function matchGlob(
         if (matched) curr[j] = 1;
       }
     } else if (tok.kind === "globstar_slash") {
-      // Matches zero segments (empty) or any prefix ending with "/".
       let seenPrefix = false;
       for (let j = 0; j <= n; j++) {
         if (prev[j]) {
@@ -259,6 +275,21 @@ interface FieldCandidate {
   pathAware: boolean;
 }
 
+interface EvalClock {
+  deadline: number;
+  nowMs: () => number;
+  timedOut: boolean;
+}
+
+function checkExpired(clock: EvalClock): boolean {
+  if (clock.timedOut) return true;
+  if (clock.nowMs() >= clock.deadline) {
+    clock.timedOut = true;
+    return true;
+  }
+  return false;
+}
+
 function extractFieldCandidates(
   field: CustomRuleCondition["field"],
   input: PolicyEvalInput,
@@ -306,10 +337,18 @@ function extractFieldCandidates(
   }
 }
 
+interface RuleEvalState {
+  compileFailed: boolean;
+}
+
 function matchConditionAgainstCandidate(
   cond: CustomRuleCondition,
   candidate: FieldCandidate,
+  clock: EvalClock,
+  state: RuleEvalState,
 ): boolean {
+  if (checkExpired(clock)) return false;
+
   const caseSensitive = cond.case_sensitive === true;
   const hay = caseSensitive ? candidate.value : candidate.value.toLowerCase();
   const needle = caseSensitive ? cond.value : cond.value.toLowerCase();
@@ -329,9 +368,40 @@ function matchConditionAgainstCandidate(
         candidate.pathAware,
       );
     case "regex": {
-      const re = compileSafeRegex(cond.value, { caseSensitive });
-      if (!re) return false;
-      return testSafeRegex(re, candidate.value);
+      const remainingBeforeCompile = clock.deadline - clock.nowMs();
+      if (remainingBeforeCompile <= 0) {
+        clock.timedOut = true;
+        return false;
+      }
+      const re = compileSafeRegex(cond.value, {
+        caseSensitive,
+        timeoutMs: Math.max(1, Math.floor(remainingBeforeCompile)),
+        onTimeout: () => {
+          clock.timedOut = true;
+        },
+      });
+      if (clock.timedOut) return false;
+      if (!re) {
+        state.compileFailed = true;
+        return false;
+      }
+      if (checkExpired(clock)) return false;
+      const remainingBeforeTest = clock.deadline - clock.nowMs();
+      if (remainingBeforeTest <= 0) {
+        clock.timedOut = true;
+        return false;
+      }
+      const matched = testSafeRegex(
+        re,
+        candidate.value,
+        Math.max(1, Math.floor(remainingBeforeTest)),
+        () => {
+          clock.timedOut = true;
+        },
+      );
+      if (matched) return true;
+      if (checkExpired(clock)) return false;
+      return false;
     }
   }
 }
@@ -339,17 +409,35 @@ function matchConditionAgainstCandidate(
 function matchesCondition(
   cond: CustomRuleCondition,
   input: PolicyEvalInput,
+  clock: EvalClock,
+  state: RuleEvalState,
 ): boolean {
+  if (checkExpired(clock)) return false;
   const candidates = extractFieldCandidates(cond.field, input);
   if (candidates.length === 0) return false;
-  return candidates.some((c) => matchConditionAgainstCandidate(cond, c));
+  for (const c of candidates) {
+    if (checkExpired(clock)) return false;
+    if (matchConditionAgainstCandidate(cond, c, clock, state)) return true;
+    if (clock.timedOut || state.compileFailed) return false;
+  }
+  return false;
 }
 
-function matchesCustomRule(rule: CustomRule, input: PolicyEvalInput): boolean {
+function matchesCustomRule(
+  rule: CustomRule,
+  input: PolicyEvalInput,
+  clock: EvalClock,
+  state: RuleEvalState,
+): boolean {
+  if (checkExpired(clock)) return false;
   if (!rule.enabled) return false;
   if (!rule.when || rule.when.length === 0) return false;
   if (!matchesScope(rule.scope, input)) return false;
-  return rule.when.every((cond) => matchesCondition(cond, input));
+  for (const cond of rule.when) {
+    if (!matchesCondition(cond, input, clock, state)) return false;
+    if (clock.timedOut || state.compileFailed) return false;
+  }
+  return true;
 }
 
 function buildBuiltinMatchContext(input: PolicyEvalInput): MatchContext {
@@ -359,6 +447,7 @@ function buildBuiltinMatchContext(input: PolicyEvalInput): MatchContext {
   if (input.file_path !== undefined) payload.file_path = input.file_path;
   if (input.url !== undefined) payload.url = input.url;
   if (input.mcp_tool !== undefined) payload.mcp_tool = input.mcp_tool;
+  if (input.toolInput !== undefined) payload.tool_input = input.toolInput;
 
   return {
     command: input.command,
@@ -367,16 +456,149 @@ function buildBuiltinMatchContext(input: PolicyEvalInput): MatchContext {
   };
 }
 
+function isEnforcingAction(action: PolicyAction): boolean {
+  return action === "block" || action === "require_approval";
+}
+
+function hasRegexCondition(rule: CustomRule): boolean {
+  return Array.isArray(rule.when) && rule.when.some((c) => c.op === "regex");
+}
+
+function orderCustomRules(customRules: CustomRule[]): CustomRule[] {
+  const cheap: CustomRule[] = [];
+  const regexEnforcing: CustomRule[] = [];
+  const regexFlag: CustomRule[] = [];
+  for (const rule of customRules) {
+    if (!rule.enabled || !rule.when || rule.when.length === 0) continue;
+    if (!hasRegexCondition(rule)) {
+      cheap.push(rule);
+    } else if (isEnforcingAction(rule.action)) {
+      regexEnforcing.push(rule);
+    } else {
+      regexFlag.push(rule);
+    }
+  }
+  return [...cheap, ...regexEnforcing, ...regexFlag];
+}
+
+function finalizeTimeout(
+  matches: PolicyRuleMatch[],
+  unevaluatedEnforcing: boolean,
+  mode: Policy["mode"],
+): PolicyEvalResult {
+  let strictest: PolicyAction | null = null;
+  for (const m of matches) {
+    if (strictest === null || ACTION_RANK[m.action] > ACTION_RANK[strictest]) {
+      strictest = m.action;
+    }
+  }
+
+  let effective: PolicyAction;
+  if (unevaluatedEnforcing) {
+    effective = "block";
+  } else if (strictest !== null && ACTION_RANK[strictest] > ACTION_RANK.flag) {
+    effective = strictest;
+  } else {
+    effective = "flag";
+  }
+
+  const ruleIds = matches.map((m) => m.rule_id);
+
+  if (mode === "observe" && isEnforcingAction(effective)) {
+    return {
+      action: "flag",
+      rule_ids: ruleIds,
+      matches,
+      downgraded: true,
+      original_action: effective,
+      timed_out: true,
+      reason: EVAL_TIMEOUT_REASON,
+      unevaluated_enforcing: unevaluatedEnforcing,
+    };
+  }
+
+  return {
+    action: effective,
+    rule_ids: ruleIds,
+    matches,
+    downgraded: false,
+    timed_out: true,
+    reason: EVAL_TIMEOUT_REASON,
+    unevaluated_enforcing: unevaluatedEnforcing,
+  };
+}
+
+function finalizeInvalidRule(
+  matches: PolicyRuleMatch[],
+  invalidRuleIds: string[],
+  unevaluatedEnforcing: boolean,
+  mode: Policy["mode"],
+): PolicyEvalResult {
+  let strictest: PolicyAction | null = null;
+  for (const m of matches) {
+    if (strictest === null || ACTION_RANK[m.action] > ACTION_RANK[strictest]) {
+      strictest = m.action;
+    }
+  }
+
+  let effective: PolicyAction;
+  if (unevaluatedEnforcing) {
+    effective = "block";
+  } else if (strictest !== null && ACTION_RANK[strictest] > ACTION_RANK.flag) {
+    effective = strictest;
+  } else {
+    effective = "flag";
+  }
+
+  const ruleIds = matches.map((m) => m.rule_id);
+
+  if (mode === "observe" && isEnforcingAction(effective)) {
+    return {
+      action: "flag",
+      rule_ids: ruleIds,
+      matches,
+      downgraded: true,
+      original_action: effective,
+      invalid_rule: true,
+      invalid_rule_ids: invalidRuleIds,
+      reason: INVALID_RULE_REASON,
+      unevaluated_enforcing: unevaluatedEnforcing,
+    };
+  }
+
+  return {
+    action: effective,
+    rule_ids: ruleIds,
+    matches,
+    downgraded: false,
+    invalid_rule: true,
+    invalid_rule_ids: invalidRuleIds,
+    reason: INVALID_RULE_REASON,
+    unevaluated_enforcing: unevaluatedEnforcing,
+  };
+}
+
 /**
  * Pure, synchronous, network-free policy evaluator.
- * Evaluates built-in Guard rules with policy overrides first, then custom rules,
- * honoring allow lists, scope, strictest-wins precedence, and observe mode.
+ * Evaluates built-in Guard rules first, then cheap custom rules, then regex
+ * custom rules (block/require_approval before flag). On deadline expiry, keeps
+ * collected matches, fails closed if any enforcing rule was unevaluated or
+ * timed out, and otherwise returns the strictest result plus an eval_timeout flag.
  */
 export function evaluatePolicy(
   input: PolicyEvalInput,
   policy: Policy,
   builtinRules: Rule[] = RULES,
+  opts: PolicyEvalOptions = {},
 ): PolicyEvalResult {
+  const nowMs = opts.nowMs ?? (() => performance.now());
+  const deadlineMs = opts.deadlineMs ?? POLICY_EVAL_DEADLINE_MS;
+  const clock: EvalClock = {
+    deadline: nowMs() + deadlineMs,
+    nowMs,
+    timedOut: false,
+  };
+
   if (isExemptByAllowLists(input, policy)) {
     return {
       action: "allow",
@@ -386,40 +608,131 @@ export function evaluatePolicy(
     };
   }
 
-  const matches: PolicyRuleMatch[] = [];
-  const ctx = buildBuiltinMatchContext(input);
-
+  const enabledBuiltins: Array<{
+    rule: Rule;
+    effectiveRule: Rule;
+    action: PolicyAction;
+    override: Policy["builtin"][string] | undefined;
+  }> = [];
   for (const rule of builtinRules) {
     const override = policy.builtin[rule.id];
     const enabled = override !== undefined ? override.enabled : rule.enabled;
     if (!enabled) continue;
-
-    const effectiveRule: Rule = rule.enabled ? rule : { ...rule, enabled: true };
-    const finding = matchRule(effectiveRule, ctx);
-    if (!finding) continue;
-
-    const action: PolicyAction = override?.action ?? "flag";
-    const severity: Severity = override?.severity ?? finding.severity;
-    matches.push({
-      rule_id: rule.id,
-      name: rule.name,
-      message: rule.description || rule.name,
-      action,
-      severity,
-      source: "builtin",
+    enabledBuiltins.push({
+      rule,
+      effectiveRule: rule.enabled ? rule : { ...rule, enabled: true },
+      action: override?.action ?? "flag",
+      override,
     });
   }
 
-  for (const rule of policy.custom) {
-    if (!matchesCustomRule(rule, input)) continue;
-    matches.push({
-      rule_id: rule.id,
-      name: rule.name,
-      message: rule.message || rule.name,
-      action: rule.action,
-      severity: rule.severity,
-      source: "custom",
-    });
+  const orderedCustom = orderCustomRules(policy.custom);
+
+  const hasEnforcingCustomFrom = (start: number): boolean => {
+    for (let j = start; j < orderedCustom.length; j++) {
+      if (isEnforcingAction(orderedCustom[j]!.action)) return true;
+    }
+    return false;
+  };
+
+  const hasEnforcingBuiltinFrom = (start: number): boolean => {
+    for (let j = start; j < enabledBuiltins.length; j++) {
+      if (isEnforcingAction(enabledBuiltins[j]!.action)) return true;
+    }
+    return false;
+  };
+
+  const matches: PolicyRuleMatch[] = [];
+  const ctx = buildBuiltinMatchContext(input);
+
+  for (let i = 0; i < enabledBuiltins.length; i++) {
+    if (checkExpired(clock)) {
+      return finalizeTimeout(
+        matches,
+        hasEnforcingBuiltinFrom(i) || hasEnforcingCustomFrom(0),
+        policy.mode,
+      );
+    }
+    const entry = enabledBuiltins[i]!;
+    const finding = matchRule(entry.effectiveRule, ctx);
+    if (finding) {
+      const severity: Severity = entry.override?.severity ?? finding.severity;
+      matches.push({
+        rule_id: entry.rule.id,
+        name: entry.rule.name,
+        message: entry.rule.description || entry.rule.name,
+        action: entry.action,
+        severity,
+        source: "builtin",
+        ...(entry.override?.approval
+          ? { approval: entry.override.approval }
+          : {}),
+      });
+    }
+    const hasMoreRules =
+      i + 1 < enabledBuiltins.length || orderedCustom.length > 0;
+    if (hasMoreRules && checkExpired(clock)) {
+      return finalizeTimeout(
+        matches,
+        hasEnforcingBuiltinFrom(i + 1) || hasEnforcingCustomFrom(0),
+        policy.mode,
+      );
+    }
+  }
+
+  const invalidRuleIds: string[] = [];
+  let invalidEnforcing = false;
+
+  for (let i = 0; i < orderedCustom.length; i++) {
+    if (checkExpired(clock)) {
+      return finalizeTimeout(
+        matches,
+        invalidEnforcing || hasEnforcingCustomFrom(i),
+        policy.mode,
+      );
+    }
+    const rule = orderedCustom[i]!;
+    if (!matchesScope(rule.scope, input)) continue;
+    const state: RuleEvalState = { compileFailed: false };
+    const matched = matchesCustomRule(rule, input, clock, state);
+    if (matched) {
+      matches.push({
+        rule_id: rule.id,
+        name: rule.name,
+        message: rule.message || rule.name,
+        action: rule.action,
+        severity: rule.severity,
+        source: "custom",
+        ...(rule.approval ? { approval: rule.approval } : {}),
+      });
+      if (i + 1 < orderedCustom.length && checkExpired(clock)) {
+        return finalizeTimeout(
+          matches,
+          invalidEnforcing || hasEnforcingCustomFrom(i + 1),
+          policy.mode,
+        );
+      }
+    } else if (clock.timedOut) {
+      return finalizeTimeout(
+        matches,
+        invalidEnforcing || hasEnforcingCustomFrom(i),
+        policy.mode,
+      );
+    } else if (state.compileFailed) {
+      invalidRuleIds.push(rule.id);
+      if (isEnforcingAction(rule.action)) {
+        invalidEnforcing = true;
+      }
+    }
+  }
+
+  if (invalidRuleIds.length > 0) {
+    return finalizeInvalidRule(
+      matches,
+      invalidRuleIds,
+      invalidEnforcing,
+      policy.mode,
+    );
   }
 
   if (matches.length === 0) {

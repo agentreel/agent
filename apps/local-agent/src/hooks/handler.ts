@@ -1,16 +1,29 @@
 import { nanoid } from "nanoid";
 import { appendFileSync } from "node:fs";
 import type { AgentEvent, ClaudeCodeHookInput, EventType } from "@agentreel/shared-types";
-import { insertEvent, upsertSession } from "../db.js";
-import { LOG_PATH, ensureAgentreelDir } from "../paths.js";
-import { scrubAny } from "../redact/scrubber.js";
-import { recomputeSessionCost } from "../cost/transcript.js";
-import { isCapturePaused } from "../config.js";
-import { applyIgnoreRules } from "./ignore-payload.js";
-import { readStdin } from "../util/stdin.js";
+import type { Attribution } from "../attribution.js";
 import { claudeVersionFromTranscript } from "../attribution.js";
-import { ensureSessionAttribution, recordSessionEndGit } from "../session-attribution.js";
+import {
+  getInstalledPreExecTimeoutS,
+  isCapturePaused,
+  readConfig,
+} from "../config.js";
+import { recomputeSessionCost } from "../cost/transcript.js";
 import { isCursorPayload, nativeCursorHooksInstalled, recordCursorHook } from "../cursor/hook-runner.js";
+import { getSessionAttribution, insertEvent, upsertSession } from "../db.js";
+import { LOG_PATH, ensureAgentreelDir } from "../paths.js";
+import {
+  enforcePreExec,
+  repoSlugFromRemoteUrl,
+  type PreExecDeps,
+  type PreExecOutcome,
+  type PreExecRequest,
+} from "../policy/enforce.js";
+import { computeHookDeadlineMs } from "../policy/types.js";
+import { scrubAny } from "../redact/scrubber.js";
+import { ensureSessionAttribution, recordSessionEndGit } from "../session-attribution.js";
+import { readStdin } from "../util/stdin.js";
+import { applyIgnoreRules } from "./ignore-payload.js";
 
 const HOOK_EVENT_TO_TYPE: Record<string, EventType> = {
   SessionStart: "session_start",
@@ -32,41 +45,79 @@ function logError(err: unknown): void {
     }\n`;
     appendFileSync(LOG_PATH, line);
   } catch {
-    // swallow — never block Claude Code
+    // swallow: never block Claude Code
   }
 }
 
-export async function runHook(eventArg?: string): Promise<void> {
-  // Hooks must never block or fail Claude Code. Wrap everything.
-  try {
-    // Honor explicit opt-outs before reading the payload — env var for
-    // single-shell suppression, persisted pause for "stop capturing
-    // until I resume." Either way: silently consume stdin (Claude Code
-    // streams hook input via pipe; not draining it could leave handles
-    // dangling) and return cleanly.
-    if (isCapturePaused()) {
-      await readStdin().catch(() => "");
-      return;
-    }
+export function formatClaudePreToolUseDeny(reason: string): string {
+  return JSON.stringify({
+    hookSpecificOutput: {
+      hookEventName: "PreToolUse",
+      permissionDecision: "deny",
+      permissionDecisionReason: reason,
+    },
+  });
+}
 
-    const raw = await readStdin();
-    if (!raw.trim()) return;
-    const input = JSON.parse(raw) as ClaudeCodeHookInput;
+export function extractClaudePreExecRequest(
+  input: ClaudeCodeHookInput,
+  sessionId: string,
+  ts: number,
+  attribution?: Attribution | null,
+): PreExecRequest {
+  const toolName = input.tool_name ?? "unknown";
+  const ti =
+    input.tool_input && typeof input.tool_input === "object" && !Array.isArray(input.tool_input)
+      ? (input.tool_input as Record<string, unknown>)
+      : undefined;
 
-    // Cursor runs Claude Code hooks from ~/.claude/settings.json too
-    // ("Third-party imports", on by default). Those payloads carry
-    // cursor_version. Record them as Cursor, or skip them when the native
-    // Cursor hooks are installed so nothing is captured twice.
-    if (isCursorPayload(input)) {
-      if (!nativeCursorHooksInstalled()) recordCursorHook(eventArg, input as never);
-      return;
-    }
+  const command = typeof ti?.command === "string" ? ti.command : undefined;
+  const filePath = [ti?.file_path, ti?.path, ti?.notebook_path, ti?.target_file, ti?.filePath, ti?.file].find(
+    (v): v is string => typeof v === "string" && v.length > 0,
+  );
+  const url = typeof ti?.url === "string" ? ti.url : undefined;
+  let mcpTool: string | undefined;
+  if (toolName.startsWith("mcp__")) {
+    mcpTool = toolName.slice(5);
+  } else if (toolName.startsWith("MCP:")) {
+    mcpTool = toolName.slice(4);
+  }
 
-    const hookEventName = input.hook_event_name ?? eventArg ?? "Unknown";
-    const type: EventType = HOOK_EVENT_TO_TYPE[hookEventName] ?? "unknown";
-    const ts = Date.now();
-    const sessionId = input.session_id ?? "unknown-session";
+  return {
+    sessionId,
+    tool: "claude-code",
+    toolName,
+    toolUseId: input.tool_use_id,
+    cwd: input.cwd,
+    command,
+    file_path: filePath,
+    url,
+    mcp_tool: mcpTool,
+    toolInput: input.tool_input,
+    repo: repoSlugFromRemoteUrl(attribution?.git?.remote_url),
+    branch: attribution?.git?.branch_end ?? attribution?.git?.branch_start,
+    member: attribution?.git?.user_email ?? attribution?.os_user,
+    ts,
+  };
+}
 
+export interface HandleClaudeHookResult {
+  stdout: string | null;
+  outcome?: PreExecOutcome;
+}
+
+export async function handleClaudeHookInput(
+  eventArg: string | undefined,
+  input: ClaudeCodeHookInput,
+  deps: PreExecDeps = {},
+): Promise<HandleClaudeHookResult> {
+  const hookEventName = input.hook_event_name ?? eventArg ?? "Unknown";
+  const type: EventType = HOOK_EVENT_TO_TYPE[hookEventName] ?? "unknown";
+  const ts = deps.now ? deps.now() : Date.now();
+  const sessionId = input.session_id ?? "unknown-session";
+  const capturePaused = isCapturePaused(deps.config ?? readConfig());
+
+  if (!capturePaused) {
     if (type === "session_start") {
       upsertSession({
         id: sessionId,
@@ -83,7 +134,6 @@ export async function runHook(eventArg?: string): Promise<void> {
         cwd: input.cwd,
       });
     } else {
-      // Make sure the session row exists so events have a parent.
       upsertSession({
         id: sessionId,
         tool: "claude-code",
@@ -103,10 +153,6 @@ export async function runHook(eventArg?: string): Promise<void> {
       logError(err);
     }
 
-    // Scrub the entire payload before persistence — never let raw secrets
-    // touch SQLite, even briefly. scrubAny handles strings recursively and
-    // also redacts values whose KEY name looks sensitive.
-    // .agentreelignore first (drops contents of ignored files), then scrub.
     const safePayload = scrubAny(applyIgnoreRules(input as never) as typeof input);
     const event: AgentEvent = {
       id: nanoid(),
@@ -118,15 +164,84 @@ export async function runHook(eventArg?: string): Promise<void> {
       payload: safePayload,
     };
     insertEvent(event);
+  }
 
-    // After every hook fire, walk the transcript tail and update the
-    // session's running cost / token totals. Incremental via offset
-    // cache, so this stays cheap even on long sessions.
+  let stdout: string | null = null;
+  let outcome: PreExecOutcome | undefined;
+
+  if (type === "tool_use_pre") {
+    try {
+      let attribution: Attribution | null = null;
+      if (!capturePaused) {
+        try {
+          attribution = getSessionAttribution<Attribution>(sessionId);
+        } catch {
+          attribution = null;
+        }
+      }
+      const req = extractClaudePreExecRequest(input, sessionId, ts, attribution);
+      outcome = await enforcePreExec(req, deps);
+      if (!outcome.permitted && outcome.message) {
+        stdout = formatClaudePreToolUseDeny(outcome.message);
+      }
+    } catch (err) {
+      logError(err);
+      stdout = null;
+    }
+  }
+
+  if (!capturePaused) {
     try {
       recomputeSessionCost(sessionId, input.transcript_path);
     } catch (err) {
-      // Cost is best-effort — never let a parse glitch break capture.
       logError(err);
+    }
+  }
+
+  return { stdout, outcome };
+}
+
+export interface RunHookOptions {
+  /** Hook start timestamp in ms (defaults to Date.now(); cli.ts passes process timeOrigin). */
+  hookStartMs?: number;
+  readStdin?: () => Promise<string>;
+  writeStdout?: (text: string) => void;
+}
+
+export async function runHook(
+  eventArg?: string,
+  opts: RunHookOptions = {},
+): Promise<void> {
+  // Hooks must never block or fail Claude Code on internal errors. Wrap everything.
+  const hookStartMs = opts.hookStartMs ?? Date.now();
+  const readInput = opts.readStdin ?? readStdin;
+  const writeOutput = opts.writeStdout ?? ((s: string) => process.stdout.write(s));
+  try {
+    const cfg = readConfig();
+    const raw = await readInput();
+    if (!raw.trim()) return;
+    const input = JSON.parse(raw) as ClaudeCodeHookInput;
+
+    // Cursor runs Claude Code hooks from ~/.claude/settings.json too
+    // ("Third-party imports", on by default). Those payloads carry
+    // cursor_version. Record them as Cursor, or skip them when the native
+    // Cursor hooks are installed so nothing is captured twice.
+    if (isCursorPayload(input)) {
+      if (!isCapturePaused(cfg) && !nativeCursorHooksInstalled()) {
+        recordCursorHook(eventArg, input as never);
+      }
+      return;
+    }
+
+    const installedTimeoutS = getInstalledPreExecTimeoutS(cfg, "claude");
+    const hookDeadlineMs = computeHookDeadlineMs(installedTimeoutS, hookStartMs);
+    const result = await handleClaudeHookInput(eventArg, input, {
+      config: cfg,
+      hookDeadlineMs,
+      installedTimeoutS,
+    });
+    if (result.stdout) {
+      writeOutput(result.stdout + "\n");
     }
   } catch (err) {
     logError(err);

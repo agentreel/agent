@@ -109,10 +109,18 @@ describe("normalizeCursorHook", () => {
     expect(norm.canonicalHookName("Stop")).toBe("stop");
   });
 
-  it("answers with observe-only JSON", () => {
+  it("answers with observe-only JSON for non-pre-exec hooks and permission JSON for pre-exec hooks", () => {
     expect(norm.cursorHookResponse("beforeSubmitPrompt")).toBe('{"continue":true}');
     expect(norm.cursorHookResponse("postToolUse")).toBe("{}");
     expect(norm.cursorHookResponse("afterShellExecution")).toBe("{}");
+    expect(norm.cursorHookResponse("beforeShellExecution")).toBe('{"permission":"allow"}');
+    expect(
+      norm.cursorHookResponse("beforeShellExecution", {
+        permission: "deny",
+        user_message: "Blocked",
+        agent_message: "Blocked",
+      }),
+    ).toBe('{"permission":"deny","user_message":"Blocked","agent_message":"Blocked"}');
   });
 });
 
@@ -169,10 +177,15 @@ describe("hooks.json install", () => {
       { command: "/usr/local/bin/agentreel cursor-hook afterFileEdit", timeout: 5 },
     ]);
     expect(f.hooks.postToolUse).toHaveLength(1);
-    // never a permission hook: recording must not be able to approve anything
+    // pre-exec hooks get the long approval timeout (130s); other hooks keep 5s
     for (const k of ["preToolUse", "beforeShellExecution", "beforeMCPExecution", "beforeReadFile"]) {
-      expect(f.hooks[k]).toBeUndefined();
+      expect(f.hooks[k]).toEqual([
+        { command: `/usr/local/bin/agentreel cursor-hook ${k}`, timeout: 130 },
+      ]);
     }
+    expect(f.hooks.beforeSubmitPrompt).toEqual([
+      { command: "/usr/local/bin/agentreel cursor-hook beforeSubmitPrompt", timeout: 5 },
+    ]);
     expect(runner.nativeCursorHooksInstalled(path)).toBe(true);
     const { removed } = install.uninstallCursorHooks(path);
     expect(removed).toBe(norm.CURSOR_HOOK_EVENTS.length);

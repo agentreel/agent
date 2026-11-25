@@ -6,18 +6,32 @@ import type { EventType } from "@agentreel/shared-types";
  * (see test/fixtures/cursor-hooks/README.md for the exact fields we rely on).
  *
  * We normalize every hook into the same event vocabulary the Claude Code
- * hooks use (tool_use_post with tool_name / tool_input / tool_response) so
- * the replay renders both the same way. The original hook name is kept in
- * `cursor_hook` so the viewer can de-duplicate overlapping hooks (for
- * example postToolUse(Shell) and afterShellExecution for one command).
+ * hooks use (tool_use_pre / tool_use_post with tool_name / tool_input / tool_response)
+ * so the replay renders both the same way. The original hook name is kept in
+ * `cursor_hook` so the viewer can de-duplicate overlapping hooks.
  */
 
-/** Hooks `agentreel init` installs. All are observe-only: none of them can
- *  approve anything, so recording never changes what the agent may do. */
+/** Pre-execution hooks that can enforce policy (block or require_approval). */
+export const CURSOR_HOOK_SUBCOMMAND = "cursor-hook";
+
+export const CURSOR_PRE_EXEC_HOOK_EVENTS = [
+  "preToolUse",
+  "beforeShellExecution",
+  "beforeMCPExecution",
+  "beforeReadFile",
+] as const;
+
+export type CursorPreExecHookEvent = (typeof CURSOR_PRE_EXEC_HOOK_EVENTS)[number];
+
+/** Hooks `agentreel init` installs in ~/.cursor/hooks.json. */
 export const CURSOR_HOOK_EVENTS = [
   "sessionStart",
   "sessionEnd",
   "beforeSubmitPrompt",
+  "preToolUse",
+  "beforeShellExecution",
+  "beforeMCPExecution",
+  "beforeReadFile",
   "postToolUse",
   "postToolUseFailure",
   "afterShellExecution",
@@ -57,6 +71,7 @@ export interface CursorHookInput {
   result_json?: unknown;
   // files
   file_path?: string;
+  content?: string;
   edits?: Array<{ old_string?: string; new_string?: string }>;
   // prompt
   prompt?: string;
@@ -88,6 +103,12 @@ export interface NormalizedCursorEvent {
   sessionEnd: boolean;
 }
 
+export interface CursorPermissionDecision {
+  permission: "allow" | "deny";
+  user_message?: string;
+  agent_message?: string;
+}
+
 /** Strings above this are cut so one huge Read/command output can't bloat the queue. */
 export const MAX_FIELD_CHARS = 16_000;
 
@@ -97,6 +118,9 @@ const NAME_ALIASES: Record<string, string> = {
   beforesubmitprompt: "beforeSubmitPrompt",
   userpromptsubmit: "beforeSubmitPrompt",
   pretooluse: "preToolUse",
+  beforeshellexecution: "beforeShellExecution",
+  beforemcpexecution: "beforeMCPExecution",
+  beforereadfile: "beforeReadFile",
   posttooluse: "postToolUse",
   posttoolusefailure: "postToolUseFailure",
   aftershellexecution: "afterShellExecution",
@@ -106,10 +130,17 @@ const NAME_ALIASES: Record<string, string> = {
   stop: "stop",
 };
 
+const PRE_EXEC_SET = new Set<string>(CURSOR_PRE_EXEC_HOOK_EVENTS);
+
 /** Accept Cursor names, Claude-style names (third-party import) and any casing. */
 export function canonicalHookName(name: string | undefined): string | undefined {
   if (!name) return undefined;
   return NAME_ALIASES[name.toLowerCase()] ?? name;
+}
+
+export function isCursorPreExecHook(hook: string | undefined): boolean {
+  const canonical = canonicalHookName(hook);
+  return canonical !== undefined && PRE_EXEC_SET.has(canonical);
 }
 
 export function cursorSessionId(input: CursorHookInput): string {
@@ -212,6 +243,24 @@ export function normalizeCursorHook(
         tool_use_id: input.tool_use_id,
         tool_input: withFilePath(parseMaybeJson(input.tool_input)),
       });
+    case "beforeShellExecution":
+      return ev("tool_use_pre", {
+        tool_name: "Shell",
+        tool_input: { command: input.command ?? "", cwd },
+      });
+    case "beforeMCPExecution":
+      return ev("tool_use_pre", {
+        tool_name: `MCP:${input.tool_name ?? "unknown"}`,
+        mcp_server_name: input.mcp_server_name,
+        ...(input.mcp_server_url || input.url ? { mcp_server_url: input.mcp_server_url ?? input.url } : {}),
+        tool_input: parseMaybeJson(input.tool_input),
+      });
+    case "beforeReadFile":
+      return ev("tool_use_pre", {
+        tool_name: "Read",
+        // Path only: never copy file contents.
+        tool_input: { file_path: input.file_path },
+      });
     case "postToolUse":
       return ev("tool_use_post", {
         tool_name: input.tool_name,
@@ -259,18 +308,15 @@ export function normalizeCursorHook(
         },
       });
     case "subagentStop":
-      return ev(
-        "subagent_stop",
-        {
-          subagent_type: input.subagent_type,
-          status: input.status,
-          task: input.task,
-          description: input.description,
-          duration_ms: input.duration_ms,
-          tool_call_count: input.tool_call_count,
-          modified_files: input.modified_files,
-        },
-      );
+      return ev("subagent_stop", {
+        subagent_type: input.subagent_type,
+        status: input.status,
+        task: input.task,
+        description: input.description,
+        duration_ms: input.duration_ms,
+        tool_call_count: input.tool_call_count,
+        modified_files: input.modified_files,
+      });
     case "stop":
       return ev("stop", { status: input.status, loop_count: input.loop_count }, { turnEnd: true });
     default:
@@ -278,8 +324,23 @@ export function normalizeCursorHook(
   }
 }
 
-/** What to print on stdout. Observe-only: never a permission decision. */
-export function cursorHookResponse(hook: string | undefined): string {
-  if (canonicalHookName(hook) === "beforeSubmitPrompt") return JSON.stringify({ continue: true });
+/** What to print on stdout for Cursor hooks. */
+export function cursorHookResponse(
+  hook: string | undefined,
+  decision?: CursorPermissionDecision,
+): string {
+  const canonical = canonicalHookName(hook);
+  if (canonical === "beforeSubmitPrompt") return JSON.stringify({ continue: true });
+  if (isCursorPreExecHook(canonical)) {
+    if (!decision) {
+      return JSON.stringify({ permission: "allow" });
+    }
+    const body: Record<string, unknown> = { permission: decision.permission };
+    if (decision.user_message) body.user_message = decision.user_message;
+    if (decision.agent_message && canonical !== "beforeReadFile") {
+      body.agent_message = decision.agent_message;
+    }
+    return JSON.stringify(body);
+  }
   return "{}";
 }
