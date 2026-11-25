@@ -221,25 +221,6 @@ export async function requestRemoteApproval(
   const postRetries = params.postRetries ?? 1;
   const pollRetries = params.pollRetries ?? 2;
 
-  if (!params.config.apiKey) {
-    return offlineResult(
-      params.decisionId,
-      fallback,
-      "agent not linked (missing API key)",
-    );
-  }
-
-  if (
-    typeof params.config.apiBaseUrl !== "string" ||
-    !params.config.apiBaseUrl.trim()
-  ) {
-    return offlineResult(
-      params.decisionId,
-      fallback,
-      "missing API base URL",
-    );
-  }
-
   const startMs = nowFn();
   const approvalExpiryMs = startMs + expiresS * 1000;
   let effectiveDeadlineMs = approvalExpiryMs;
@@ -255,6 +236,33 @@ export async function requestRemoteApproval(
     hookDeadlineBinding
       ? "hook deadline reached waiting for approval"
       : "approval timed out";
+  const timeoutResult = (approvalId?: string): ApprovalResult => ({
+    permitted: false,
+    outcome: "timeout",
+    decisionId: params.decisionId,
+    ...(approvalId ? { approvalId } : {}),
+    reason: timeoutReason(),
+  });
+  const offlineOrTimeout = (
+    reason: string,
+    approvalId?: string,
+  ): ApprovalResult => {
+    if (nowFn() >= effectiveDeadlineMs) {
+      return timeoutResult(approvalId);
+    }
+    return offlineResult(params.decisionId, fallback, reason, approvalId);
+  };
+
+  if (!params.config.apiKey) {
+    return offlineOrTimeout("agent not linked (missing API key)");
+  }
+
+  if (
+    typeof params.config.apiBaseUrl !== "string" ||
+    !params.config.apiBaseUrl.trim()
+  ) {
+    return offlineOrTimeout("missing API base URL");
+  }
 
   const baseUrl = params.config.apiBaseUrl.trim().replace(/\/$/, "");
   const postUrl = `${baseUrl}/api/v1/approvals`;
@@ -277,12 +285,7 @@ export async function requestRemoteApproval(
   for (let attempt = 0; attempt <= postRetries; attempt++) {
     const remainingMs = effectiveDeadlineMs - nowFn();
     if (remainingMs <= 0) {
-      return {
-        permitted: false,
-        outcome: "timeout",
-        decisionId: params.decisionId,
-        reason: timeoutReason(),
-      };
+      return timeoutResult();
     }
 
     const cappedToDeadline = remainingMs <= APPROVAL_POST_TIMEOUT_MS;
@@ -299,20 +302,11 @@ export async function requestRemoteApproval(
     );
 
     if (result.abortedByTimeout && (cappedToDeadline || nowFn() >= effectiveDeadlineMs)) {
-      return {
-        permitted: false,
-        outcome: "timeout",
-        decisionId: params.decisionId,
-        reason: timeoutReason(),
-      };
+      return timeoutResult();
     }
 
     if (result.invalidJson) {
-      return offlineResult(
-        params.decisionId,
-        fallback,
-        "invalid JSON from approval server",
-      );
+      return offlineOrTimeout("invalid JSON from approval server");
     }
 
     if (result.networkError !== undefined || result.status >= 500) {
@@ -324,15 +318,11 @@ export async function requestRemoteApproval(
         await sleepFn(Math.min(retryDelayMs, effectiveDeadlineMs - nowFn()));
         continue;
       }
-      return offlineResult(params.decisionId, fallback, lastErrorReason);
+      return offlineOrTimeout(lastErrorReason);
     }
 
     if (!result.ok) {
-      return offlineResult(
-        params.decisionId,
-        fallback,
-        `approval server returned HTTP ${result.status}`,
-      );
+      return offlineOrTimeout(`approval server returned HTTP ${result.status}`);
     }
 
     postData = result.data ?? null;
@@ -340,11 +330,7 @@ export async function requestRemoteApproval(
   }
 
   if (!postData || typeof postData.approval_id !== "string" || !postData.approval_id) {
-    return offlineResult(
-      params.decisionId,
-      fallback,
-      "missing approval_id from approval server",
-    );
+    return offlineOrTimeout("missing approval_id from approval server");
   }
 
   const approvalId = postData.approval_id;
@@ -357,7 +343,7 @@ export async function requestRemoteApproval(
   );
   if (immediate) return immediate;
 
-    const serverExpiresMs = parseExpiresAtMs(postData.expires_at);
+  const serverExpiresMs = parseExpiresAtMs(postData.expires_at);
   if (serverExpiresMs !== null && serverExpiresMs < effectiveDeadlineMs) {
     effectiveDeadlineMs = serverExpiresMs;
     hookDeadlineBinding = false;
@@ -399,22 +385,11 @@ export async function requestRemoteApproval(
     );
 
     if (result.abortedByTimeout && (cappedToDeadline || nowFn() >= effectiveDeadlineMs)) {
-      return {
-        permitted: false,
-        outcome: "timeout",
-        decisionId: params.decisionId,
-        approvalId,
-        reason: timeoutReason(),
-      };
+      return timeoutResult(approvalId);
     }
 
     if (result.invalidJson) {
-      return offlineResult(
-        params.decisionId,
-        fallback,
-        "invalid JSON from approval poll",
-        approvalId,
-      );
+      return offlineOrTimeout("invalid JSON from approval poll", approvalId);
     }
 
     if (result.networkError !== undefined || result.status >= 500) {
@@ -430,16 +405,11 @@ export async function requestRemoteApproval(
         await sleepFn(Math.min(retryDelayMs, effectiveDeadlineMs - nowFn()));
         continue;
       }
-      return offlineResult(params.decisionId, fallback, reason, approvalId);
+      return offlineOrTimeout(reason, approvalId);
     }
 
     if (!result.ok) {
-      return offlineResult(
-        params.decisionId,
-        fallback,
-        `approval poll returned HTTP ${result.status}`,
-        approvalId,
-      );
+      return offlineOrTimeout(`approval poll returned HTTP ${result.status}`, approvalId);
     }
 
     consecutivePollErrors = 0;
@@ -455,9 +425,7 @@ export async function requestRemoteApproval(
     if (resolved) return resolved;
 
     if (pollData.status !== "pending") {
-      return offlineResult(
-        params.decisionId,
-        fallback,
+      return offlineOrTimeout(
         `unexpected approval status: ${String(pollData.status)}`,
         approvalId,
       );
@@ -469,11 +437,5 @@ export async function requestRemoteApproval(
     }
   }
 
-  return {
-    permitted: false,
-    outcome: "timeout",
-    decisionId: params.decisionId,
-    approvalId,
-    reason: timeoutReason(),
-  };
+  return timeoutResult(approvalId);
 }
