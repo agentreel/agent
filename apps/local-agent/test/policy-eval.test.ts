@@ -242,9 +242,12 @@ describe("RE2-safe regex compiler, cache, and timeout guard", () => {
       "a?\\s+foo\\s+bar",
       "(ba)?\\s+foo\\s+bar",
       "A\\w+\\s+\\w+",
+      "a\\w+\\s+\\w+",
+      "(?:a)\\w+\\s+\\w+",
       "\\x41\\w+\\s+\\w+",
       "a[a-z]+\\s+\\w+",
       "(DROP|TRUNCATE)\\w+\\s+\\w+",
+      "(:|DROP)\\w+\\s+\\w+",
       "curl[^|]*\\|\\s*(ba)?sh",
       "foo[\\x41-\\x5A]+@[\\x41-\\x5A]+",
       // Extra conservative boundary rejects

@@ -1512,6 +1512,48 @@
         "reason": "invalid_rule",
         "invalid_rule_ids": ["cust_casefold_overlap_regex"]
       }
+    },
+    {
+      "name": "literal-only alternation group where non-first branch last char overlaps first unbounded atom is rejected by validatePolicy and fails closed in eval",
+      "expected_valid": false,
+      "expected_rejected_rule_id": "cust_alt_branch_overlap_regex",
+      "expected_rejected_condition_index": 0,
+      "policy": {
+        "version": 1,
+        "etag": "etag-41",
+        "workspace_id": "ws_test",
+        "updated_at": "2026-11-25T00:00:00Z",
+        "mode": "enforce",
+        "offline": "last_known",
+        "builtin": {},
+        "custom": [
+          {
+            "id": "cust_alt_branch_overlap_regex",
+            "name": "Non-first branch overlapping leading literal regex",
+            "enabled": true,
+            "version": 1,
+            "message": "Every branch of a leading literal-only group must end disjoint from the first unbounded atom",
+            "when": [
+              { "field": "command", "op": "regex", "value": "(:|DROP)\\w+\\s+\\w+" }
+            ],
+            "action": "block",
+            "severity": "high",
+            "scope": {}
+          }
+        ],
+        "allow": { "commands": [], "paths": [], "repos": [] }
+      },
+      "input": {
+        "tool": "claude-code",
+        "toolName": "Bash",
+        "command": "echo hi"
+      },
+      "expected": {
+        "action": "block",
+        "rule_ids": [],
+        "reason": "invalid_rule",
+        "invalid_rule_ids": ["cust_alt_branch_overlap_regex"]
+      }
     }
   ]
 }
