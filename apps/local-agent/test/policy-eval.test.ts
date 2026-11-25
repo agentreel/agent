@@ -303,7 +303,7 @@ describe("evaluation deadline and latency budget", () => {
     const elapsed = performance.now() - t0;
     expect(res.action).toBe("allow");
     expect(res.timed_out).toBe(true);
-    expect(elapsed).toBeLessThan(200);
+    expect(elapsed).toBeLessThanOrEqual(POLICY_EVAL_DEADLINE_MS + 15);
   });
 });
 

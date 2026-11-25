@@ -20,6 +20,8 @@ const cursorNorm = await import("../src/cursor/hook-normalize.js");
 const cursorInstall = await import("../src/cursor/hooks-install.js");
 const queue = await import("../src/upload/queue.js");
 const doctor = await import("../src/commands/doctor.js");
+const initMod = await import("../src/commands/init.js");
+const configMod = await import("../src/config.js");
 
 const cursorFixtureRaw = readFileSync(
   new URL("./fixtures/cursor-hooks/session.jsonl", import.meta.url),
@@ -64,11 +66,17 @@ function makeEnforcePolicy(overrides: Partial<Policy> = {}): Policy {
   };
 }
 
-function makeConfig(apiBaseUrl = "http://127.0.0.1:1", apiKey?: string): AgentConfig {
+function makeConfig(
+  apiBaseUrl = "http://127.0.0.1:1",
+  apiKey?: string,
+  overrides: Partial<AgentConfig> = {},
+): AgentConfig {
   return {
     apiBaseUrl,
     apiKey,
+    installedHookTimeouts: { claude: 130, cursor: 130 },
     schemaVersion: 1,
+    ...overrides,
   };
 }
 
@@ -1413,5 +1421,648 @@ describe("hook timeout installation and agentreel doctor", () => {
       },
     );
     expect(res.decision?.rule_ids ?? []).not.toContain("FS001");
+  });
+});
+
+describe("hook deadline enforcement, timeout pre-check, init recording, and doctor warnings", () => {
+  let workDir: string;
+  let cachePath: string;
+  let guardConfigPath: string;
+
+  beforeEach(() => {
+    workDir = mkdtempSync(join(testHome, "deadline-"));
+    cachePath = join(workDir, "policy.json");
+    guardConfigPath = join(workDir, "guard-config.json");
+  });
+
+  afterEach(() => {
+    vi.useRealTimers();
+    rmSync(workDir, { recursive: true, force: true });
+  });
+
+  function makeAbortablePendingFetch(opts: {
+    postDelayMs?: number;
+    postStallForever?: boolean;
+    pollBehavior: (
+      url: string,
+      pollIdx: number,
+      signal: AbortSignal | null | undefined,
+    ) => Promise<Response>;
+  }) {
+    const postTimeouts: number[] = [];
+    const pollUrls: string[] = [];
+    let pollIdx = 0;
+
+    const fetchImpl: typeof fetch = (input, init) => {
+      const url = typeof input === "string" ? input : input.toString();
+      const method = (init?.method ?? "GET").toUpperCase();
+      const signal = init?.signal;
+
+      if (method === "POST") {
+        const startedAt = Date.now();
+        return new Promise<Response>((resolve, reject) => {
+          const onAbort = () => {
+            postTimeouts.push(Date.now() - startedAt);
+            reject(Object.assign(new Error("aborted"), { name: "AbortError" }));
+          };
+          if (signal?.aborted) {
+            onAbort();
+            return;
+          }
+          signal?.addEventListener("abort", onAbort, { once: true });
+
+          if (opts.postStallForever) {
+            return;
+          }
+          const delay = opts.postDelayMs ?? 0;
+          setTimeout(() => {
+            signal?.removeEventListener("abort", onAbort);
+            resolve(
+              new Response(
+                JSON.stringify({
+                  approval_id: "apr_fake_timer",
+                  status: "pending",
+                  poll_after_ms: 0,
+                }),
+                { status: 200, headers: { "content-type": "application/json" } },
+              ),
+            );
+          }, delay);
+        });
+      }
+
+      pollUrls.push(url);
+      pollIdx++;
+      return opts.pollBehavior(url, pollIdx, signal);
+    };
+
+    return { fetchImpl, postTimeouts, pollUrls };
+  }
+
+  it("denies when the hook deadline hits mid-poll using fake timers against a server that stays pending", async () => {
+    // Pre-load dynamic import before enabling fake timers so module resolution
+    // does not depend on prior tests having loaded approval.ts.
+    await import("../src/policy/approval.js");
+    vi.useFakeTimers();
+    const baseTime = 1_764_100_000_000;
+    vi.setSystemTime(baseTime);
+
+    // Policy has expires_s: 35 and offline_fallback: "allow" to prove deadline hit NEVER allows.
+    const policy = makeEnforcePolicy({
+      etag: "etag-mid-poll-deadline",
+      builtin: {
+        GIT001: {
+          enabled: true,
+          action: "require_approval",
+          approval: { expires_s: 35, offline_fallback: "allow" },
+        },
+      },
+    });
+    cache.writeCachedPolicyAtomic(
+      { policy, etag: policy.etag, fetched_at: baseTime },
+      cachePath,
+    );
+
+    // Installed timeout 40s -> usable budget 35s; hook already ran 5s before approval started
+    // so hookDeadlineMs is baseTime + 30_000 (hits mid-poll during poll 2).
+    const mock = makeAbortablePendingFetch({
+      postDelayMs: 0,
+      pollBehavior: (_url, idx, signal) =>
+        new Promise<Response>((resolve, reject) => {
+          const onAbort = () => {
+            reject(Object.assign(new Error("aborted"), { name: "AbortError" }));
+          };
+          if (signal?.aborted) {
+            onAbort();
+            return;
+          }
+          signal?.addEventListener("abort", onAbort, { once: true });
+          if (idx === 1) {
+            // First poll returns pending after 25s
+            setTimeout(() => {
+              signal?.removeEventListener("abort", onAbort);
+              resolve(
+                new Response(JSON.stringify({ status: "pending" }), {
+                  status: 200,
+                  headers: { "content-type": "application/json" },
+                }),
+              );
+            }, 25_000);
+          }
+          // Second poll stays pending forever until deadline aborts it
+        }),
+    });
+
+    const outcomePromise = enforce.enforcePreExec(
+      {
+        sessionId: "sess-mid-poll-deadline",
+        tool: "cursor",
+        toolName: "Shell",
+        command: "git push --force origin main",
+      },
+      {
+        cachePath,
+        guardConfigPath,
+        config: makeConfig("https://api.agentreel.dev", "ar_live_key", {
+          installedHookTimeouts: { claude: 40, cursor: 40 },
+        }),
+        hookDeadlineMs: baseTime + 30_000,
+        fetchImpl: mock.fetchImpl,
+        onWaiting: () => {},
+        recordDecision: () => {},
+        minPollDelayMs: 0,
+      },
+    );
+
+    await vi.advanceTimersByTimeAsync(25_000);
+    await vi.advanceTimersByTimeAsync(5_000);
+
+    const outcome = await outcomePromise;
+    expect(outcome.permitted).toBe(false);
+    expect(outcome.enforced).toBe(true);
+    expect(outcome.downgraded).toBe(false);
+    expect(outcome.decision?.approval_status).toBe("timeout");
+    expect(mock.pollUrls).toHaveLength(2);
+    expect(mock.pollUrls[0]).toContain("?wait=25s");
+    expect(mock.pollUrls[1]).toContain("?wait=5s");
+  });
+
+  it("clamps POST timeout and ?wait= values to the remaining hook deadline", async () => {
+    await import("../src/policy/approval.js");
+    vi.useFakeTimers();
+    const baseTime = 1_764_200_000_000;
+    vi.setSystemTime(baseTime);
+
+    const policy = makeEnforcePolicy({
+      etag: "etag-clamp",
+      builtin: {
+        GIT001: {
+          enabled: true,
+          action: "require_approval",
+          approval: { expires_s: 60, offline_fallback: "allow" },
+        },
+      },
+    });
+    cache.writeCachedPolicyAtomic(
+      { policy, etag: policy.etag, fetched_at: baseTime },
+      cachePath,
+    );
+
+    // 1. POST timeout clamped below default 10_000ms to remaining 3_500ms
+    const postClampMock = makeAbortablePendingFetch({
+      postStallForever: true,
+      pollBehavior: async () => new Response(JSON.stringify({ status: "pending" }), { status: 200 }),
+    });
+
+    const postPromise = enforce.enforcePreExec(
+      {
+        sessionId: "sess-post-clamp",
+        tool: "claude-code",
+        toolName: "Bash",
+        command: "git push --force origin main",
+      },
+      {
+        cachePath,
+        guardConfigPath,
+        config: makeConfig("https://api.agentreel.dev", "ar_live_key", {
+          installedHookTimeouts: { claude: 70, cursor: 70 },
+        }),
+        hookDeadlineMs: baseTime + 3_500,
+        fetchImpl: postClampMock.fetchImpl,
+        onWaiting: () => {},
+        recordDecision: () => {},
+      },
+    );
+
+    await vi.advanceTimersByTimeAsync(3_500);
+    const postOutcome = await postPromise;
+    expect(postOutcome.permitted).toBe(false);
+    expect(postOutcome.enforced).toBe(true);
+    expect(postOutcome.decision?.approval_status).toBe("timeout");
+    expect(postClampMock.postTimeouts).toEqual([3_500]);
+
+    // 2. ?wait= clamped via floor so it never extends past remaining deadline
+    const pollStart = Date.now();
+    const waitClampMock = makeAbortablePendingFetch({
+      postDelayMs: 200,
+      pollBehavior: (_url, idx, signal) =>
+        new Promise<Response>((resolve, reject) => {
+          const onAbort = () => {
+            reject(Object.assign(new Error("aborted"), { name: "AbortError" }));
+          };
+          signal?.addEventListener("abort", onAbort, { once: true });
+          if (idx === 1) {
+            // Remaining at poll 1 = 12_200ms -> ?wait=12s; returns pending after 8_000ms
+            setTimeout(() => {
+              signal?.removeEventListener("abort", onAbort);
+              resolve(
+                new Response(JSON.stringify({ status: "pending" }), {
+                  status: 200,
+                  headers: { "content-type": "application/json" },
+                }),
+              );
+            }, 8_000);
+          }
+          // Poll 2 has remaining = 4_200ms -> ?wait=4s (never 5s or 25s); stalls until aborted
+        }),
+    });
+
+    const pollPromise = enforce.enforcePreExec(
+      {
+        sessionId: "sess-wait-clamp",
+        tool: "cursor",
+        toolName: "Shell",
+        command: "git push --force origin main",
+      },
+      {
+        cachePath,
+        guardConfigPath,
+        config: makeConfig("https://api.agentreel.dev", "ar_live_key", {
+          installedHookTimeouts: { claude: 70, cursor: 70 },
+        }),
+        hookDeadlineMs: pollStart + 12_400,
+        fetchImpl: waitClampMock.fetchImpl,
+        onWaiting: () => {},
+        recordDecision: () => {},
+        minPollDelayMs: 0,
+      },
+    );
+
+    await vi.advanceTimersByTimeAsync(200);
+    await vi.advanceTimersByTimeAsync(8_000);
+    await vi.advanceTimersByTimeAsync(4_200);
+
+    const pollOutcome = await pollPromise;
+    expect(pollOutcome.permitted).toBe(false);
+    expect(pollOutcome.enforced).toBe(true);
+    expect(pollOutcome.decision?.approval_status).toBe("timeout");
+    expect(waitClampMock.pollUrls).toHaveLength(2);
+    expect(waitClampMock.pollUrls[0]).toMatch(/\?wait=12s$/);
+    expect(waitClampMock.pollUrls[1]).toMatch(/\?wait=4s$/);
+  });
+
+  it("denies immediately with init message and makes no POST when expires_s exceeds installed timeout minus 5s (Claude and Cursor, even with offline_fallback allow)", async () => {
+    const policy = makeEnforcePolicy({
+      etag: "etag-too-short",
+      builtin: {
+        GIT001: {
+          enabled: true,
+          action: "require_approval",
+          approval: { expires_s: 180, offline_fallback: "allow" },
+        },
+        SECRET004: {
+          enabled: true,
+          action: "require_approval",
+          approval: { expires_s: 180, offline_fallback: "allow" },
+        },
+      },
+    });
+    cache.writeCachedPolicyAtomic(
+      { policy, etag: policy.etag, fetched_at: Date.now() },
+      cachePath,
+    );
+
+    const fetchSpy = vi.fn();
+    const waitingSpy = vi.fn();
+    const cfg = makeConfig("https://api.agentreel.dev", "ar_live_key", {
+      installedHookTimeouts: { claude: 130, cursor: 130 },
+    });
+
+    // Claude PreToolUse
+    const claudeRes = await claudeHandler.handleClaudeHookInput(
+      "PreToolUse",
+      {
+        session_id: "sess-claude-short",
+        cwd: "/tmp/repo",
+        hook_event_name: "PreToolUse",
+        tool_name: "Bash",
+        tool_input: { command: "git push --force origin main" },
+      },
+      {
+        cachePath,
+        guardConfigPath,
+        config: cfg,
+        fetchImpl: fetchSpy as unknown as typeof fetch,
+        onWaiting: waitingSpy,
+      },
+    );
+
+    const expectedGitMsg =
+      "Admin approval for Force push to main branch needs a longer hook timeout than is installed. Run `npx @agentreel/agent init` to update hook timeouts.";
+    expect(fetchSpy).not.toHaveBeenCalled();
+    expect(waitingSpy).not.toHaveBeenCalled();
+    expect(claudeRes.outcome?.permitted).toBe(false);
+    expect(claudeRes.outcome?.enforced).toBe(true);
+    expect(claudeRes.outcome?.downgraded).toBe(false);
+    expect(claudeRes.outcome?.reason).toBe(enforce.HOOK_TIMEOUT_TOO_SHORT_REASON);
+    expect(claudeRes.outcome?.decision?.reason).toBe(enforce.HOOK_TIMEOUT_TOO_SHORT_REASON);
+    expect(JSON.parse(claudeRes.stdout!)).toEqual({
+      hookSpecificOutput: {
+        hookEventName: "PreToolUse",
+        permissionDecision: "deny",
+        permissionDecisionReason: expectedGitMsg,
+      },
+    });
+
+    // Cursor beforeShellExecution (supports user_message + agent_message)
+    const cursorShellRes = await cursorRunner.handleCursorHookInput(
+      "beforeShellExecution",
+      {
+        ...cursorBaseInput,
+        conversation_id: "conv-cursor-short-shell",
+        hook_event_name: "beforeShellExecution",
+        command: "git push --force origin main",
+        cwd: "/tmp/repo",
+      },
+      {
+        cachePath,
+        guardConfigPath,
+        config: cfg,
+        fetchImpl: fetchSpy as unknown as typeof fetch,
+        onWaiting: waitingSpy,
+      },
+    );
+    expect(fetchSpy).not.toHaveBeenCalled();
+    expect(cursorShellRes.outcome?.permitted).toBe(false);
+    expect(cursorShellRes.outcome?.enforced).toBe(true);
+    expect(cursorShellRes.outcome?.decision?.reason).toBe(enforce.HOOK_TIMEOUT_TOO_SHORT_REASON);
+    expect(JSON.parse(cursorShellRes.response)).toEqual({
+      permission: "deny",
+      user_message: expectedGitMsg,
+      agent_message: expectedGitMsg,
+    });
+
+    // Cursor beforeReadFile (user_message only per Cursor hook schema)
+    const cursorReadRes = await cursorRunner.handleCursorHookInput(
+      "beforeReadFile",
+      {
+        ...cursorBaseInput,
+        conversation_id: "conv-cursor-short-read",
+        hook_event_name: "beforeReadFile",
+        file_path: "/tmp/repo/.env",
+      },
+      {
+        cachePath,
+        guardConfigPath,
+        config: cfg,
+        fetchImpl: fetchSpy as unknown as typeof fetch,
+        onWaiting: waitingSpy,
+      },
+    );
+    const expectedReadMsg =
+      "Admin approval for Secret or credential file read needs a longer hook timeout than is installed. Run `npx @agentreel/agent init` to update hook timeouts.";
+    expect(fetchSpy).not.toHaveBeenCalled();
+    expect(JSON.parse(cursorReadRes.response)).toEqual({
+      permission: "deny",
+      user_message: expectedReadMsg,
+    });
+
+    // Verify policy_decision persisted in SQLite with distinct reason
+    const storedRows = db
+      .getDb()
+      .prepare(`SELECT payload FROM events WHERE session_id = ? AND type = 'policy_decision'`)
+      .all("sess-claude-short") as Array<{ payload: string }>;
+    expect(storedRows).toHaveLength(1);
+    const storedPayload = JSON.parse(storedRows[0]!.payload);
+    expect(storedPayload.enforced).toBe(true);
+    expect(storedPayload.reason).toBe("hook_timeout_too_short");
+  });
+
+  it("treats a missing recorded timeout as 5s so any approval rule denies with the init message", async () => {
+    const policy = makeEnforcePolicy({
+      etag: "etag-missing-recorded",
+      builtin: {
+        GIT001: {
+          enabled: true,
+          action: "require_approval",
+          approval: { expires_s: 10, offline_fallback: "allow" },
+        },
+      },
+    });
+    cache.writeCachedPolicyAtomic(
+      { policy, etag: policy.etag, fetched_at: Date.now() },
+      cachePath,
+    );
+
+    const fetchSpy = vi.fn();
+    // Omit installedHookTimeouts (simulating hooks installed by an older agent)
+    const legacyCfg: AgentConfig = {
+      apiBaseUrl: "https://api.agentreel.dev",
+      apiKey: "ar_live_key",
+      schemaVersion: 1,
+    };
+
+    expect(configMod.getRecordedPreExecTimeoutS(legacyCfg, "claude")).toBeNull();
+    expect(configMod.getInstalledPreExecTimeoutS(legacyCfg, "claude")).toBe(5);
+    expect(configMod.getInstalledPreExecTimeoutS(legacyCfg, "cursor")).toBe(5);
+
+    const expectedMsg =
+      "Admin approval for Force push to main branch needs a longer hook timeout than is installed. Run `npx @agentreel/agent init` to update hook timeouts.";
+
+    const claudeRes = await claudeHandler.handleClaudeHookInput(
+      "PreToolUse",
+      {
+        session_id: "sess-legacy-claude",
+        cwd: "/tmp/repo",
+        hook_event_name: "PreToolUse",
+        tool_name: "Bash",
+        tool_input: { command: "git push --force origin main" },
+      },
+      {
+        cachePath,
+        guardConfigPath,
+        config: legacyCfg,
+        fetchImpl: fetchSpy as unknown as typeof fetch,
+      },
+    );
+    expect(fetchSpy).not.toHaveBeenCalled();
+    expect(claudeRes.outcome?.permitted).toBe(false);
+    expect(claudeRes.outcome?.reason).toBe(enforce.HOOK_TIMEOUT_TOO_SHORT_REASON);
+    expect(JSON.parse(claudeRes.stdout!).hookSpecificOutput.permissionDecisionReason).toBe(
+      expectedMsg,
+    );
+
+    const cursorRes = await cursorRunner.handleCursorHookInput(
+      "beforeShellExecution",
+      {
+        ...cursorBaseInput,
+        conversation_id: "conv-legacy-cursor",
+        hook_event_name: "beforeShellExecution",
+        command: "git push --force origin main",
+        cwd: "/tmp/repo",
+      },
+      {
+        cachePath,
+        guardConfigPath,
+        config: legacyCfg,
+        fetchImpl: fetchSpy as unknown as typeof fetch,
+      },
+    );
+    expect(fetchSpy).not.toHaveBeenCalled();
+    expect(cursorRes.outcome?.permitted).toBe(false);
+    expect(cursorRes.outcome?.reason).toBe(enforce.HOOK_TIMEOUT_TOO_SHORT_REASON);
+    expect(JSON.parse(cursorRes.response)).toEqual({
+      permission: "deny",
+      user_message: expectedMsg,
+      agent_message: expectedMsg,
+    });
+  });
+
+  it("initCommand records installedHookTimeouts per host and stays idempotent", async () => {
+    const claudePath = join(workDir, "init-claude.json");
+    const cursorPath = join(workDir, "init-cursor.json");
+
+    // Policy with expires_s: 180 -> expected pre-exec timeout = 190s
+    const policy = makeEnforcePolicy({
+      etag: "etag-init-timeout",
+      builtin: {
+        GIT001: {
+          enabled: true,
+          action: "require_approval",
+          approval: { expires_s: 180 },
+        },
+      },
+    });
+    cache.writeCachedPolicyAtomic(
+      { policy, etag: policy.etag, fetched_at: Date.now() },
+      cachePath,
+    );
+
+    const logSpy = vi.spyOn(console, "log").mockImplementation(() => {});
+    try {
+      await initMod.initCommand({
+        claudeSettingsPath: claudePath,
+        cursorHooksPath: cursorPath,
+        cachePath,
+        guardConfigPath,
+      });
+      const firstCfg = configMod.readConfig();
+      expect(firstCfg.installedHookTimeouts).toEqual({ claude: 190, cursor: 190 });
+      const firstInstalledAt = firstCfg.installedAt;
+
+      // Second run is idempotent: preserves installedAt and does not duplicate hooks
+      await initMod.initCommand({
+        claudeSettingsPath: claudePath,
+        cursorHooksPath: cursorPath,
+        cachePath,
+        guardConfigPath,
+      });
+      const secondCfg = configMod.readConfig();
+      expect(secondCfg.installedHookTimeouts).toEqual({ claude: 190, cursor: 190 });
+      expect(secondCfg.installedAt).toBe(firstInstalledAt);
+
+      const claudeJson = JSON.parse(readFileSync(claudePath, "utf8"));
+      expect(claudeJson.hooks.PreToolUse).toHaveLength(1);
+      expect(claudeJson.hooks.PreToolUse[0].hooks[0].timeout).toBe(190);
+      expect(claudeJson.hooks.PostToolUse[0].hooks[0].timeout).toBe(5);
+
+      const cursorJson = JSON.parse(readFileSync(cursorPath, "utf8"));
+      expect(cursorJson.hooks.beforeShellExecution).toHaveLength(1);
+      expect(cursorJson.hooks.beforeShellExecution[0].timeout).toBe(190);
+      expect(cursorJson.hooks.beforeSubmitPrompt[0].timeout).toBe(5);
+
+      // Partial re-init (--no-cursor) updates claude while preserving cursor's recorded timeout
+      const shorterPolicy = makeEnforcePolicy({ etag: "etag-init-default" });
+      cache.writeCachedPolicyAtomic(
+        { policy: shorterPolicy, etag: shorterPolicy.etag, fetched_at: Date.now() },
+        cachePath,
+      );
+      await initMod.initCommand({
+        claude: true,
+        cursor: false,
+        claudeSettingsPath: claudePath,
+        cursorHooksPath: cursorPath,
+        cachePath,
+        guardConfigPath,
+      });
+      const partialCfg = configMod.readConfig();
+      expect(partialCfg.installedHookTimeouts).toEqual({ claude: 130, cursor: 190 });
+    } finally {
+      logSpy.mockRestore();
+    }
+  });
+
+  it("doctor reports recorded installed timeout per host and warns when policy max expires_s needs a re-init", () => {
+    const claudePath = join(workDir, "doc2-claude.json");
+    const cursorPath = join(workDir, "doc2-cursor.json");
+    const now = 1_764_300_000_000;
+
+    const policy = makeEnforcePolicy({
+      etag: "etag-doctor-warn",
+      builtin: {
+        GIT001: {
+          enabled: true,
+          action: "require_approval",
+          approval: { expires_s: 180 },
+        },
+      },
+    });
+    cache.writeCachedPolicyAtomic(
+      { policy, etag: policy.etag, fetched_at: now - 60_000 },
+      cachePath,
+    );
+    claudeInstall.installClaudeCodeHooks("/usr/local/bin/agentreel", {
+      settingsPath: claudePath,
+      preExecTimeoutS: 130,
+    });
+    cursorInstall.installCursorHooks("/usr/local/bin/agentreel", cursorPath, {
+      preExecTimeoutS: 130,
+    });
+
+    // 1. Recorded 130s < 180 + 5 -> warns for both hosts
+    const warnReport = doctor.inspectDoctorState({
+      cachePath,
+      guardConfigPath,
+      claudeSettingsPath: claudePath,
+      cursorHooksPath: cursorPath,
+      config: makeConfig("https://api.agentreel.dev", "ar_live_key", {
+        installedHookTimeouts: { claude: 130, cursor: 130 },
+      }),
+      now,
+    });
+    expect(warnReport.maxPolicyApprovalExpiresS).toBe(180);
+    expect(warnReport.needsReinit).toBe(true);
+    expect(warnReport.claude.recordedTimeoutS).toBe(130);
+    expect(warnReport.claude.needsReinitForApproval).toBe(true);
+    expect(warnReport.cursor.recordedTimeoutS).toBe(130);
+    expect(warnReport.cursor.needsReinitForApproval).toBe(true);
+
+    const warnOutput = doctor.formatDoctorReport(warnReport);
+    expect(warnOutput).toContain("claude 130s, cursor 130s");
+    expect(warnOutput).toContain("warning:");
+    expect(warnOutput).toContain("180s");
+    expect(warnOutput).toContain("npx @agentreel/agent init");
+
+    // 2. Missing recorded timeouts -> shows unset (assumed 5s) and warns
+    const missingReport = doctor.inspectDoctorState({
+      cachePath,
+      guardConfigPath,
+      claudeSettingsPath: claudePath,
+      cursorHooksPath: cursorPath,
+      config: { apiBaseUrl: "https://api.agentreel.dev", schemaVersion: 1 },
+      now,
+    });
+    expect(missingReport.needsReinit).toBe(true);
+    expect(missingReport.claude.recordedTimeoutS).toBeNull();
+    expect(missingReport.claude.effectiveInstalledTimeoutS).toBe(5);
+    expect(doctor.formatDoctorReport(missingReport)).toContain(
+      "claude unset (assumed 5s), cursor unset (assumed 5s)",
+    );
+
+    // 3. Updated recorded timeouts (190s) -> no re-init warning
+    const okReport = doctor.inspectDoctorState({
+      cachePath,
+      guardConfigPath,
+      claudeSettingsPath: claudePath,
+      cursorHooksPath: cursorPath,
+      config: makeConfig("https://api.agentreel.dev", "ar_live_key", {
+        installedHookTimeouts: { claude: 190, cursor: 190 },
+      }),
+      now,
+    });
+    expect(okReport.needsReinit).toBe(false);
+    expect(okReport.claude.needsReinitForApproval).toBe(false);
+    expect(okReport.cursor.needsReinitForApproval).toBe(false);
+    expect(doctor.formatDoctorReport(okReport)).not.toContain("warning:");
   });
 });
