@@ -529,6 +529,10 @@ describe("initCommand policy fetch behaviour", () => {
     const prevHome = process.env.HOME;
     process.env.HOME = initHome;
     const fetchSpy = vi.spyOn(globalThis, "fetch");
+    const fetchPolicyMock = vi.fn(async () => ({ status: "unlinked" as const }));
+    vi.doMock("../src/policy/fetch.js", () => ({
+      fetchPolicy: fetchPolicyMock,
+    }));
     const logSpy = vi.spyOn(console, "log").mockImplementation(() => {});
 
     try {
@@ -536,8 +540,10 @@ describe("initCommand policy fetch behaviour", () => {
       const { closeDb } = await import("../src/db.js");
       await initCommand({ claude: false, cursor: false });
       closeDb();
+      expect(fetchPolicyMock).not.toHaveBeenCalled();
       expect(fetchSpy).not.toHaveBeenCalled();
     } finally {
+      vi.doUnmock("../src/policy/fetch.js");
       logSpy.mockRestore();
       process.env.HOME = prevHome;
     }
