@@ -1,16 +1,24 @@
 import { nanoid } from "nanoid";
 import { appendFileSync } from "node:fs";
 import type { AgentEvent, ClaudeCodeHookInput, EventType } from "@agentreel/shared-types";
-import { insertEvent, upsertSession } from "../db.js";
-import { LOG_PATH, ensureAgentreelDir } from "../paths.js";
-import { scrubAny } from "../redact/scrubber.js";
-import { recomputeSessionCost } from "../cost/transcript.js";
-import { isCapturePaused } from "../config.js";
-import { applyIgnoreRules } from "./ignore-payload.js";
-import { readStdin } from "../util/stdin.js";
+import type { Attribution } from "../attribution.js";
 import { claudeVersionFromTranscript } from "../attribution.js";
-import { ensureSessionAttribution, recordSessionEndGit } from "../session-attribution.js";
+import { isCapturePaused } from "../config.js";
+import { recomputeSessionCost } from "../cost/transcript.js";
 import { isCursorPayload, nativeCursorHooksInstalled, recordCursorHook } from "../cursor/hook-runner.js";
+import { getSessionAttribution, insertEvent, upsertSession } from "../db.js";
+import { LOG_PATH, ensureAgentreelDir } from "../paths.js";
+import {
+  enforcePreExec,
+  repoSlugFromRemoteUrl,
+  type PreExecDeps,
+  type PreExecOutcome,
+  type PreExecRequest,
+} from "../policy/enforce.js";
+import { scrubAny } from "../redact/scrubber.js";
+import { ensureSessionAttribution, recordSessionEndGit } from "../session-attribution.js";
+import { readStdin } from "../util/stdin.js";
+import { applyIgnoreRules } from "./ignore-payload.js";
 
 const HOOK_EVENT_TO_TYPE: Record<string, EventType> = {
   SessionStart: "session_start",
@@ -32,18 +40,158 @@ function logError(err: unknown): void {
     }\n`;
     appendFileSync(LOG_PATH, line);
   } catch {
-    // swallow — never block Claude Code
+    // swallow: never block Claude Code
   }
 }
 
-export async function runHook(eventArg?: string): Promise<void> {
-  // Hooks must never block or fail Claude Code. Wrap everything.
+export function formatClaudePreToolUseDeny(reason: string): string {
+  return JSON.stringify({
+    hookSpecificOutput: {
+      hookEventName: "PreToolUse",
+      permissionDecision: "deny",
+      permissionDecisionReason: reason,
+    },
+  });
+}
+
+export function extractClaudePreExecRequest(
+  input: ClaudeCodeHookInput,
+  sessionId: string,
+  ts: number,
+  attribution?: Attribution | null,
+): PreExecRequest {
+  const toolName = input.tool_name ?? "unknown";
+  const ti =
+    input.tool_input && typeof input.tool_input === "object" && !Array.isArray(input.tool_input)
+      ? (input.tool_input as Record<string, unknown>)
+      : undefined;
+
+  const command = typeof ti?.command === "string" ? ti.command : undefined;
+  const filePath = [ti?.file_path, ti?.path, ti?.notebook_path, ti?.target_file, ti?.filePath, ti?.file].find(
+    (v): v is string => typeof v === "string" && v.length > 0,
+  );
+  const url = typeof ti?.url === "string" ? ti.url : undefined;
+  let mcpTool: string | undefined;
+  if (toolName.startsWith("mcp__")) {
+    mcpTool = toolName.slice(5);
+  } else if (toolName.startsWith("MCP:")) {
+    mcpTool = toolName.slice(4);
+  }
+
+  return {
+    sessionId,
+    tool: "claude-code",
+    toolName,
+    toolUseId: input.tool_use_id,
+    cwd: input.cwd,
+    command,
+    file_path: filePath,
+    url,
+    mcp_tool: mcpTool,
+    toolInput: input.tool_input,
+    repo: repoSlugFromRemoteUrl(attribution?.git?.remote_url),
+    branch: attribution?.git?.branch_end ?? attribution?.git?.branch_start,
+    member: attribution?.git?.user_email ?? attribution?.os_user,
+    ts,
+  };
+}
+
+export interface HandleClaudeHookResult {
+  stdout: string | null;
+  outcome?: PreExecOutcome;
+}
+
+export async function handleClaudeHookInput(
+  eventArg: string | undefined,
+  input: ClaudeCodeHookInput,
+  deps: PreExecDeps = {},
+): Promise<HandleClaudeHookResult> {
+  const hookEventName = input.hook_event_name ?? eventArg ?? "Unknown";
+  const type: EventType = HOOK_EVENT_TO_TYPE[hookEventName] ?? "unknown";
+  const ts = deps.now ? deps.now() : Date.now();
+  const sessionId = input.session_id ?? "unknown-session";
+
+  if (type === "session_start") {
+    upsertSession({
+      id: sessionId,
+      tool: "claude-code",
+      startedAt: ts,
+      cwd: input.cwd,
+    });
+  } else if (type === "session_end") {
+    upsertSession({
+      id: sessionId,
+      tool: "claude-code",
+      startedAt: ts,
+      endedAt: ts,
+      cwd: input.cwd,
+    });
+  } else {
+    upsertSession({
+      id: sessionId,
+      tool: "claude-code",
+      startedAt: ts,
+      cwd: input.cwd,
+    });
+  }
+
   try {
-    // Honor explicit opt-outs before reading the payload — env var for
-    // single-shell suppression, persisted pause for "stop capturing
-    // until I resume." Either way: silently consume stdin (Claude Code
-    // streams hook input via pipe; not draining it could leave handles
-    // dangling) and return cleanly.
+    ensureSessionAttribution(sessionId, {
+      cwd: input.cwd,
+      tool: "claude-code",
+      toolVersion: () => claudeVersionFromTranscript(input.transcript_path),
+    });
+    if (type === "stop" || type === "session_end") recordSessionEndGit(sessionId, input.cwd);
+  } catch (err) {
+    logError(err);
+  }
+
+  const safePayload = scrubAny(applyIgnoreRules(input as never) as typeof input);
+  const event: AgentEvent = {
+    id: nanoid(),
+    sessionId,
+    tool: "claude-code",
+    type,
+    ts,
+    cwd: input.cwd,
+    payload: safePayload,
+  };
+  insertEvent(event);
+
+  let stdout: string | null = null;
+  let outcome: PreExecOutcome | undefined;
+
+  if (type === "tool_use_pre") {
+    try {
+      let attribution: Attribution | null = null;
+      try {
+        attribution = getSessionAttribution<Attribution>(sessionId);
+      } catch {
+        attribution = null;
+      }
+      const req = extractClaudePreExecRequest(input, sessionId, ts, attribution);
+      outcome = await enforcePreExec(req, deps);
+      if (!outcome.permitted && outcome.message) {
+        stdout = formatClaudePreToolUseDeny(outcome.message);
+      }
+    } catch (err) {
+      logError(err);
+      stdout = null;
+    }
+  }
+
+  try {
+    recomputeSessionCost(sessionId, input.transcript_path);
+  } catch (err) {
+    logError(err);
+  }
+
+  return { stdout, outcome };
+}
+
+export async function runHook(eventArg?: string): Promise<void> {
+  // Hooks must never block or fail Claude Code on internal errors. Wrap everything.
+  try {
     if (isCapturePaused()) {
       await readStdin().catch(() => "");
       return;
@@ -62,71 +210,9 @@ export async function runHook(eventArg?: string): Promise<void> {
       return;
     }
 
-    const hookEventName = input.hook_event_name ?? eventArg ?? "Unknown";
-    const type: EventType = HOOK_EVENT_TO_TYPE[hookEventName] ?? "unknown";
-    const ts = Date.now();
-    const sessionId = input.session_id ?? "unknown-session";
-
-    if (type === "session_start") {
-      upsertSession({
-        id: sessionId,
-        tool: "claude-code",
-        startedAt: ts,
-        cwd: input.cwd,
-      });
-    } else if (type === "session_end") {
-      upsertSession({
-        id: sessionId,
-        tool: "claude-code",
-        startedAt: ts,
-        endedAt: ts,
-        cwd: input.cwd,
-      });
-    } else {
-      // Make sure the session row exists so events have a parent.
-      upsertSession({
-        id: sessionId,
-        tool: "claude-code",
-        startedAt: ts,
-        cwd: input.cwd,
-      });
-    }
-
-    try {
-      ensureSessionAttribution(sessionId, {
-        cwd: input.cwd,
-        tool: "claude-code",
-        toolVersion: () => claudeVersionFromTranscript(input.transcript_path),
-      });
-      if (type === "stop" || type === "session_end") recordSessionEndGit(sessionId, input.cwd);
-    } catch (err) {
-      logError(err);
-    }
-
-    // Scrub the entire payload before persistence — never let raw secrets
-    // touch SQLite, even briefly. scrubAny handles strings recursively and
-    // also redacts values whose KEY name looks sensitive.
-    // .agentreelignore first (drops contents of ignored files), then scrub.
-    const safePayload = scrubAny(applyIgnoreRules(input as never) as typeof input);
-    const event: AgentEvent = {
-      id: nanoid(),
-      sessionId,
-      tool: "claude-code",
-      type,
-      ts,
-      cwd: input.cwd,
-      payload: safePayload,
-    };
-    insertEvent(event);
-
-    // After every hook fire, walk the transcript tail and update the
-    // session's running cost / token totals. Incremental via offset
-    // cache, so this stays cheap even on long sessions.
-    try {
-      recomputeSessionCost(sessionId, input.transcript_path);
-    } catch (err) {
-      // Cost is best-effort — never let a parse glitch break capture.
-      logError(err);
+    const result = await handleClaudeHookInput(eventArg, input);
+    if (result.stdout) {
+      process.stdout.write(result.stdout + "\n");
     }
   } catch (err) {
     logError(err);

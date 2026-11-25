@@ -1,4 +1,5 @@
 import type { AgentConfig } from "../config.js";
+import type { PolicyDecisionRecord } from "../policy/enforce.js";
 
 export interface IngestSession {
   id: string;
@@ -21,6 +22,11 @@ export interface IngestSession {
       timestamp: number;
       evidence: string;
     }>;
+  };
+  /** AgentReel Govern policy decisions (v2, agent >= 0.3.0). Optional, additive field. */
+  policy_decisions?: {
+    version: 2;
+    decisions: PolicyDecisionRecord[];
   };
 }
 

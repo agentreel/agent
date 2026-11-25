@@ -1,0 +1,550 @@
+import { createHash } from "node:crypto";
+import { appendFileSync } from "node:fs";
+import type { AgentEvent } from "@agentreel/shared-types";
+import { readConfig, type AgentConfig } from "../config.js";
+import { insertEvent } from "../db.js";
+import { RULES } from "../guard/rules.js";
+import { ensureAgentreelDir, LOG_PATH } from "../paths.js";
+import { scrubAny, scrubString } from "../redact/scrubber.js";
+import { isPolicyCacheStale, loadEffectivePolicy } from "./cache.js";
+import {
+  evaluatePolicy,
+  POLICY_EVAL_DEADLINE_MS,
+  type PolicyEvalInput,
+  type PolicyRuleMatch,
+} from "./eval.js";
+import {
+  DEFAULT_APPROVAL_EXPIRES_S,
+  type ApprovalOfflineFallback,
+  type Policy,
+  type PolicyAction,
+  type PolicyDecisionAction,
+  type PolicyTool,
+} from "./types.js";
+
+export const STALE_FAIL_OPEN_REASON = "policy stale, fail_open";
+
+export interface PolicyDecisionRecord {
+  id: string;
+  ts: number;
+  session_id: string;
+  rule_id: string;
+  rule_ids: string[];
+  action: PolicyAction;
+  enforced: boolean;
+  downgraded: boolean;
+  policy_etag: string | null;
+  tool: PolicyTool;
+  tool_name?: string;
+  reason?: string;
+  original_action?: PolicyAction;
+  approval_id?: string;
+  approval_status?: string;
+  decided_by?: string;
+}
+
+export interface PreExecRequest {
+  sessionId: string;
+  tool: PolicyTool;
+  toolName: string;
+  toolUseId?: string;
+  cwd?: string;
+  command?: string;
+  file_path?: string;
+  url?: string;
+  mcp_tool?: string;
+  toolInput?: unknown;
+  repo?: string;
+  branch?: string;
+  member?: string;
+  ts?: number;
+}
+
+export interface PreExecOutcome {
+  permitted: boolean;
+  action: PolicyDecisionAction;
+  enforced: boolean;
+  downgraded: boolean;
+  message?: string;
+  reason?: string;
+  decision?: PolicyDecisionRecord;
+  timedOut?: boolean;
+  error?: boolean;
+}
+
+export interface PreExecDeps {
+  cachePath?: string;
+  guardConfigPath?: string;
+  config?: AgentConfig;
+  now?: () => number;
+  evalDeadlineMs?: number;
+  hookDeadlineMs?: number;
+  fetchImpl?: typeof fetch;
+  onWaiting?: (message: string) => void;
+  recordDecision?: (event: AgentEvent) => void;
+  log?: (message: string) => void;
+  evaluateFn?: typeof evaluatePolicy;
+  minPollDelayMs?: number;
+  retryDelayMs?: number;
+  postRetries?: number;
+}
+
+function defaultLog(message: string): void {
+  try {
+    ensureAgentreelDir();
+    appendFileSync(
+      LOG_PATH,
+      `[${new Date().toISOString()}] policy enforce: ${message}\n`,
+    );
+  } catch {
+    // Logging must never crash or block a hook.
+  }
+}
+
+function defaultOnWaiting(message: string): void {
+  try {
+    process.stderr.write(`${message}\n`);
+  } catch {
+    // Ignore stderr write failures.
+  }
+}
+
+export function repoSlugFromRemoteUrl(
+  remoteUrl: string | undefined,
+): string | undefined {
+  if (!remoteUrl) return undefined;
+  const trimmed = remoteUrl.trim();
+  if (!trimmed) return undefined;
+  if (trimmed.includes("://")) {
+    try {
+      const u = new URL(trimmed);
+      const slug = u.pathname.replace(/^\/+/, "").replace(/\.git$/i, "");
+      return slug || undefined;
+    } catch {
+      return undefined;
+    }
+  }
+  const scp = /^[^@]+@[^:]+:(.+)$/.exec(trimmed);
+  if (scp && scp[1]) {
+    const slug = scp[1].replace(/^\/+/, "").replace(/\.git$/i, "");
+    return slug || undefined;
+  }
+  return undefined;
+}
+
+export function formatBlockMessage(
+  ruleName: string,
+  policy: Policy | null,
+  config: AgentConfig,
+): string {
+  const org = policy?.org_name?.trim() || config.orgName?.trim() || "your org";
+  const slug = policy?.org_slug?.trim() || config.orgSlug?.trim();
+  const url = slug ? `agentreel.dev/org/${slug}` : "agentreel.dev";
+  return `Blocked by ${org} policy: ${ruleName}. Ask an admin or see ${url}`;
+}
+
+export function formatWaitingMessage(
+  ruleName: string,
+  expiresS: number,
+): string {
+  return `Waiting for admin approval (${ruleName}), up to ${Math.ceil(expiresS)}s`;
+}
+
+const MAX_APPROVAL_SUMMARY_CHARS = 500;
+
+export function buildActionSummary(req: PreExecRequest): string {
+  if (req.command) return `${req.toolName}: ${req.command}`;
+  if (req.file_path) return `${req.toolName}: ${req.file_path}`;
+  if (req.url) return `${req.toolName}: ${req.url}`;
+  if (req.mcp_tool) return `${req.toolName} (${req.mcp_tool})`;
+  return req.toolName;
+}
+
+export function buildScrubbedApprovalSummary(req: PreExecRequest): string {
+  let raw: string;
+  if (req.command) {
+    raw = `${req.toolName}: ${scrubString(req.command)}`;
+  } else if (req.file_path) {
+    raw = `${req.toolName}: ${scrubString(req.file_path)}`;
+  } else if (req.url) {
+    raw = `${req.toolName}: ${scrubString(req.url)}`;
+  } else if (req.mcp_tool) {
+    raw = `${req.toolName} (${scrubString(req.mcp_tool)})`;
+  } else {
+    raw = req.toolName;
+  }
+  const scrubbed = scrubString(raw);
+  if (scrubbed.length <= MAX_APPROVAL_SUMMARY_CHARS) return scrubbed;
+  return `${scrubbed.slice(0, MAX_APPROVAL_SUMMARY_CHARS - 3)}...`;
+}
+
+export function computeDecisionId(params: {
+  sessionId: string;
+  ruleId: string;
+  tool: PolicyTool;
+  toolUseId?: string;
+  summary: string;
+}): string {
+  const hash = createHash("sha256")
+    .update(
+      JSON.stringify([
+        params.sessionId,
+        params.ruleId,
+        params.tool,
+        params.toolUseId ?? "",
+        params.summary,
+      ]),
+    )
+    .digest("hex");
+  return `dec_${hash.slice(0, 24)}`;
+}
+
+function selectPrimaryMatch(
+  matches: PolicyRuleMatch[],
+  targetAction: PolicyAction,
+): PolicyRuleMatch {
+  return matches.find((m) => m.action === targetAction) ?? matches[0]!;
+}
+
+function resolveApprovalConfig(matches: PolicyRuleMatch[]): {
+  expiresS: number;
+  offlineFallback: ApprovalOfflineFallback;
+} {
+  const approvalMatches = matches.filter((m) => m.action === "require_approval");
+  const candidates = approvalMatches.length > 0 ? approvalMatches : matches;
+
+  let minExpiresS: number | undefined;
+  let allAllowOffline = candidates.length > 0;
+
+  for (const m of candidates) {
+    const exp = m.approval?.expires_s;
+    if (typeof exp === "number" && Number.isFinite(exp) && exp > 0) {
+      minExpiresS = minExpiresS === undefined ? exp : Math.min(minExpiresS, exp);
+    }
+    if (m.approval?.offline_fallback !== "allow") {
+      allAllowOffline = false;
+    }
+  }
+
+  return {
+    expiresS: minExpiresS ?? DEFAULT_APPROVAL_EXPIRES_S,
+    offlineFallback: allAllowOffline ? "allow" : "deny",
+  };
+}
+
+function persistDecisionEvent(
+  record: PolicyDecisionRecord,
+  cwd: string | undefined,
+  recordDecision: (event: AgentEvent) => void,
+  log: (message: string) => void,
+): void {
+  try {
+    const safePayload = scrubAny(record) as PolicyDecisionRecord;
+    // Preserve admin approver identity verbatim; scrubAny redacts emails.
+    if (record.decided_by !== undefined) {
+      safePayload.decided_by = record.decided_by;
+    }
+    recordDecision({
+      id: record.id,
+      sessionId: record.session_id,
+      tool: record.tool,
+      type: "policy_decision",
+      ts: record.ts,
+      cwd,
+      payload: safePayload,
+    });
+  } catch (err) {
+    log(
+      `failed to persist policy_decision event: ${err instanceof Error ? err.message : String(err)}`,
+    );
+  }
+}
+
+function formatApprovalDenyMessage(
+  ruleName: string,
+  policy: Policy | null,
+  config: AgentConfig,
+  outcome: string,
+  decidedBy?: string,
+  reason?: string,
+  expiresS?: number,
+): string {
+  const org = policy?.org_name?.trim() || config.orgName?.trim() || "your org";
+  const slug = policy?.org_slug?.trim() || config.orgSlug?.trim();
+  const url = slug ? `agentreel.dev/org/${slug}` : "agentreel.dev";
+  let detail = outcome;
+  if (outcome === "denied") {
+    detail = decidedBy ? `denied by ${decidedBy}` : "denied by admin";
+    if (reason) detail += `: ${reason}`;
+  } else if (outcome === "expired") {
+    detail = "approval expired";
+  } else if (outcome === "timeout") {
+    detail = `approval timed out after ${Math.ceil(expiresS ?? DEFAULT_APPROVAL_EXPIRES_S)}s`;
+  } else if (outcome === "offline_deny") {
+    detail = "approval server unavailable";
+  }
+  return `Blocked by ${org} policy: ${ruleName} (${detail}). Ask an admin or see ${url}`;
+}
+
+/**
+ * Evaluates cached policy for a pre-execution tool call, handles offline modes,
+ * optionally runs the remote approval flow only for require_approval, records
+ * non-allow policy_decision events locally, and always fails open on errors.
+ */
+export async function enforcePreExec(
+  req: PreExecRequest,
+  deps: PreExecDeps = {},
+): Promise<PreExecOutcome> {
+  const log = deps.log ?? defaultLog;
+  const nowFn = deps.now ?? Date.now;
+  const recordDecision = deps.recordDecision ?? insertEvent;
+  const onWaiting = deps.onWaiting ?? defaultOnWaiting;
+  const evaluateFn = deps.evaluateFn ?? evaluatePolicy;
+
+  try {
+    const loaded = loadEffectivePolicy({
+      cachePath: deps.cachePath,
+      guardConfigPath: deps.guardConfigPath,
+    });
+
+    if (!loaded.policy) {
+      return {
+        permitted: true,
+        action: "allow",
+        enforced: false,
+        downgraded: false,
+      };
+    }
+
+    const evalInput: PolicyEvalInput = {
+      tool: req.tool,
+      toolName: req.toolName,
+      command: req.command,
+      file_path: req.file_path,
+      url: req.url,
+      mcp_tool: req.mcp_tool,
+      toolInput: req.toolInput,
+      repo: req.repo,
+      branch: req.branch,
+      member: req.member,
+    };
+
+    const evalResult = evaluateFn(evalInput, loaded.policy, RULES, {
+      deadlineMs: deps.evalDeadlineMs ?? POLICY_EVAL_DEADLINE_MS,
+    });
+
+    if (evalResult.timed_out) {
+      log(
+        `evaluation exceeded ${deps.evalDeadlineMs ?? POLICY_EVAL_DEADLINE_MS}ms deadline for ${req.toolName}; failing open`,
+      );
+      return {
+        permitted: true,
+        action: "allow",
+        enforced: false,
+        downgraded: false,
+        timedOut: true,
+      };
+    }
+
+    if (evalResult.action === "allow" || evalResult.matches.length === 0) {
+      return {
+        permitted: true,
+        action: "allow",
+        enforced: false,
+        downgraded: false,
+      };
+    }
+
+    const ts = req.ts ?? nowFn();
+    const targetAction = evalResult.original_action ?? evalResult.action;
+    const primaryMatch = selectPrimaryMatch(evalResult.matches, targetAction);
+    const summary = buildActionSummary(req);
+    const decisionId = computeDecisionId({
+      sessionId: req.sessionId,
+      ruleId: primaryMatch.rule_id,
+      tool: req.tool,
+      toolUseId: req.toolUseId,
+      summary,
+    });
+
+    const isStaleFailOpen =
+      loaded.policy.offline === "fail_open" &&
+      (loaded.source !== "server_cache" ||
+        isPolicyCacheStale(loaded.fetchedAt, nowFn()));
+
+    if (
+      isStaleFailOpen &&
+      (evalResult.action === "block" || evalResult.action === "require_approval")
+    ) {
+      const record: PolicyDecisionRecord = {
+        id: decisionId,
+        ts,
+        session_id: req.sessionId,
+        rule_id: primaryMatch.rule_id,
+        rule_ids: evalResult.rule_ids,
+        action: "flag",
+        enforced: false,
+        downgraded: true,
+        original_action: evalResult.action,
+        reason: STALE_FAIL_OPEN_REASON,
+        policy_etag: loaded.etag,
+        tool: req.tool,
+        tool_name: req.toolName,
+      };
+      persistDecisionEvent(record, req.cwd, recordDecision, log);
+      return {
+        permitted: true,
+        action: "flag",
+        enforced: false,
+        downgraded: true,
+        reason: STALE_FAIL_OPEN_REASON,
+        decision: record,
+      };
+    }
+
+    if (evalResult.action === "flag") {
+      const record: PolicyDecisionRecord = {
+        id: decisionId,
+        ts,
+        session_id: req.sessionId,
+        rule_id: primaryMatch.rule_id,
+        rule_ids: evalResult.rule_ids,
+        action: "flag",
+        enforced: false,
+        downgraded: evalResult.downgraded,
+        ...(evalResult.original_action
+          ? { original_action: evalResult.original_action }
+          : {}),
+        policy_etag: loaded.etag,
+        tool: req.tool,
+        tool_name: req.toolName,
+      };
+      persistDecisionEvent(record, req.cwd, recordDecision, log);
+      return {
+        permitted: true,
+        action: "flag",
+        enforced: false,
+        downgraded: evalResult.downgraded,
+        decision: record,
+      };
+    }
+
+    const cfg = deps.config ?? readConfig();
+
+    if (evalResult.action === "block") {
+      const message = formatBlockMessage(primaryMatch.name, loaded.policy, cfg);
+      const record: PolicyDecisionRecord = {
+        id: decisionId,
+        ts,
+        session_id: req.sessionId,
+        rule_id: primaryMatch.rule_id,
+        rule_ids: evalResult.rule_ids,
+        action: "block",
+        enforced: true,
+        downgraded: false,
+        reason: primaryMatch.message,
+        policy_etag: loaded.etag,
+        tool: req.tool,
+        tool_name: req.toolName,
+      };
+      persistDecisionEvent(record, req.cwd, recordDecision, log);
+      return {
+        permitted: false,
+        action: "block",
+        enforced: true,
+        downgraded: false,
+        message,
+        reason: primaryMatch.message,
+        decision: record,
+      };
+    }
+
+    // require_approval: the only hook path permitted to reach the network.
+    if (evalResult.action === "require_approval") {
+      const approvalCfg = resolveApprovalConfig(evalResult.matches);
+      onWaiting(formatWaitingMessage(primaryMatch.name, approvalCfg.expiresS));
+
+      const { requestRemoteApproval } = await import("./approval.js");
+      const approval = await requestRemoteApproval({
+        decisionId,
+        ruleId: primaryMatch.rule_id,
+        sessionId: req.sessionId,
+        repo: req.repo,
+        tool: req.tool,
+        summary: buildScrubbedApprovalSummary(req),
+        config: cfg,
+        expiresS: approvalCfg.expiresS,
+        offlineFallback: approvalCfg.offlineFallback,
+        hookDeadlineMs: deps.hookDeadlineMs,
+        fetchImpl: deps.fetchImpl,
+        now: nowFn,
+        minPollDelayMs: deps.minPollDelayMs,
+        retryDelayMs: deps.retryDelayMs,
+        postRetries: deps.postRetries,
+      });
+
+      const downgraded = approval.outcome === "offline_allow";
+      const enforced = !approval.permitted;
+      const message = approval.permitted
+        ? undefined
+        : formatApprovalDenyMessage(
+            primaryMatch.name,
+            loaded.policy,
+            cfg,
+            approval.outcome,
+            approval.decidedBy,
+            approval.reason,
+            approvalCfg.expiresS,
+          );
+
+      const record: PolicyDecisionRecord = {
+        id: decisionId,
+        ts,
+        session_id: req.sessionId,
+        rule_id: primaryMatch.rule_id,
+        rule_ids: evalResult.rule_ids,
+        action: "require_approval",
+        enforced,
+        downgraded,
+        policy_etag: loaded.etag,
+        tool: req.tool,
+        tool_name: req.toolName,
+        ...(approval.approvalId ? { approval_id: approval.approvalId } : {}),
+        approval_status: approval.outcome,
+        ...(approval.decidedBy ? { decided_by: approval.decidedBy } : {}),
+        ...(approval.reason ? { reason: approval.reason } : {}),
+      };
+      persistDecisionEvent(record, req.cwd, recordDecision, log);
+
+      return {
+        permitted: approval.permitted,
+        action: "require_approval",
+        enforced,
+        downgraded,
+        ...(message ? { message } : {}),
+        ...(approval.reason ? { reason: approval.reason } : {}),
+        decision: record,
+      };
+    }
+
+    return {
+      permitted: true,
+      action: "allow",
+      enforced: false,
+      downgraded: false,
+    };
+  } catch (err) {
+    log(
+      `unexpected error during pre-exec enforcement; failing open: ${
+        err instanceof Error ? err.stack ?? err.message : String(err)
+      }`,
+    );
+    return {
+      permitted: true,
+      action: "allow",
+      enforced: false,
+      downgraded: false,
+      error: true,
+    };
+  }
+}
