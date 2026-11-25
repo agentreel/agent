@@ -126,14 +126,16 @@ program
   .command("hook <event>")
   .description("internal: hook handler invoked by Claude Code (reads JSON from stdin)")
   .action(async (event: string) => {
-    await runHook(event);
+    // Measure hook deadline from Node process start (earliest available timestamp).
+    await runHook(event, { hookStartMs: Math.floor(performance.timeOrigin) });
   });
 
 program
   .command("cursor-hook <event>")
   .description("internal: hook handler invoked by Cursor (reads JSON from stdin)")
   .action(async (event: string) => {
-    await runCursorHook(event);
+    // Measure hook deadline from Node process start (earliest available timestamp).
+    await runCursorHook(event, { hookStartMs: Math.floor(performance.timeOrigin) });
   });
 
 program

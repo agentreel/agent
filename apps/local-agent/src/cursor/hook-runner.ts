@@ -2,7 +2,11 @@ import { nanoid } from "nanoid";
 import { appendFileSync, existsSync, readFileSync } from "node:fs";
 import type { AgentEvent } from "@agentreel/shared-types";
 import type { Attribution } from "../attribution.js";
-import { isCapturePaused } from "../config.js";
+import {
+  getInstalledPreExecTimeoutS,
+  isCapturePaused,
+  readConfig,
+} from "../config.js";
 import { getSessionAttribution, insertEvent, upsertSession } from "../db.js";
 import { applyIgnoreRules } from "../hooks/ignore-payload.js";
 import { CURSOR_HOOKS_PATH, LOG_PATH, ensureAgentreelDir } from "../paths.js";
@@ -13,6 +17,7 @@ import {
   type PreExecOutcome,
   type PreExecRequest,
 } from "../policy/enforce.js";
+import { computeHookDeadlineMs } from "../policy/types.js";
 import { scrubAny } from "../redact/scrubber.js";
 import { ensureSessionAttribution, recordSessionEndGit } from "../session-attribution.js";
 import { readStdin } from "../util/stdin.js";
@@ -270,16 +275,32 @@ export async function handleCursorHookInput(
   };
 }
 
+export interface RunCursorHookOptions {
+  /** Hook start timestamp in ms (defaults to Date.now(); cli.ts passes process timeOrigin). */
+  hookStartMs?: number;
+}
+
 /** `agentreel cursor-hook <event>`: read JSON on stdin, record, enforce if pre-exec, answer. */
-export async function runCursorHook(eventArg?: string): Promise<void> {
+export async function runCursorHook(
+  eventArg?: string,
+  opts: RunCursorHookOptions = {},
+): Promise<void> {
+  const hookStartMs = opts.hookStartMs ?? Date.now();
   let hook = canonicalHookName(eventArg);
   let decision: CursorPermissionDecision | undefined;
   try {
     const raw = await readStdin().catch(() => "");
-    if (!isCapturePaused() && raw.trim()) {
+    const cfg = readConfig();
+    if (!isCapturePaused(cfg) && raw.trim()) {
       const input = JSON.parse(raw) as CursorHookInput;
       hook = canonicalHookName(input.hook_event_name) ?? hook;
-      const handled = await handleCursorHookInput(eventArg, input);
+      const installedTimeoutS = getInstalledPreExecTimeoutS(cfg, "cursor");
+      const hookDeadlineMs = computeHookDeadlineMs(installedTimeoutS, hookStartMs);
+      const handled = await handleCursorHookInput(eventArg, input, {
+        config: cfg,
+        hookDeadlineMs,
+        installedTimeoutS,
+      });
       decision = handled.decision;
     }
   } catch (err) {

@@ -12,10 +12,62 @@ export const PRE_EXEC_TIMEOUT_BUFFER_S = 10;
 export const DEFAULT_PRE_EXEC_HOOK_TIMEOUT_S =
   DEFAULT_APPROVAL_EXPIRES_S + PRE_EXEC_TIMEOUT_BUFFER_S;
 export const DEFAULT_HOOK_TIMEOUT_S = 5;
+export const HOOK_DEADLINE_MARGIN_S = 5;
+
+export type HookHost = "claude" | "cursor";
+
+export function policyToolToHookHost(tool: PolicyTool): HookHost {
+  return tool === "claude-code" ? "claude" : "cursor";
+}
+
+export function computeHookDeadlineMs(
+  installedTimeoutS: number,
+  startMs: number,
+): number {
+  const usableS = Math.max(0, installedTimeoutS - HOOK_DEADLINE_MARGIN_S);
+  return startMs + usableS * 1000;
+}
 
 export interface RuleApprovalConfig {
   expires_s?: number;
   offline_fallback?: ApprovalOfflineFallback;
+}
+
+/**
+ * Returns the largest effective approval expires_s across enabled require_approval
+ * rules in a policy, or null if the policy has no enabled require_approval rules.
+ */
+export function computeMaxPolicyApprovalExpiresS(
+  policy?: Policy | null,
+): number | null {
+  if (!policy) return null;
+  let maxExpiresS: number | null = null;
+
+  for (const override of Object.values(policy.builtin)) {
+    if (override.enabled === false) continue;
+    if (override.action !== "require_approval") continue;
+    const exp =
+      typeof override.approval?.expires_s === "number" &&
+      Number.isFinite(override.approval.expires_s) &&
+      override.approval.expires_s > 0
+        ? override.approval.expires_s
+        : DEFAULT_APPROVAL_EXPIRES_S;
+    maxExpiresS = maxExpiresS === null ? exp : Math.max(maxExpiresS, exp);
+  }
+
+  for (const rule of policy.custom) {
+    if (!rule.enabled) continue;
+    if (rule.action !== "require_approval") continue;
+    const exp =
+      typeof rule.approval?.expires_s === "number" &&
+      Number.isFinite(rule.approval.expires_s) &&
+      rule.approval.expires_s > 0
+        ? rule.approval.expires_s
+        : DEFAULT_APPROVAL_EXPIRES_S;
+    maxExpiresS = maxExpiresS === null ? exp : Math.max(maxExpiresS, exp);
+  }
+
+  return maxExpiresS;
 }
 
 export function computePreExecTimeoutS(policy?: Policy | null): number {

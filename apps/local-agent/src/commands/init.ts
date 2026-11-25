@@ -44,6 +44,10 @@ export interface InitOptions {
   /** commander maps --no-claude / --no-cursor to claude:false / cursor:false */
   claude?: boolean;
   cursor?: boolean;
+  claudeSettingsPath?: string;
+  cursorHooksPath?: string;
+  cachePath?: string;
+  guardConfigPath?: string;
 }
 
 export async function initCommand(opts: InitOptions = {}): Promise<void> {
@@ -58,10 +62,13 @@ export async function initCommand(opts: InitOptions = {}): Promise<void> {
   writeConfig(cfg);
 
   if (cfg.apiKey) {
-    await fetchPolicy({ config: cfg });
+    await fetchPolicy({ config: cfg, cachePath: opts.cachePath });
   }
 
-  const loadedPolicy = loadEffectivePolicy();
+  const loadedPolicy = loadEffectivePolicy({
+    cachePath: opts.cachePath,
+    guardConfigPath: opts.guardConfigPath,
+  });
   const preExecTimeoutS = computePreExecTimeoutS(loadedPolicy.policy);
 
   const binary = resolveAgentBinary();
@@ -69,11 +76,22 @@ export async function initCommand(opts: InitOptions = {}): Promise<void> {
   const result =
     opts.claude === false
       ? null
-      : installClaudeCodeHooks(prefix, { preExecTimeoutS });
+      : installClaudeCodeHooks(prefix, {
+          settingsPath: opts.claudeSettingsPath,
+          preExecTimeoutS,
+        });
   const cursor =
     opts.cursor === false
       ? null
-      : installCursorHooks(prefix, undefined, { preExecTimeoutS });
+      : installCursorHooks(prefix, opts.cursorHooksPath, { preExecTimeoutS });
+
+  if (result || cursor) {
+    const nextTimeouts = { ...(cfg.installedHookTimeouts ?? {}) };
+    if (result) nextTimeouts.claude = preExecTimeoutS;
+    if (cursor) nextTimeouts.cursor = preExecTimeoutS;
+    cfg.installedHookTimeouts = nextTimeouts;
+    writeConfig(cfg);
+  }
 
   console.log(pc.bold(pc.cyan("\n  AgentReel  ")) + pc.dim("Loom for AI coding sessions\n"));
   console.log(pc.green("✓") + " Created ~/.agentreel/sessions.db");

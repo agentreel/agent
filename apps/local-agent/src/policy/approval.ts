@@ -241,13 +241,20 @@ export async function requestRemoteApproval(
   }
 
   const startMs = nowFn();
-  let effectiveDeadlineMs = startMs + expiresS * 1000;
+  const approvalExpiryMs = startMs + expiresS * 1000;
+  let effectiveDeadlineMs = approvalExpiryMs;
+  let hookDeadlineBinding = false;
   if (
     params.hookDeadlineMs !== undefined &&
-    params.hookDeadlineMs < effectiveDeadlineMs
+    params.hookDeadlineMs <= effectiveDeadlineMs
   ) {
     effectiveDeadlineMs = params.hookDeadlineMs;
+    hookDeadlineBinding = true;
   }
+  const timeoutReason = (): string =>
+    hookDeadlineBinding
+      ? "hook deadline reached waiting for approval"
+      : "approval timed out";
 
   const baseUrl = params.config.apiBaseUrl.trim().replace(/\/$/, "");
   const postUrl = `${baseUrl}/api/v1/approvals`;
@@ -274,7 +281,7 @@ export async function requestRemoteApproval(
         permitted: false,
         outcome: "timeout",
         decisionId: params.decisionId,
-        reason: "approval timed out",
+        reason: timeoutReason(),
       };
     }
 
@@ -296,7 +303,7 @@ export async function requestRemoteApproval(
         permitted: false,
         outcome: "timeout",
         decisionId: params.decisionId,
-        reason: "approval timed out",
+        reason: timeoutReason(),
       };
     }
 
@@ -350,9 +357,10 @@ export async function requestRemoteApproval(
   );
   if (immediate) return immediate;
 
-  const serverExpiresMs = parseExpiresAtMs(postData.expires_at);
+    const serverExpiresMs = parseExpiresAtMs(postData.expires_at);
   if (serverExpiresMs !== null && serverExpiresMs < effectiveDeadlineMs) {
     effectiveDeadlineMs = serverExpiresMs;
+    hookDeadlineBinding = false;
   }
 
   let nextDelayMs =
@@ -372,9 +380,10 @@ export async function requestRemoteApproval(
     const remainingMs = effectiveDeadlineMs - nowFn();
     if (remainingMs <= 0) break;
 
+    // Floor so ?wait= never extends past the remaining deadline budget.
     const waitSec = Math.max(
-      1,
-      Math.min(APPROVAL_LONG_POLL_WAIT_S, Math.ceil(remainingMs / 1000)),
+      0,
+      Math.min(APPROVAL_LONG_POLL_WAIT_S, Math.floor(remainingMs / 1000)),
     );
     const pollUrl = `${baseUrl}/api/v1/approvals/${encodeURIComponent(approvalId)}?wait=${waitSec}s`;
     const maxSinglePollMs = waitSec * 1000 + APPROVAL_POLL_BUFFER_MS;
@@ -395,7 +404,7 @@ export async function requestRemoteApproval(
         outcome: "timeout",
         decisionId: params.decisionId,
         approvalId,
-        reason: "approval timed out",
+        reason: timeoutReason(),
       };
     }
 
@@ -465,6 +474,6 @@ export async function requestRemoteApproval(
     outcome: "timeout",
     decisionId: params.decisionId,
     approvalId,
-    reason: "approval timed out",
+    reason: timeoutReason(),
   };
 }

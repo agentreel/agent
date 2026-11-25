@@ -3,7 +3,11 @@ import { appendFileSync } from "node:fs";
 import type { AgentEvent, ClaudeCodeHookInput, EventType } from "@agentreel/shared-types";
 import type { Attribution } from "../attribution.js";
 import { claudeVersionFromTranscript } from "../attribution.js";
-import { isCapturePaused } from "../config.js";
+import {
+  getInstalledPreExecTimeoutS,
+  isCapturePaused,
+  readConfig,
+} from "../config.js";
 import { recomputeSessionCost } from "../cost/transcript.js";
 import { isCursorPayload, nativeCursorHooksInstalled, recordCursorHook } from "../cursor/hook-runner.js";
 import { getSessionAttribution, insertEvent, upsertSession } from "../db.js";
@@ -15,6 +19,7 @@ import {
   type PreExecOutcome,
   type PreExecRequest,
 } from "../policy/enforce.js";
+import { computeHookDeadlineMs } from "../policy/types.js";
 import { scrubAny } from "../redact/scrubber.js";
 import { ensureSessionAttribution, recordSessionEndGit } from "../session-attribution.js";
 import { readStdin } from "../util/stdin.js";
@@ -189,10 +194,20 @@ export async function handleClaudeHookInput(
   return { stdout, outcome };
 }
 
-export async function runHook(eventArg?: string): Promise<void> {
+export interface RunHookOptions {
+  /** Hook start timestamp in ms (defaults to Date.now(); cli.ts passes process timeOrigin). */
+  hookStartMs?: number;
+}
+
+export async function runHook(
+  eventArg?: string,
+  opts: RunHookOptions = {},
+): Promise<void> {
   // Hooks must never block or fail Claude Code on internal errors. Wrap everything.
+  const hookStartMs = opts.hookStartMs ?? Date.now();
   try {
-    if (isCapturePaused()) {
+    const cfg = readConfig();
+    if (isCapturePaused(cfg)) {
       await readStdin().catch(() => "");
       return;
     }
@@ -210,7 +225,13 @@ export async function runHook(eventArg?: string): Promise<void> {
       return;
     }
 
-    const result = await handleClaudeHookInput(eventArg, input);
+    const installedTimeoutS = getInstalledPreExecTimeoutS(cfg, "claude");
+    const hookDeadlineMs = computeHookDeadlineMs(installedTimeoutS, hookStartMs);
+    const result = await handleClaudeHookInput(eventArg, input, {
+      config: cfg,
+      hookDeadlineMs,
+      installedTimeoutS,
+    });
     if (result.stdout) {
       process.stdout.write(result.stdout + "\n");
     }

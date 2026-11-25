@@ -1,7 +1,11 @@
 import { createHash } from "node:crypto";
 import { appendFileSync } from "node:fs";
 import type { AgentEvent } from "@agentreel/shared-types";
-import { readConfig, type AgentConfig } from "../config.js";
+import {
+  getInstalledPreExecTimeoutS,
+  readConfig,
+  type AgentConfig,
+} from "../config.js";
 import { insertEvent } from "../db.js";
 import { RULES } from "../guard/rules.js";
 import { ensureAgentreelDir, LOG_PATH } from "../paths.js";
@@ -14,7 +18,10 @@ import {
   type PolicyRuleMatch,
 } from "./eval.js";
 import {
+  computeHookDeadlineMs,
   DEFAULT_APPROVAL_EXPIRES_S,
+  HOOK_DEADLINE_MARGIN_S,
+  policyToolToHookHost,
   type ApprovalOfflineFallback,
   type Policy,
   type PolicyAction,
@@ -23,6 +30,11 @@ import {
 } from "./types.js";
 
 export const STALE_FAIL_OPEN_REASON = "policy stale, fail_open";
+export const HOOK_TIMEOUT_TOO_SHORT_REASON = "hook_timeout_too_short";
+
+export function formatHookTimeoutTooShortMessage(ruleName: string): string {
+  return `Admin approval for ${ruleName} needs a longer hook timeout than is installed. Run \`npx @agentreel/agent init\` to update hook timeouts.`;
+}
 
 export interface PolicyDecisionRecord {
   id: string;
@@ -77,8 +89,10 @@ export interface PreExecDeps {
   guardConfigPath?: string;
   config?: AgentConfig;
   now?: () => number;
+  sleep?: (ms: number) => Promise<void>;
   evalDeadlineMs?: number;
   hookDeadlineMs?: number;
+  installedTimeoutS?: number;
   fetchImpl?: typeof fetch;
   onWaiting?: (message: string) => void;
   recordDecision?: (event: AgentEvent) => void;
@@ -462,6 +476,45 @@ export async function enforcePreExec(
     // require_approval: the only hook path permitted to reach the network.
     if (evalResult.action === "require_approval") {
       const approvalCfg = resolveApprovalConfig(evalResult.matches);
+      const installedTimeoutS =
+        deps.installedTimeoutS ??
+        getInstalledPreExecTimeoutS(cfg, policyToolToHookHost(req.tool));
+      const maxWaitBudgetS = installedTimeoutS - HOOK_DEADLINE_MARGIN_S;
+
+      if (approvalCfg.expiresS > maxWaitBudgetS) {
+        const message = formatHookTimeoutTooShortMessage(primaryMatch.name);
+        const reason = HOOK_TIMEOUT_TOO_SHORT_REASON;
+        const record: PolicyDecisionRecord = {
+          id: decisionId,
+          ts,
+          session_id: req.sessionId,
+          rule_id: primaryMatch.rule_id,
+          rule_ids: evalResult.rule_ids,
+          action: "require_approval",
+          enforced: true,
+          downgraded: false,
+          policy_etag: loaded.etag,
+          tool: req.tool,
+          tool_name: req.toolName,
+          approval_status: HOOK_TIMEOUT_TOO_SHORT_REASON,
+          reason,
+        };
+        persistDecisionEvent(record, req.cwd, recordDecision, log);
+
+        return {
+          permitted: false,
+          action: "require_approval",
+          enforced: true,
+          downgraded: false,
+          message,
+          reason,
+          decision: record,
+        };
+      }
+
+      const effectiveHookDeadlineMs =
+        deps.hookDeadlineMs ?? computeHookDeadlineMs(installedTimeoutS, ts);
+
       onWaiting(formatWaitingMessage(primaryMatch.name, approvalCfg.expiresS));
 
       const { requestRemoteApproval } = await import("./approval.js");
@@ -475,9 +528,10 @@ export async function enforcePreExec(
         config: cfg,
         expiresS: approvalCfg.expiresS,
         offlineFallback: approvalCfg.offlineFallback,
-        hookDeadlineMs: deps.hookDeadlineMs,
+        hookDeadlineMs: effectiveHookDeadlineMs,
         fetchImpl: deps.fetchImpl,
         now: nowFn,
+        sleep: deps.sleep,
         minPollDelayMs: deps.minPollDelayMs,
         retryDelayMs: deps.retryDelayMs,
         postRetries: deps.postRetries,

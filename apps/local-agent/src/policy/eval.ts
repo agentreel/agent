@@ -364,7 +364,7 @@ function matchConditionAgainstCandidate(
       }
       const re = compileSafeRegex(cond.value, {
         caseSensitive,
-        timeoutMs: Math.max(1, Math.ceil(remainingBeforeCompile)),
+        timeoutMs: Math.max(1, Math.floor(remainingBeforeCompile)),
         onTimeout: () => {
           clock.timedOut = true;
         },
@@ -379,7 +379,7 @@ function matchConditionAgainstCandidate(
       const matched = testSafeRegex(
         re,
         candidate.value,
-        Math.max(1, Math.ceil(remainingBeforeTest)),
+        Math.max(1, Math.floor(remainingBeforeTest)),
         () => {
           clock.timedOut = true;
         },
