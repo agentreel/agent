@@ -231,7 +231,8 @@ describe("RE2-safe regex compiler, cache, and timeout guard", () => {
       ".*passwd.*",
       "kubectl\\s+delete\\s+.*prod",
       "\\w+\\s*\\w+",
-      // Leading-literal rejects (2+ unbounded without mandatory leading literal)
+      // Leading-literal rejects (2+ unbounded without mandatory leading literal
+      // or where the last char of the leading literal overlaps the first unbounded atom)
       "\\w+\\s+\\w+",
       "\\S+\\s+\\S+",
       "[a-z]+@[a-z]+",
@@ -240,6 +241,12 @@ describe("RE2-safe regex compiler, cache, and timeout guard", () => {
       "(DROP|)\\s+TABLE\\s+\\w+",
       "a?\\s+foo\\s+bar",
       "(ba)?\\s+foo\\s+bar",
+      "A\\w+\\s+\\w+",
+      "\\x41\\w+\\s+\\w+",
+      "a[a-z]+\\s+\\w+",
+      "(DROP|TRUNCATE)\\w+\\s+\\w+",
+      "curl[^|]*\\|\\s*(ba)?sh",
+      "foo[\\x41-\\x5A]+@[\\x41-\\x5A]+",
       // Extra conservative boundary rejects
       "\\s+[a-z]*\\s+",
       "a+x?a+",
@@ -264,14 +271,15 @@ describe("RE2-safe regex compiler, cache, and timeout guard", () => {
       "\\w+",
       "[a-z]+",
       ".*foo",
-      // Multi-quantifier org patterns with mandatory leading literal + disjoint barriers
+      "curl[^|]*\\|",
+      // Multi-quantifier org patterns with mandatory disjoint leading literal + disjoint barriers
       "rm\\s+-rf\\s+/",
       "curl\\s+\\|\\s*sh",
       "curl\\s*\\|\\s*(ba)?sh",
+      "curl\\s+\\S+\\s+\\|\\s*(ba)?sh",
       "(DROP|TRUNCATE)\\s+TABLE\\s+\\w+",
       "(?:DROP|TRUNCATE)\\s+TABLE\\s+\\w+",
       "aws\\s+s3\\s+rb",
-      "curl[^|]*\\|\\s*(ba)?sh",
       "^git\\s+push\\s+--force",
       "^deploy-service-0\\s+--env=(prod|staging)\\s+--region=[a-z0-9-]+$",
     ];
@@ -283,7 +291,7 @@ describe("RE2-safe regex compiler, cache, and timeout guard", () => {
     }
   });
 
-  it("decodes \\xHH, \\uHHHH, and \\u{H...} escapes and rejects forbidden or malformed escapes", () => {
+  it("decodes \\xHH, \\uHHHH, and \\u{H...} escapes and rejects forbidden, octal, or malformed escapes", () => {
     const rejected = [
       // Escape-encoded overlapping/adjacent unbounded quantifiers
       "\\x41+\\x42+",
@@ -294,6 +302,12 @@ describe("RE2-safe regex compiler, cache, and timeout guard", () => {
       "x\\u0041+\\u0042+",
       "x\\u{41}+\\u{42}+",
       "x[\\x41]+[\\x42]+",
+      // Octal escapes (\0 followed by any digit, outside and inside [...])
+      "\\012+\\s+\\w+",
+      "\\01+\\s+\\w+",
+      "\\07+\\s+\\w+",
+      "[\\012]+\\s+\\w+",
+      "a\\00b",
       // Forbidden \p, \P, \c escapes anywhere
       "\\p{L}+",
       "\\P{L}+",
@@ -325,8 +339,9 @@ describe("RE2-safe regex compiler, cache, and timeout guard", () => {
       { pattern: "a\\x2Db", sampleMatch: "a-b" },
       { pattern: "a\\u002Db", sampleMatch: "a-b" },
       { pattern: "a\\u{2D}b", sampleMatch: "a-b" },
+      { pattern: "a\\0b", sampleMatch: "a\0b" },
       { pattern: "rm\\x20+-rf\\x20+/", sampleMatch: "rm   -rf  /" },
-      { pattern: "foo[\\x41-\\x5A]+@[\\x41-\\x5A]+", sampleMatch: "fooABC@XYZ" },
+      { pattern: "foo:[\\x41-\\x5A]+@[\\x41-\\x5A]+", sampleMatch: "foo:ABC@XYZ" },
     ];
     for (const c of accepted) {
       expect(isRe2SafePattern(c.pattern), `expected accept: ${c.pattern}`).toBe(
@@ -347,15 +362,21 @@ describe("RE2-safe regex compiler, cache, and timeout guard", () => {
       "rm\\s+-rf\\s+/",
       "curl\\s+\\|\\s*sh",
       "curl\\s*\\|\\s*(ba)?sh",
+      "curl\\s+\\S+\\s+\\|\\s*(ba)?sh",
       "(DROP|TRUNCATE)\\s+TABLE\\s+\\w+",
+      "(?:DROP|TRUNCATE)\\s+TABLE\\s+\\w+",
       "aws\\s+s3\\s+rb",
-      "curl[^|]*\\|\\s*(ba)?sh",
       "^git\\s+push\\s+--force",
+      "rm\\x20+-rf\\x20+/",
+      "foo:[\\x41-\\x5A]+@[\\x41-\\x5A]+",
+      "^deploy-service-0\\s+--env=(prod|staging)\\s+--region=[a-z0-9-]+$",
     ];
     const adversarialInputs = [
       { label: "a*32768", value: "a".repeat(32_768) },
       { label: "space*32768", value: " ".repeat(32_768) },
       { label: "rm+space*32768", value: "rm" + " ".repeat(32_768) },
+      { label: "A+a*32767", value: "A" + "a".repeat(32_767) },
+      { label: "nl*32768", value: "\n".repeat(32_768) },
     ];
 
     // Pre-warm VM script once so per-pattern timings measure regex matching rather than V8 cold-start JIT.

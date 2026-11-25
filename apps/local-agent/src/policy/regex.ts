@@ -20,11 +20,14 @@ interface GroupFrame {
   currentBranchLiteralOnly: boolean;
   currentBranchTokenCount: number;
   lastTokenIsLiteralLike: boolean;
+  currentBranchLastCharSet: CharSet | null;
+  allBranchesLastCharSet: CharSet;
 }
 
 interface SeqToken {
   kind: "atom" | "group" | "assertion";
   charSet: CharSet;
+  groupLastCharSet: CharSet | null;
   min: number;
   unbounded: boolean;
   isWhitespaceEscape: boolean;
@@ -168,10 +171,17 @@ function parseEscape(
     return null;
   }
 
-  // Reject backreferences outside character classes.
-  if (!inCharClass) {
-    if (next >= "1" && next <= "9") return null;
-    if (next === "k" && pattern[start + 2] === "<") return null;
+  // Reject backreferences (\1..\9 anywhere to also block octal escapes in [...], and \k<...>).
+  if (next >= "1" && next <= "9") return null;
+  if (!inCharClass && next === "k" && pattern[start + 2] === "<") return null;
+
+  // Reject \0 followed by any digit (octal escape like \012 or \00) outside and inside [...].
+  // Plain \0 not followed by a digit stays a NUL literal.
+  if (next === "0") {
+    const afterZero = pattern[start + 2];
+    if (afterZero !== undefined && afterZero >= "0" && afterZero <= "9") {
+      return null;
+    }
   }
 
   // \xHH hex escape
@@ -483,26 +493,74 @@ function parseCharClass(
   return null;
 }
 
-function hasMandatoryLeadingLiteral(tokens: SeqToken[]): boolean {
+function isMandatoryLeadingLiteralToken(tok: SeqToken): boolean {
+  if (tok.unbounded || tok.min < 1) return false;
+  return (tok.kind === "atom" && tok.isLiteral) ||
+    (tok.kind === "group" && tok.isLiteralOnlyGroup);
+}
+
+function leadingTokenLastCharSet(tok: SeqToken): CharSet {
+  if (tok.kind === "group" && tok.groupLastCharSet) {
+    return tok.groupLastCharSet;
+  }
+  return tok.charSet;
+}
+
+function hasMandatoryLeadingLiteral(
+  tokens: SeqToken[],
+  firstUnboundedIdx: number,
+): boolean {
   let idx = 0;
   if (idx < tokens.length && tokens[idx]!.isCaret) {
     idx++;
   }
-  if (idx >= tokens.length) return false;
-  const first = tokens[idx]!;
-  if (first.unbounded || first.min < 1) return false;
-  if (first.kind === "atom" && first.isLiteral) return true;
-  if (first.kind === "group" && first.isLiteralOnlyGroup) return true;
-  return false;
+  const limit = firstUnboundedIdx === -1 ? tokens.length : firstUnboundedIdx;
+  if (idx >= limit) return false;
+  if (!isMandatoryLeadingLiteralToken(tokens[idx]!)) return false;
+
+  // Find the end of the contiguous mandatory leading literal run before firstUnboundedIdx.
+  let runEnd = idx;
+  while (runEnd < limit && isMandatoryLeadingLiteralToken(tokens[runEnd]!)) {
+    runEnd++;
+  }
+
+  if (firstUnboundedIdx === -1) return true;
+
+  const firstUnbounded = tokens[firstUnboundedIdx]!;
+  const lastLeading = tokens[runEnd - 1]!;
+  if (!areDisjoint(leadingTokenLastCharSet(lastLeading), firstUnbounded.charSet)) {
+    return false;
+  }
+
+  // If there are additional mandatory tokens between the leading literal run and
+  // the first unbounded atom, ensure the last mandatory token is also disjoint.
+  let lastMandatoryAfterRun: SeqToken | null = null;
+  for (let m = runEnd; m < firstUnboundedIdx; m++) {
+    const mid = tokens[m]!;
+    if (mid.min >= 1 && (mid.kind === "atom" || mid.kind === "group")) {
+      lastMandatoryAfterRun = mid;
+    }
+  }
+  if (
+    lastMandatoryAfterRun &&
+    !areDisjoint(
+      leadingTokenLastCharSet(lastMandatoryAfterRun),
+      firstUnbounded.charSet,
+    )
+  ) {
+    return false;
+  }
+
+  return true;
 }
 
 function validateBranchUnboundedTokens(tokens: SeqToken[]): boolean {
-  if (!hasMandatoryLeadingLiteral(tokens)) return false;
-
   const unboundedIdx: number[] = [];
   for (let i = 0; i < tokens.length; i++) {
     if (tokens[i]!.unbounded) unboundedIdx.push(i);
   }
+  const firstUnboundedIdx = unboundedIdx.length > 0 ? unboundedIdx[0]! : -1;
+  if (!hasMandatoryLeadingLiteral(tokens, firstUnboundedIdx)) return false;
   if (unboundedIdx.length <= 1) return true;
 
   for (let k = 0; k < unboundedIdx.length - 1; k++) {
@@ -693,6 +751,8 @@ function createGroupFrame(): GroupFrame {
     currentBranchLiteralOnly: true,
     currentBranchTokenCount: 0,
     lastTokenIsLiteralLike: false,
+    currentBranchLastCharSet: null,
+    allBranchesLastCharSet: emptyCharSet(),
   };
 }
 
@@ -716,12 +776,18 @@ export function isRe2SafePattern(pattern: string): boolean {
   let totalUnbounded = 0;
   let hasUnboundedInsideGroup = false;
 
-  const recordGroupItem = (isLiteralLike: boolean): void => {
+  const recordGroupItem = (
+    isLiteralLike: boolean,
+    lastCharSet: CharSet | null,
+  ): void => {
     if (stack.length > 1) {
       const frame = stack[stack.length - 1]!;
       frame.currentBranchTokenCount++;
       if (!isLiteralLike) {
         frame.currentBranchLiteralOnly = false;
+        frame.currentBranchLastCharSet = null;
+      } else {
+        frame.currentBranchLastCharSet = lastCharSet;
       }
       frame.lastTokenIsLiteralLike = isLiteralLike;
     }
@@ -744,6 +810,7 @@ export function isRe2SafePattern(pattern: string): boolean {
       const frame = stack[stack.length - 1]!;
       if (unbounded || min < 1 || !frame.lastTokenIsLiteralLike) {
         frame.currentBranchLiteralOnly = false;
+        frame.currentBranchLastCharSet = null;
       }
     } else if (currentBranch.length > 0) {
       const last = currentBranch[currentBranch.length - 1]!;
@@ -752,6 +819,7 @@ export function isRe2SafePattern(pattern: string): boolean {
         last.unbounded = true;
         if (last.kind === "group") {
           last.charSet = universalCharSet();
+          last.groupLastCharSet = null;
           last.isWhitespaceEscape = false;
           last.isLiteralOnlyGroup = false;
         }
@@ -780,10 +848,11 @@ export function isRe2SafePattern(pattern: string): boolean {
       if (!esc) return false;
 
       if (esc.isAssertion) {
-        recordGroupItem(false);
+        recordGroupItem(false, null);
         pushTopToken({
           kind: "assertion",
           charSet: esc.set,
+          groupLastCharSet: null,
           min: 0,
           unbounded: false,
           isWhitespaceEscape: false,
@@ -792,10 +861,11 @@ export function isRe2SafePattern(pattern: string): boolean {
           isCaret: false,
         });
       } else {
-        recordGroupItem(esc.isLiteral);
+        recordGroupItem(esc.isLiteral, esc.isLiteral ? esc.set : null);
         pushTopToken({
           kind: "atom",
           charSet: esc.set,
+          groupLastCharSet: null,
           min: 1,
           unbounded: false,
           isWhitespaceEscape: esc.isWhitespaceEscape,
@@ -814,10 +884,11 @@ export function isRe2SafePattern(pattern: string): boolean {
     if (ch === "[") {
       const parsed = parseCharClass(pattern, i);
       if (!parsed) return false;
-      recordGroupItem(false);
+      recordGroupItem(false, null);
       pushTopToken({
         kind: "atom",
         charSet: parsed.set,
+        groupLastCharSet: null,
         min: 1,
         unbounded: false,
         isWhitespaceEscape: false,
@@ -836,12 +907,19 @@ export function isRe2SafePattern(pattern: string): boolean {
       const frame = stack[stack.length - 1]!;
       frame.hasAlternation = true;
       if (stack.length > 1) {
-        if (frame.currentBranchTokenCount === 0 || !frame.currentBranchLiteralOnly) {
+        if (
+          frame.currentBranchTokenCount === 0 ||
+          !frame.currentBranchLiteralOnly ||
+          !frame.currentBranchLastCharSet
+        ) {
           frame.allBranchesLiteralOnly = false;
+        } else {
+          unionInto(frame.allBranchesLastCharSet, frame.currentBranchLastCharSet);
         }
         frame.currentBranchLiteralOnly = true;
         frame.currentBranchTokenCount = 0;
         frame.lastTokenIsLiteralLike = false;
+        frame.currentBranchLastCharSet = null;
       } else {
         currentBranch = [];
         topBranches.push(currentBranch);
@@ -885,11 +963,18 @@ export function isRe2SafePattern(pattern: string): boolean {
       const closedLiteralOnly =
         closed.allBranchesLiteralOnly &&
         closed.currentBranchLiteralOnly &&
-        closed.currentBranchTokenCount > 0;
-      recordGroupItem(closedLiteralOnly);
+        closed.currentBranchTokenCount > 0 &&
+        closed.currentBranchLastCharSet !== null;
+      let closedLastCharSet: CharSet | null = null;
+      if (closedLiteralOnly) {
+        unionInto(closed.allBranchesLastCharSet, closed.currentBranchLastCharSet!);
+        closedLastCharSet = closed.allBranchesLastCharSet;
+      }
+      recordGroupItem(closedLiteralOnly, closedLastCharSet);
       pushTopToken({
         kind: "group",
         charSet: universalCharSet(),
+        groupLastCharSet: closedLastCharSet,
         min: 1,
         unbounded: false,
         isWhitespaceEscape: false,
@@ -953,10 +1038,11 @@ export function isRe2SafePattern(pattern: string): boolean {
     }
 
     if (ch === "^" || ch === "$") {
-      recordGroupItem(false);
+      recordGroupItem(false, null);
       pushTopToken({
         kind: "assertion",
         charSet: emptyCharSet(),
+        groupLastCharSet: null,
         min: 0,
         unbounded: false,
         isWhitespaceEscape: false,
@@ -965,10 +1051,11 @@ export function isRe2SafePattern(pattern: string): boolean {
         isCaret: ch === "^",
       });
     } else if (ch === ".") {
-      recordGroupItem(false);
+      recordGroupItem(false, null);
       pushTopToken({
         kind: "atom",
         charSet: universalCharSet(),
+        groupLastCharSet: null,
         min: 1,
         unbounded: false,
         isWhitespaceEscape: false,
@@ -979,10 +1066,11 @@ export function isRe2SafePattern(pattern: string): boolean {
     } else {
       const set = emptyCharSet();
       addChar(set, ch);
-      recordGroupItem(true);
+      recordGroupItem(true, set);
       pushTopToken({
         kind: "atom",
         charSet: set,
+        groupLastCharSet: null,
         min: 1,
         unbounded: false,
         isWhitespaceEscape: false,
