@@ -7,7 +7,9 @@ import { installCursorHooks } from "../cursor/hooks-install.js";
 import { readConfig, writeConfig } from "../config.js";
 import { getDb } from "../db.js";
 import { ensureAgentreelDir } from "../paths.js";
+import { loadEffectivePolicy } from "../policy/cache.js";
 import { fetchPolicy } from "../policy/fetch.js";
+import { computePreExecTimeoutS } from "../policy/types.js";
 
 const PACKAGE_NAME = "@agentreel/agent";
 
@@ -59,10 +61,19 @@ export async function initCommand(opts: InitOptions = {}): Promise<void> {
     await fetchPolicy({ config: cfg });
   }
 
+  const loadedPolicy = loadEffectivePolicy();
+  const preExecTimeoutS = computePreExecTimeoutS(loadedPolicy.policy);
+
   const binary = resolveAgentBinary();
   const { prefix, mode } = chooseHookPrefix(binary);
-  const result = opts.claude === false ? null : installClaudeCodeHooks(prefix);
-  const cursor = opts.cursor === false ? null : installCursorHooks(prefix);
+  const result =
+    opts.claude === false
+      ? null
+      : installClaudeCodeHooks(prefix, { preExecTimeoutS });
+  const cursor =
+    opts.cursor === false
+      ? null
+      : installCursorHooks(prefix, undefined, { preExecTimeoutS });
 
   console.log(pc.bold(pc.cyan("\n  AgentReel  ")) + pc.dim("Loom for AI coding sessions\n"));
   console.log(pc.green("✓") + " Created ~/.agentreel/sessions.db");

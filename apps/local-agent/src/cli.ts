@@ -22,6 +22,7 @@ import { runCursorHook } from "./cursor/hook-runner.js";
 import { configCommand } from "./commands/config.js";
 import { scanCommand } from "./commands/scan.js";
 import { policyCommand } from "./commands/policy.js";
+import { doctorCommand } from "./commands/doctor.js";
 
 const program = new Command();
 
@@ -154,6 +155,13 @@ program
   .description("show cached policy source, etag, age, mode, offline setting, and rule counts")
   .action(() => {
     policyCommand();
+  });
+
+program
+  .command("doctor")
+  .description("check policy enforcement state, etag age, and pre-exec hook timeouts")
+  .action(() => {
+    doctorCommand();
   });
 
 program.exitOverride();

@@ -1,8 +1,16 @@
 import { copyFileSync, existsSync, mkdirSync, readFileSync, writeFileSync } from "node:fs";
 import { dirname } from "node:path";
 import { CURSOR_HOOKS_PATH } from "../paths.js";
-import { CURSOR_HOOK_EVENTS } from "./hook-normalize.js";
-import { CURSOR_HOOK_SUBCOMMAND } from "./hook-runner.js";
+import {
+  DEFAULT_HOOK_TIMEOUT_S,
+  DEFAULT_PRE_EXEC_HOOK_TIMEOUT_S,
+} from "../policy/types.js";
+import {
+  CURSOR_HOOK_EVENTS,
+  CURSOR_HOOK_SUBCOMMAND,
+  CURSOR_PRE_EXEC_HOOK_EVENTS,
+  isCursorPreExecHook,
+} from "./hook-normalize.js";
 
 interface CursorHookDef {
   command: string;
@@ -30,12 +38,28 @@ function backup(path: string): string | null {
   return b;
 }
 
+export function cursorHookTimeoutForEvent(
+  event: string,
+  preExecTimeoutS: number = DEFAULT_PRE_EXEC_HOOK_TIMEOUT_S,
+): number {
+  return isCursorPreExecHook(event) ? preExecTimeoutS : DEFAULT_HOOK_TIMEOUT_S;
+}
+
+export interface InstallCursorHooksOptions {
+  preExecTimeoutS?: number;
+}
+
 /**
- * Add `<prefix> cursor-hook <event>` to ~/.cursor/hooks.json for every
- * observe-only hook. Other tools' hooks are left alone; re-running replaces
- * our previous entries, so it is idempotent.
+ * Add `<prefix> cursor-hook <event>` to ~/.cursor/hooks.json for every hook.
+ * Pre-exec hooks receive the longer approval timeout (in seconds); other hooks
+ * keep the default 5s timeout. Re-running replaces our previous entries idempotently.
  */
-export function installCursorHooks(prefix: string, path = CURSOR_HOOKS_PATH): { backup: string | null; installedEvents: string[]; path: string } {
+export function installCursorHooks(
+  prefix: string,
+  path = CURSOR_HOOKS_PATH,
+  opts: InstallCursorHooksOptions = {},
+): { backup: string | null; installedEvents: string[]; path: string; preExecTimeoutS: number } {
+  const preExecTimeoutS = opts.preExecTimeoutS ?? DEFAULT_PRE_EXEC_HOOK_TIMEOUT_S;
   mkdirSync(dirname(path), { recursive: true });
   const b = backup(path);
   const file = read(path);
@@ -43,11 +67,14 @@ export function installCursorHooks(prefix: string, path = CURSOR_HOOKS_PATH): { 
   file.hooks ??= {};
   for (const ev of CURSOR_HOOK_EVENTS) {
     const kept = (file.hooks[ev] ?? []).filter((d) => !isOurs(d));
-    kept.push({ command: `${prefix} ${CURSOR_HOOK_SUBCOMMAND} ${ev}`, timeout: 5 });
+    kept.push({
+      command: `${prefix} ${CURSOR_HOOK_SUBCOMMAND} ${ev}`,
+      timeout: cursorHookTimeoutForEvent(ev, preExecTimeoutS),
+    });
     file.hooks[ev] = kept;
   }
   writeFileSync(path, JSON.stringify(file, null, 2) + "\n", "utf8");
-  return { backup: b, installedEvents: [...CURSOR_HOOK_EVENTS], path };
+  return { backup: b, installedEvents: [...CURSOR_HOOK_EVENTS], path, preExecTimeoutS };
 }
 
 export function uninstallCursorHooks(path = CURSOR_HOOKS_PATH): { backup: string | null; removed: number } {
@@ -64,4 +91,54 @@ export function uninstallCursorHooks(path = CURSOR_HOOKS_PATH): { backup: string
   }
   writeFileSync(path, JSON.stringify(file, null, 2) + "\n", "utf8");
   return { backup: b, removed };
+}
+
+export interface CursorPreExecHookEntryStatus {
+  event: string;
+  installed: boolean;
+  timeoutS: number | null;
+}
+
+export interface CursorPreExecHooksCheck {
+  fileExists: boolean;
+  hooks: CursorPreExecHookEntryStatus[];
+}
+
+export function inspectCursorPreExecHooks(
+  path: string = CURSOR_HOOKS_PATH,
+): CursorPreExecHooksCheck {
+  if (!existsSync(path)) {
+    return {
+      fileExists: false,
+      hooks: CURSOR_PRE_EXEC_HOOK_EVENTS.map((event) => ({
+        event,
+        installed: false,
+        timeoutS: null,
+      })),
+    };
+  }
+  try {
+    const file = read(path);
+    const hooks = CURSOR_PRE_EXEC_HOOK_EVENTS.map((event) => {
+      const entry = (file.hooks?.[event] ?? []).find(isOurs);
+      return {
+        event,
+        installed: Boolean(entry),
+        timeoutS:
+          entry && typeof entry.timeout === "number" && Number.isFinite(entry.timeout)
+            ? entry.timeout
+            : null,
+      };
+    });
+    return { fileExists: true, hooks };
+  } catch {
+    return {
+      fileExists: true,
+      hooks: CURSOR_PRE_EXEC_HOOK_EVENTS.map((event) => ({
+        event,
+        installed: false,
+        timeoutS: null,
+      })),
+    };
+  }
 }
