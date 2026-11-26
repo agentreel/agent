@@ -1,6 +1,7 @@
 import { execFileSync } from "node:child_process";
 import { createServer, type IncomingMessage, type ServerResponse } from "node:http";
 import {
+  existsSync,
   mkdirSync,
   mkdtempSync,
   readdirSync,
@@ -23,6 +24,7 @@ import {
   writePolicyRejectionAtomic,
 } from "../src/policy/cache.js";
 import { fetchPolicy, repoSlugFromRemoteUrl } from "../src/policy/fetch.js";
+import { enforcePreExec } from "../src/policy/enforce.js";
 import {
   computeMaxPolicyApprovalExpiresS,
   computePreExecTimeoutS,
@@ -1170,6 +1172,41 @@ describe("govern API v1 (C1) additive fields, repo query, 304, no-org, org_id, e
           builtin: { FS001: { enabled: true, action: "flag" } },
         }).ok,
       ).toBe(false);
+      expect(
+        validatePolicy({
+          ...noOrgPayload,
+          custom: [
+            {
+              id: "cust_no_org",
+              name: "Custom rule",
+              enabled: true,
+              version: 1,
+              message: "Blocked",
+              when: [{ field: "command", op: "contains", value: "sudo" }],
+              action: "block",
+              severity: "high",
+            },
+          ],
+        }).ok,
+      ).toBe(false);
+      expect(
+        validatePolicy({
+          ...noOrgPayload,
+          allow: { commands: ["echo ok"], paths: [], repos: [] },
+        }).ok,
+      ).toBe(false);
+      expect(
+        validatePolicy({
+          ...noOrgPayload,
+          allow: { commands: [], paths: ["/tmp/ok"], repos: [] },
+        }).ok,
+      ).toBe(false);
+      expect(
+        validatePolicy({
+          ...noOrgPayload,
+          allow: { commands: [], paths: [], repos: ["acme/sandbox"] },
+        }).ok,
+      ).toBe(false);
     } finally {
       await srv.close();
     }
@@ -1373,5 +1410,418 @@ describe("govern API v1 (C1) additive fields, repo query, 304, no-org, org_id, e
       },
     });
     expect(invalidBuiltinSeverity.ok).toBe(false);
+  });
+
+  it("repro: personal repo cwd fetch returning no-org 200 does not overwrite cached org_acme policy and sudo stays blocked", async () => {
+    const t0 = 1_764_530_000_000;
+    const orgAcmePolicy: Policy = makePolicy({
+      etag: "etag-org-acme-v1",
+      org_id: "org_acme",
+      workspace_id: "org_acme",
+      mode: "enforce",
+      custom: [
+        {
+          id: "cust_block_sudo",
+          name: "Block sudo",
+          enabled: true,
+          version: 1,
+          message: "sudo is blocked by org_acme",
+          when: [{ field: "command", op: "contains", value: "sudo" }],
+          action: "block",
+          severity: "critical",
+        },
+      ],
+    });
+    writeCachedPolicyAtomic(
+      { policy: orgAcmePolicy, etag: orgAcmePolicy.etag, fetched_at: t0 },
+      cachePath,
+    );
+
+    const personalRepo = join(tmpDir, "hobby");
+    mkdirSync(personalRepo, { recursive: true });
+    execFileSync("git", ["init"], { cwd: personalRepo, stdio: "ignore" });
+    execFileSync("git", ["remote", "add", "origin", "https://github.com/me/hobby.git"], {
+      cwd: personalRepo,
+      stdio: "ignore",
+    });
+
+    const seenUrls: string[] = [];
+    const srv = await startMockServer((req, res) => {
+      seenUrls.push(req.url ?? "");
+      res.writeHead(200, { "content-type": "application/json" });
+      res.end(
+        JSON.stringify({
+          version: 1,
+          etag: "etag-no-org-hobby",
+          org_id: null,
+          workspace_id: null,
+          updated_at: "2026-11-26T00:00:00Z",
+          mode: "observe",
+          offline: "last_known",
+          builtin: {},
+          custom: [],
+          allow: { commands: [], paths: [], repos: [] },
+        }),
+      );
+    });
+
+    const logs: string[] = [];
+    try {
+      const res = await fetchPolicy({
+        config: makeConfig(srv.url, "ar_live_key"),
+        cachePath,
+        cwd: personalRepo,
+        now: () => t0 + 60_000,
+        log: (m) => logs.push(m),
+      });
+
+      expect(seenUrls).toEqual(["/api/v1/policy"]);
+      expect(res.status).toBe("kept_cache");
+      if (res.status === "kept_cache") {
+        expect(res.reason).toBe("no_org_ignored");
+        expect(res.keptCache).toBe(true);
+      }
+      expect(logs).toContain(
+        "no-org response ignored; keeping cached org policy org_acme",
+      );
+
+      const cached = readCachedPolicy(cachePath);
+      expect(cached?.policy.org_id).toBe("org_acme");
+      expect(cached?.etag).toBe("etag-org-acme-v1");
+
+      const report = inspectDoctorState({
+        cachePath,
+        guardConfigPath,
+        claudeSettingsPath: join(tmpDir, "missing-claude.json"),
+        cursorHooksPath: join(tmpDir, "missing-cursor.json"),
+        config: makeConfig(srv.url, "ar_live_key"),
+        now: t0 + 61_000,
+      });
+      expect(report.enforcementActive).toBe(true);
+      expect(report.noOrgPolicy).toBe(false);
+      expect(formatDoctorReport(report)).toContain(
+        "no-org response ignored; keeping cached org policy org_acme",
+      );
+
+      const outcome = await enforcePreExec(
+        {
+          sessionId: "sess-acme-backend",
+          tool: "claude-code",
+          toolName: "Bash",
+          command: "sudo rm -rf /",
+          repo: "acme/backend",
+        },
+        {
+          cachePath,
+          guardConfigPath,
+          config: makeConfig(srv.url, "ar_live_key"),
+          recordDecision: () => {},
+        },
+      );
+      expect(outcome.permitted).toBe(false);
+      expect(outcome.action).toBe("block");
+      expect(outcome.enforced).toBe(true);
+    } finally {
+      await srv.close();
+    }
+  });
+
+  it("adversarial: neither no-org 200 nor org-B 200 (with new or reused ETag) nor a 304 can replace cached org-A policy", async () => {
+    const t0 = 1_764_540_000_000;
+    const orgAPolicy: Policy = makePolicy({
+      etag: "etag-org-a",
+      org_id: "org_a",
+      workspace_id: "org_a",
+      mode: "enforce",
+      custom: [
+        {
+          id: "cust_org_a_block_sudo",
+          name: "Org A block sudo",
+          enabled: true,
+          version: 1,
+          message: "Blocked by org_a",
+          when: [{ field: "command", op: "contains", value: "sudo" }],
+          action: "block",
+          severity: "critical",
+        },
+      ],
+    });
+    writeCachedPolicyAtomic(
+      { policy: orgAPolicy, etag: orgAPolicy.etag, fetched_at: t0 },
+      cachePath,
+    );
+
+    const noOrgBase = {
+      version: 1,
+      org_id: null,
+      workspace_id: null,
+      updated_at: "2026-11-26T00:00:00Z",
+      mode: "observe",
+      offline: "last_known",
+      builtin: {},
+      custom: [],
+      allow: { commands: [], paths: [], repos: [] },
+    };
+    const orgBBase = makePolicy({
+      org_id: "org_b",
+      workspace_id: "org_b",
+      mode: "observe",
+      builtin: {},
+      custom: [],
+      allow: { commands: [], paths: [], repos: [] },
+    });
+
+    let step = 0;
+    const seenIfNoneMatch: Array<string | undefined> = [];
+    const srv = await startMockServer((req, res) => {
+      seenIfNoneMatch.push(req.headers["if-none-match"] as string | undefined);
+      step++;
+      if (step === 1) {
+        // Attack 1: no-org 200 with fresh etag
+        res.writeHead(200, { "content-type": "application/json" });
+        res.end(JSON.stringify({ ...noOrgBase, etag: "etag-no-org" }));
+        return;
+      }
+      if (step === 2) {
+        // Attack 2: no-org 200 reusing org_a's exact etag
+        res.writeHead(200, { "content-type": "application/json" });
+        res.end(JSON.stringify({ ...noOrgBase, etag: "etag-org-a" }));
+        return;
+      }
+      if (step === 3) {
+        // Attack 3: org_b 200 with new etag
+        res.writeHead(200, { "content-type": "application/json" });
+        res.end(JSON.stringify({ ...orgBBase, etag: "etag-org-b" }));
+        return;
+      }
+      if (step === 4) {
+        // Attack 4: org_b 200 reusing org_a's exact etag
+        res.writeHead(200, { "content-type": "application/json" });
+        res.end(JSON.stringify({ ...orgBBase, etag: "etag-org-a" }));
+        return;
+      }
+      // Attack 5: 304 response carrying an adversarial org_b ETag header
+      res.writeHead(304, { etag: "etag-org-b" });
+      res.end();
+    });
+
+    const logs: string[] = [];
+    const assertOrgAEnforced = async () => {
+      const cached = readCachedPolicy(cachePath);
+      expect(cached?.policy.org_id).toBe("org_a");
+      expect(cached?.etag).toBe("etag-org-a");
+
+      const outcome = await enforcePreExec(
+        {
+          sessionId: "sess-adversarial",
+          tool: "claude-code",
+          toolName: "Bash",
+          command: "sudo rm -rf /",
+        },
+        {
+          cachePath,
+          guardConfigPath,
+          config: makeConfig(srv.url, "ar_live_key"),
+          recordDecision: () => {},
+        },
+      );
+      expect(outcome.permitted).toBe(false);
+      expect(outcome.action).toBe("block");
+      expect(outcome.decision?.rule_id).toBe("cust_org_a_block_sudo");
+    };
+
+    try {
+      const r1 = await fetchPolicy({
+        config: makeConfig(srv.url, "ar_live_key"),
+        cachePath,
+        now: () => t0 + 10_000,
+        log: (m) => logs.push(m),
+      });
+      expect(r1.status).toBe("kept_cache");
+      await assertOrgAEnforced();
+
+      const r2 = await fetchPolicy({
+        config: makeConfig(srv.url, "ar_live_key"),
+        cachePath,
+        now: () => t0 + 20_000,
+        log: (m) => logs.push(m),
+      });
+      expect(r2.status).toBe("kept_cache");
+      await assertOrgAEnforced();
+
+      const r3 = await fetchPolicy({
+        config: makeConfig(srv.url, "ar_live_key"),
+        cachePath,
+        now: () => t0 + 30_000,
+        log: (m) => logs.push(m),
+      });
+      expect(r3.status).toBe("kept_cache");
+      if (r3.status === "kept_cache") {
+        expect(r3.reason).toBe("org_mismatch_ignored");
+      }
+      expect(logs).toContain(
+        "policy for org org_b ignored; keeping cached org org_a",
+      );
+
+      const doctorAfterOrgB = inspectDoctorState({
+        cachePath,
+        guardConfigPath,
+        claudeSettingsPath: join(tmpDir, "missing-claude.json"),
+        cursorHooksPath: join(tmpDir, "missing-cursor.json"),
+        config: makeConfig(srv.url, "ar_live_key"),
+        now: t0 + 31_000,
+      });
+      const doctorOut = formatDoctorReport(doctorAfterOrgB);
+      expect(doctorOut).toContain(
+        "policy for org org_b ignored; keeping cached org org_a",
+      );
+      expect(doctorOut).toContain("run `npx @agentreel/agent auth` to switch orgs");
+      await assertOrgAEnforced();
+
+      const r4 = await fetchPolicy({
+        config: makeConfig(srv.url, "ar_live_key"),
+        cachePath,
+        now: () => t0 + 40_000,
+        log: (m) => logs.push(m),
+      });
+      expect(r4.status).toBe("kept_cache");
+      await assertOrgAEnforced();
+
+      const r5 = await fetchPolicy({
+        config: makeConfig(srv.url, "ar_live_key"),
+        cachePath,
+        now: () => t0 + 50_000,
+        log: (m) => logs.push(m),
+      });
+      expect(r5.status).toBe("not_modified");
+      // Every single fetch must have sent org_a's etag, never org_b's
+      expect(seenIfNoneMatch).toEqual([
+        "etag-org-a",
+        "etag-org-a",
+        "etag-org-a",
+        "etag-org-a",
+        "etag-org-a",
+      ]);
+      await assertOrgAEnforced();
+    } finally {
+      await srv.close();
+    }
+  });
+
+  it("explicit auth (linkCommand) clears cached policy, etag, and sidecar when switching accounts, and logout clears cache", async () => {
+    vi.resetModules();
+    const prevHome = process.env.HOME;
+    const authHome = mkdtempSync(join(tmpdir(), "agentreel-auth-switch-"));
+    process.env.HOME = authHome;
+
+    const orgAPolicy = makePolicy({
+      etag: "etag-org-a",
+      org_id: "org_a",
+      workspace_id: "org_a",
+      mode: "enforce",
+    });
+    const orgBPolicy = makePolicy({
+      etag: "etag-org-b",
+      org_id: "org_b",
+      workspace_id: "org_b",
+      mode: "enforce",
+    });
+
+    const seenPolicyIfNoneMatch: Array<string | undefined> = [];
+    const srv = await startMockServer((req, res) => {
+      const pathname = new URL(req.url ?? "/", "http://127.0.0.1").pathname;
+      const authHeader = req.headers.authorization;
+      if (pathname === "/api/v1/sessions/ingest") {
+        if (authHeader === "Bearer ar_live_bad_key") {
+          res.writeHead(401, { "content-type": "application/json" });
+          res.end(JSON.stringify({ error: "unauthorized" }));
+          return;
+        }
+        res.writeHead(200, { "content-type": "application/json" });
+        res.end(JSON.stringify({ ok: true }));
+        return;
+      }
+      if (pathname === "/api/v1/policy") {
+        seenPolicyIfNoneMatch.push(req.headers["if-none-match"] as string | undefined);
+        res.writeHead(200, { "content-type": "application/json" });
+        res.end(
+          JSON.stringify(
+            authHeader === "Bearer ar_live_org_b_key" ? orgBPolicy : orgAPolicy,
+          ),
+        );
+        return;
+      }
+      res.writeHead(404);
+      res.end();
+    });
+
+    const logSpy = vi.spyOn(console, "log").mockImplementation(() => {});
+    const errSpy = vi.spyOn(console, "error").mockImplementation(() => {});
+    const exitSpy = vi.spyOn(process, "exit").mockImplementation((() => {
+      throw new Error("EXIT_CALLED");
+    }) as never);
+
+    try {
+      const { linkCommand, logoutCommand } = await import("../src/commands/auth.js");
+      const { POLICY_PATH } = await import("../src/paths.js");
+      const {
+        policyRejectionPath,
+        readCachedPolicy: readCachedFresh,
+        readPolicyRejection: readRejectionFresh,
+        writePolicyRejectionAtomic: writeRejectionFresh,
+      } = await import("../src/policy/cache.js");
+
+      // 1. Initial link caches org_a
+      await linkCommand("ar_live_org_a_key", { api: srv.url });
+      expect(readCachedFresh(POLICY_PATH)?.policy.org_id).toBe("org_a");
+      expect(readCachedFresh(POLICY_PATH)?.etag).toBe("etag-org-a");
+
+      // Seed an org_mismatch_ignored sidecar as if a refresh saw org_b
+      writeRejectionFresh(
+        {
+          ts: Date.now(),
+          error: "policy for org org_b ignored; keeping cached org org_a",
+          reason: "org_mismatch_ignored",
+          cached_org_id: "org_a",
+          incoming_org_id: "org_b",
+        },
+        POLICY_PATH,
+      );
+      expect(readRejectionFresh(POLICY_PATH)?.reason).toBe("org_mismatch_ignored");
+
+      // 2. Failed link (401) must NOT wipe org_a cache or sidecar
+      await expect(
+        linkCommand("ar_live_bad_key", { api: srv.url }),
+      ).rejects.toThrow("EXIT_CALLED");
+      expect(readCachedFresh(POLICY_PATH)?.policy.org_id).toBe("org_a");
+      expect(readRejectionFresh(POLICY_PATH)?.reason).toBe("org_mismatch_ignored");
+
+      // 3. Successful link to org_b clears org_a cache + etag + sidecar before fetching fresh
+      await linkCommand("ar_live_org_b_key", { api: srv.url });
+      expect(seenPolicyIfNoneMatch).toEqual([undefined, undefined]);
+      expect(readCachedFresh(POLICY_PATH)?.policy.org_id).toBe("org_b");
+      expect(readCachedFresh(POLICY_PATH)?.etag).toBe("etag-org-b");
+      expect(readRejectionFresh(POLICY_PATH)).toBeNull();
+
+      // 4. Logout clears cached policy and any sidecar
+      writeRejectionFresh(
+        {
+          ts: Date.now(),
+          error: "some notice",
+          reason: "no_org_ignored",
+        },
+        POLICY_PATH,
+      );
+      await logoutCommand();
+      expect(existsSync(POLICY_PATH)).toBe(false);
+      expect(existsSync(policyRejectionPath(POLICY_PATH))).toBe(false);
+    } finally {
+      logSpy.mockRestore();
+      errSpy.mockRestore();
+      exitSpy.mockRestore();
+      await srv.close();
+      process.env.HOME = prevHome;
+      rmSync(authHome, { recursive: true, force: true });
+    }
   });
 });

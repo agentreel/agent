@@ -3167,6 +3167,67 @@ describe("C1 additive enforcement: no-org, approval_defaults, POST 201/200/409, 
     expect(decisions).toEqual([]);
   });
 
+  it("enforce.ts no-org guard short-circuits enforcePreExec before evaluateFn is invoked", async () => {
+    const noOrgPolicy: Policy = {
+      version: 1,
+      etag: "etag-no-org-guard-direct",
+      org_id: null,
+      workspace_id: null,
+      updated_at: "2026-11-26T00:00:00Z",
+      mode: "observe",
+      offline: "last_known",
+      builtin: {},
+      custom: [],
+      allow: { commands: [], paths: [], repos: [] },
+    };
+    cache.writeCachedPolicyAtomic(
+      { policy: noOrgPolicy, etag: noOrgPolicy.etag, fetched_at: Date.now() },
+      cachePath,
+    );
+
+    const evaluateSpy = vi.fn(() => ({
+      action: "block" as const,
+      rule_ids: ["SHOULD_NOT_RUN"],
+      matches: [
+        {
+          rule_id: "SHOULD_NOT_RUN",
+          name: "Should not run",
+          message: "Should not run",
+          action: "block" as const,
+          severity: "critical" as const,
+          source: "custom" as const,
+        },
+      ],
+      downgraded: false,
+    }));
+    const decisions: AgentEvent[] = [];
+
+    const res = await enforce.enforcePreExec(
+      {
+        sessionId: "sess-no-org-guard-only",
+        tool: "claude-code",
+        toolName: "Bash",
+        command: "sudo rm -rf /",
+      },
+      {
+        cachePath,
+        guardConfigPath,
+        config: makeConfig(),
+        evaluateFn: evaluateSpy,
+        recordDecision: (e) => decisions.push(e),
+      },
+    );
+
+    expect(evaluateSpy).not.toHaveBeenCalled();
+    expect(res).toEqual({
+      permitted: true,
+      action: "allow",
+      enforced: false,
+      downgraded: false,
+    });
+    expect(decisions).toEqual([]);
+  });
+
   it("applies approval_defaults to builtin require_approval entries and keeps hook_timeout_too_short check", async () => {
     // 1. approval_defaults.expires_s=180 exceeds installedTimeoutS(130)-5=125 -> hook_timeout_too_short, no POST
     const tooShortPolicy = makeEnforcePolicy({
