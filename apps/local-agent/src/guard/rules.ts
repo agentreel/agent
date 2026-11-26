@@ -1,4 +1,10 @@
 import type { Rule } from "./types.js";
+import {
+  hasCurlPipeShell,
+  hasGitBranchDelete,
+  hasGitForcePush,
+  hasGitNoVerify,
+} from "./linear-match.js";
 
 export const RULES: Rule[] = [
   {
@@ -574,10 +580,7 @@ export const RULES: Rule[] = [
       type: "command",
       customMatcher: (ctx) => {
         const cmd = ctx.command || "";
-        const hasForce =
-          /git\s+push\s+[^|&;]*--force/i.test(cmd) ||
-          /git\s+push\s+[^|&;]*-f\b/i.test(cmd);
-        if (!hasForce) return false;
+        if (!hasGitForcePush(cmd)) return false;
         
         const hasBranchName = /origin\s+[\w\-\/]+/.test(cmd);
         if (!hasBranchName) return true;
@@ -615,7 +618,7 @@ export const RULES: Rule[] = [
     enabled: true,
     matcher: {
       type: "command",
-      pattern: /\bgit\s+(branch\s+-D|push\s+[^|&;]*--delete)/i,
+      customMatcher: (ctx) => hasGitBranchDelete(ctx.command || ""),
     },
   },
 
@@ -658,7 +661,7 @@ export const RULES: Rule[] = [
     enabled: true,
     matcher: {
       type: "command",
-      pattern: /\bgit\s+(commit|push)\s+[^|&;]*--no-verify/i,
+      customMatcher: (ctx) => hasGitNoVerify(ctx.command || ""),
     },
   },
 
@@ -713,7 +716,7 @@ export const RULES: Rule[] = [
     enabled: true,
     matcher: {
       type: "command",
-      pattern: /\b(curl|wget)\s+[^|&;]+\s*\|\s*(sh|bash|zsh|fish|python)/i,
+      customMatcher: (ctx) => hasCurlPipeShell(ctx.command || ""),
     },
   },
 

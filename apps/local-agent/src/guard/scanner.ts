@@ -1,6 +1,6 @@
 import { appendFileSync } from "node:fs";
 import type { AgentEvent, Session } from "@agentreel/shared-types";
-import type { Finding, SessionSummary, MatchContext } from "./types.js";
+import type { Finding, SessionSummary, MatchContext, Rule } from "./types.js";
 import { RULES } from "./rules.js";
 import {
   calculateRiskScore,
@@ -37,6 +37,8 @@ export interface ScanOptions {
   deadlineMs?: number;
   /** Receives one line per scan that hit the deadline. */
   log?: (message: string) => void;
+  /** Rule set to scan with. Defaults to the built-in RULES; tests inject slow rules. */
+  rules?: Rule[];
 }
 
 export function scanDeadlineMs(context: MatchContext): number {
@@ -75,7 +77,7 @@ export function scanEvent(event: AgentEvent, opts: ScanOptions = {}): Finding[] 
   };
 
   const deadlineMs = opts.deadlineMs ?? scanDeadlineMs(context);
-  const result = matchAllRulesWithDeadline(RULES, context, config, deadlineMs);
+  const result = matchAllRulesWithDeadline(opts.rules ?? RULES, context, config, deadlineMs);
   if (result.timedOut) {
     (opts.log ?? defaultLog)(
       `${SCAN_TIMEOUT_REASON}: event ${event.id} exceeded ${Math.floor(deadlineMs)}ms; rule(s) ${result.timedOutRuleIds.join(", ") || "none"} failed closed as findings`,
@@ -123,7 +125,7 @@ export function scanSession(
     // One VM call per event (each costs about 80us): the rule pass first,
     // then the blast-radius stats, under one hard deadline.
     const deadlineMs = opts.deadlineMs ?? scanDeadlineMs(context);
-    const pass = createRulePass(RULES, context, readGuardConfig(), deadlineMs);
+    const pass = createRulePass(opts.rules ?? RULES, context, readGuardConfig(), deadlineMs);
     let blastPhase = false;
     const run = runWithTimeout(() => {
       pass.run();
