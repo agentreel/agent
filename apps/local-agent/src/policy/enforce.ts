@@ -14,8 +14,10 @@ import { isPolicyCacheStale, loadEffectivePolicy } from "./cache.js";
 import {
   EVAL_TIMEOUT_REASON,
   evaluatePolicy,
+  INPUT_TOO_LONG_REASON,
   INVALID_RULE_REASON,
   POLICY_EVAL_DEADLINE_MS,
+  REGEX_INPUT_CAP,
   type PolicyEvalInput,
   type PolicyRuleMatch,
 } from "./eval.js";
@@ -35,7 +37,12 @@ import {
   type RuleApprovalConfig,
 } from "./types.js";
 
-export { EVAL_TIMEOUT_REASON, INVALID_RULE_REASON, repoSlugFromRemoteUrl };
+export {
+  EVAL_TIMEOUT_REASON,
+  INPUT_TOO_LONG_REASON,
+  INVALID_RULE_REASON,
+  repoSlugFromRemoteUrl,
+};
 export const STALE_FAIL_OPEN_REASON = "policy stale, fail_open";
 export const HOOK_TIMEOUT_TOO_SHORT_REASON = "hook_timeout_too_short";
 
@@ -150,6 +157,17 @@ export function formatEvalTimeoutBlockMessage(
   const slug = policy?.org_slug?.trim() || config.orgSlug?.trim();
   const url = slug ? `agentreel.dev/org/${slug}` : "agentreel.dev";
   return `Blocked by ${org} policy: policy check timed out. Ask an admin or see ${url}`;
+}
+
+export function formatInputTooLongBlockMessage(
+  ruleName: string,
+  policy: Policy | null,
+  config: AgentConfig,
+): string {
+  const org = policy?.org_name?.trim() || config.orgName?.trim() || "your org";
+  const slug = policy?.org_slug?.trim() || config.orgSlug?.trim();
+  const url = slug ? `agentreel.dev/org/${slug}` : "agentreel.dev";
+  return `Blocked by ${org} policy: ${ruleName} (input is longer than ${REGEX_INPUT_CAP} characters, so this regex rule could not be fully checked). Shorten the command or ask an admin; see ${url}`;
 }
 
 export function formatInvalidRuleBlockMessage(
@@ -370,6 +388,12 @@ export async function enforcePreExec(
       );
     }
 
+    if (evalResult.input_too_long) {
+      log(
+        `input longer than ${REGEX_INPUT_CAP} chars for ${req.toolName}; regex rule(s) ${(evalResult.input_too_long_rule_ids ?? []).join(", ")} failed closed; action=${evalResult.action}`,
+      );
+    }
+
     if (evalResult.invalid_rule) {
       log(
         `unsupported regex failed to compile during eval for rule(s) ${(evalResult.invalid_rule_ids ?? []).join(", ") || "unknown"}; action=${evalResult.action}`,
@@ -532,11 +556,17 @@ export async function enforcePreExec(
         Boolean(evalResult.timed_out) &&
         Boolean(evalResult.unevaluated_enforcing) &&
         (!primaryMatch || primaryMatch.action !== "block");
+      const isInputTooLongFailClosed =
+        !isInvalidRuleFailClosed &&
+        !isTimeoutFailClosed &&
+        evalResult.reason === INPUT_TOO_LONG_REASON;
       const message = isInvalidRuleFailClosed
         ? formatInvalidRuleBlockMessage(primaryRuleId, loaded.policy, cfg)
         : isTimeoutFailClosed
           ? formatEvalTimeoutBlockMessage(loaded.policy, cfg)
-          : formatBlockMessage(primaryRuleName, loaded.policy, cfg);
+          : isInputTooLongFailClosed
+            ? formatInputTooLongBlockMessage(primaryRuleName, loaded.policy, cfg)
+            : formatBlockMessage(primaryRuleName, loaded.policy, cfg);
       const reason = isInvalidRuleFailClosed
         ? INVALID_RULE_REASON
         : isTimeoutFailClosed
@@ -669,7 +699,11 @@ export async function enforcePreExec(
         ...(approval.approvalId ? { approval_id: approval.approvalId } : {}),
         approval_status: approval.outcome,
         ...(approval.decidedBy ? { decided_by: approval.decidedBy } : {}),
-        ...(approval.reason ? { reason: approval.reason } : {}),
+        ...(approval.reason
+          ? { reason: approval.reason }
+          : evalResult.reason === INPUT_TOO_LONG_REASON
+            ? { reason: INPUT_TOO_LONG_REASON }
+            : {}),
       };
       persistDecisionEvent(record, req.cwd, recordDecision, log);
 

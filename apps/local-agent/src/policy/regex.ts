@@ -3,6 +3,14 @@ import vm from "node:vm";
 export const MAX_REGEX_LENGTH = 300;
 export const REGEX_TIMEOUT_MS = 50;
 export const MAX_REGEX_CACHE_SIZE = 256;
+/**
+ * Custom regex conditions are tested against at most this many UTF-16 code
+ * units of a field value. JS regexes run over UTF-16 code units, so this
+ * bounds backtracking work directly. Measured at /iu, the slowest accepted
+ * fixture (.*foo) stays under 10ms up to about 3571 code units and the
+ * slowest shipped template (git push .*(--force|-f)\b) up to about 11603.
+ */
+export const REGEX_INPUT_CAP = 3072;
 const MAX_QUANTIFIER_BOUND = 100;
 const MAX_GROUP_DEPTH = 16;
 const MAX_UNICODE_CODE_POINT = 0x10ffff;
@@ -670,6 +678,7 @@ function normalizePatternForRegExp(pattern: string): {
 const regexVmContext = vm.createContext({});
 const compileScript = new vm.Script("new RegExp(pattern, flags)");
 const testScript = new vm.Script("re.test(text)");
+const runScript = new vm.Script("fn()");
 const compiledRegexCache = new Map<string, RegExp | null>();
 
 function isVmTimeoutError(err: unknown): boolean {
@@ -683,6 +692,58 @@ function isVmTimeoutError(err: unknown): boolean {
     return true;
   }
   return false;
+}
+
+export interface CappedRegexInput {
+  text: string;
+  truncated: boolean;
+}
+
+/**
+ * Returns the first REGEX_INPUT_CAP UTF-16 code units of value. Never splits a
+ * surrogate pair: if the cut would land between a high and a low surrogate,
+ * the high surrogate is dropped too, so the prefix stays well-formed.
+ */
+export function capRegexInput(
+  value: string,
+  cap: number = REGEX_INPUT_CAP,
+): CappedRegexInput {
+  if (value.length <= cap) return { text: value, truncated: false };
+  let end = cap;
+  const last = value.charCodeAt(end - 1);
+  const next = value.charCodeAt(end);
+  if (last >= 0xd800 && last <= 0xdbff && next >= 0xdc00 && next <= 0xdfff) {
+    end--;
+  }
+  return { text: value.slice(0, end), truncated: true };
+}
+
+export type TimedRunResult<T> =
+  | { ok: true; value: T }
+  | { ok: false; timedOut: true };
+
+/**
+ * Runs fn synchronously under the shared VM context with a hard timeout. The
+ * VM watchdog terminates execution mid-call (including a native RegExp
+ * backtracking inside fn), so the caller regains control at the budget.
+ * Errors other than the timeout are rethrown.
+ */
+export function runWithTimeout<T>(
+  fn: () => T,
+  timeoutMs: number,
+): TimedRunResult<T> {
+  try {
+    regexVmContext.fn = fn;
+    const value = runScript.runInContext(regexVmContext, {
+      timeout: Math.max(1, Math.floor(timeoutMs)),
+    }) as T;
+    return { ok: true, value };
+  } catch (err) {
+    if (isVmTimeoutError(err)) return { ok: false, timedOut: true };
+    throw err;
+  } finally {
+    regexVmContext.fn = undefined;
+  }
 }
 
 export function clearRegexCache(): void {
