@@ -1,7 +1,13 @@
 import { matchRule } from "../guard/matcher.js";
 import { RULES } from "../guard/rules.js";
 import type { MatchContext, Rule, Severity } from "../guard/types.js";
-import { compileSafeRegex, testSafeRegex } from "./regex.js";
+import {
+  capRegexInput,
+  compileSafeRegex,
+  REGEX_INPUT_CAP,
+  runWithTimeout,
+  testSafeRegex,
+} from "./regex.js";
 import {
   isNoOrgPolicy,
   resolveEffectiveRuleApproval,
@@ -18,6 +24,8 @@ import {
 export const POLICY_EVAL_DEADLINE_MS = 50;
 export const EVAL_TIMEOUT_REASON = "eval_timeout";
 export const INVALID_RULE_REASON = "invalid_rule";
+export const INPUT_TOO_LONG_REASON = "input_too_long";
+export { REGEX_INPUT_CAP };
 
 export interface PolicyEvalInput {
   tool: PolicyTool;
@@ -33,6 +41,12 @@ export interface PolicyEvalInput {
 }
 
 export interface PolicyRuleMatch {
+  /**
+   * Set when this is a fail-closed entry for an enforcing regex rule that
+   * could not be checked because the input exceeded REGEX_INPUT_CAP and the
+   * capped prefix did not match.
+   */
+  input_too_long?: boolean;
   rule_id: string;
   name: string;
   message: string;
@@ -53,6 +67,8 @@ export interface PolicyEvalResult {
   invalid_rule_ids?: string[];
   reason?: string;
   unevaluated_enforcing?: boolean;
+  input_too_long?: boolean;
+  input_too_long_rule_ids?: string[];
 }
 
 export interface PolicyEvalOptions {
@@ -343,6 +359,8 @@ function extractFieldCandidates(
 
 interface RuleEvalState {
   compileFailed: boolean;
+  /** Set when a regex condition was only checked on a capped prefix and missed. */
+  inputTooLong: boolean;
 }
 
 function matchConditionAgainstCandidate(
@@ -395,15 +413,17 @@ function matchConditionAgainstCandidate(
         clock.timedOut = true;
         return false;
       }
+      const capped = capRegexInput(candidate.value);
       const matched = testSafeRegex(
         re,
-        candidate.value,
+        capped.text,
         Math.max(1, Math.floor(remainingBeforeTest)),
         () => {
           clock.timedOut = true;
         },
       );
       if (matched) return true;
+      if (capped.truncated) state.inputTooLong = true;
       if (checkExpired(clock)) return false;
       return false;
     }
@@ -437,9 +457,26 @@ function matchesCustomRule(
   if (!rule.enabled) return false;
   if (!rule.when || rule.when.length === 0) return false;
   if (!matchesScope(rule.scope, input)) return false;
+  // A regex condition that missed only on a capped prefix is unknown, not
+  // false. Keep checking the other conditions: if any is definitely false the
+  // rule cannot match; otherwise the rule is reported as inputTooLong.
+  let unknown = false;
   for (const cond of rule.when) {
-    if (!matchesCondition(cond, input, clock, state)) return false;
+    const condState: RuleEvalState = { compileFailed: false, inputTooLong: false };
+    const matched = matchesCondition(cond, input, clock, condState);
+    if (condState.compileFailed) state.compileFailed = true;
     if (clock.timedOut || state.compileFailed) return false;
+    if (matched) continue;
+    if (condState.inputTooLong) {
+      unknown = true;
+      continue;
+    }
+    state.inputTooLong = false;
+    return false;
+  }
+  if (unknown) {
+    state.inputTooLong = true;
+    return false;
   }
   return true;
 }
@@ -649,60 +686,89 @@ export function evaluatePolicy(
   const matches: PolicyRuleMatch[] = [];
   const ctx = buildBuiltinMatchContext(input);
 
-  for (let i = 0; i < enabledBuiltins.length; i++) {
-    if (checkExpired(clock)) {
-      return finalizeTimeout(
-        matches,
-        hasEnforcingBuiltinFrom(i) || hasEnforcingCustomFrom(0),
-        policy.mode,
-      );
+  // Built-in Guard rules use native RegExp objects outside the safe subset
+  // (some are quadratic on long adversarial input), so the whole built-in
+  // pass runs under the VM watchdog and is preempted at the deadline. On
+  // preemption, builtinIndex is the rule that was running (unevaluated).
+  let builtinIndex = 0;
+  let builtinDeadlineHit = false;
+  const runBuiltins = (): void => {
+    for (; builtinIndex < enabledBuiltins.length; builtinIndex++) {
+      if (checkExpired(clock)) {
+        builtinDeadlineHit = true;
+        return;
+      }
+      const entry = enabledBuiltins[builtinIndex]!;
+      const finding = matchRule(entry.effectiveRule, ctx);
+      if (finding) {
+        const severity: Severity = entry.override?.severity ?? finding.severity;
+        const effectiveApproval =
+          entry.action === "require_approval"
+            ? resolveEffectiveRuleApproval(
+                entry.override?.approval,
+                policy.approval_defaults,
+              )
+            : entry.override?.approval;
+        matches.push({
+          rule_id: entry.rule.id,
+          name: entry.rule.name,
+          message: entry.rule.description || entry.rule.name,
+          action: entry.action,
+          severity,
+          source: "builtin",
+          ...(effectiveApproval ? { approval: effectiveApproval } : {}),
+        });
+      }
+      const hasMoreRules =
+        builtinIndex + 1 < enabledBuiltins.length || orderedCustom.length > 0;
+      if (hasMoreRules && checkExpired(clock)) {
+        builtinIndex++;
+        builtinDeadlineHit = true;
+        return;
+      }
     }
-    const entry = enabledBuiltins[i]!;
-    const finding = matchRule(entry.effectiveRule, ctx);
-    if (finding) {
-      const severity: Severity = entry.override?.severity ?? finding.severity;
-      const effectiveApproval =
-        entry.action === "require_approval"
-          ? resolveEffectiveRuleApproval(
-              entry.override?.approval,
-              policy.approval_defaults,
-            )
-          : entry.override?.approval;
-      matches.push({
-        rule_id: entry.rule.id,
-        name: entry.rule.name,
-        message: entry.rule.description || entry.rule.name,
-        action: entry.action,
-        severity,
-        source: "builtin",
-        ...(effectiveApproval ? { approval: effectiveApproval } : {}),
-      });
+  };
+
+  if (enabledBuiltins.length > 0) {
+    const remaining = clock.deadline - clock.nowMs();
+    if (remaining <= 0) {
+      clock.timedOut = true;
+      builtinDeadlineHit = true;
+    } else {
+      const run = runWithTimeout(runBuiltins, remaining);
+      if (!run.ok) {
+        clock.timedOut = true;
+        builtinDeadlineHit = true;
+      }
     }
-    const hasMoreRules =
-      i + 1 < enabledBuiltins.length || orderedCustom.length > 0;
-    if (hasMoreRules && checkExpired(clock)) {
-      return finalizeTimeout(
-        matches,
-        hasEnforcingBuiltinFrom(i + 1) || hasEnforcingCustomFrom(0),
-        policy.mode,
-      );
-    }
+  }
+  if (builtinDeadlineHit) {
+    return finalizeTimeout(
+      matches,
+      hasEnforcingBuiltinFrom(builtinIndex) || hasEnforcingCustomFrom(0),
+      policy.mode,
+    );
   }
 
   const invalidRuleIds: string[] = [];
   let invalidEnforcing = false;
+  // Fail-closed entries for enforcing regex rules that could not be checked
+  // because the input exceeded REGEX_INPUT_CAP. Kept after real matches so a
+  // real match is always the primary one at the same action rank.
+  const tooLongMatches: PolicyRuleMatch[] = [];
+  const allMatches = (): PolicyRuleMatch[] => [...matches, ...tooLongMatches];
 
   for (let i = 0; i < orderedCustom.length; i++) {
     if (checkExpired(clock)) {
       return finalizeTimeout(
-        matches,
+        allMatches(),
         invalidEnforcing || hasEnforcingCustomFrom(i),
         policy.mode,
       );
     }
     const rule = orderedCustom[i]!;
     if (!matchesScope(rule.scope, input)) continue;
-    const state: RuleEvalState = { compileFailed: false };
+    const state: RuleEvalState = { compileFailed: false, inputTooLong: false };
     const matched = matchesCustomRule(rule, input, clock, state);
     if (matched) {
       const effectiveApproval =
@@ -720,14 +786,14 @@ export function evaluatePolicy(
       });
       if (i + 1 < orderedCustom.length && checkExpired(clock)) {
         return finalizeTimeout(
-          matches,
+          allMatches(),
           invalidEnforcing || hasEnforcingCustomFrom(i + 1),
           policy.mode,
         );
       }
     } else if (clock.timedOut) {
       return finalizeTimeout(
-        matches,
+        allMatches(),
         invalidEnforcing || hasEnforcingCustomFrom(i),
         policy.mode,
       );
@@ -736,19 +802,42 @@ export function evaluatePolicy(
       if (isEnforcingAction(rule.action)) {
         invalidEnforcing = true;
       }
+    } else if (state.inputTooLong && isEnforcingAction(rule.action)) {
+      // Over the cap: a block rule fails closed to block and a
+      // require_approval rule to require_approval. Flag rules are skipped.
+      const effectiveApproval =
+        rule.action === "require_approval"
+          ? resolveEffectiveRuleApproval(rule.approval, policy.approval_defaults)
+          : rule.approval;
+      tooLongMatches.push({
+        input_too_long: true,
+        rule_id: rule.id,
+        name: rule.name,
+        message: rule.message || rule.name,
+        action: rule.action,
+        severity: rule.severity,
+        source: "custom",
+        ...(effectiveApproval ? { approval: effectiveApproval } : {}),
+      });
     }
   }
 
+  const finalMatches = allMatches();
+  const tooLongExtras = tooLongInfo(finalMatches);
+
   if (invalidRuleIds.length > 0) {
-    return finalizeInvalidRule(
-      matches,
-      invalidRuleIds,
-      invalidEnforcing,
-      policy.mode,
-    );
+    return {
+      ...finalizeInvalidRule(
+        finalMatches,
+        invalidRuleIds,
+        invalidEnforcing,
+        policy.mode,
+      ),
+      ...tooLongExtras,
+    };
   }
 
-  if (matches.length === 0) {
+  if (finalMatches.length === 0) {
     return {
       action: "allow",
       rule_ids: [],
@@ -757,15 +846,22 @@ export function evaluatePolicy(
     };
   }
 
-  let strictest: PolicyAction = matches[0]!.action;
-  for (let i = 1; i < matches.length; i++) {
-    const candidate = matches[i]!.action;
+  let strictest: PolicyAction = finalMatches[0]!.action;
+  for (let i = 1; i < finalMatches.length; i++) {
+    const candidate = finalMatches[i]!.action;
     if (ACTION_RANK[candidate] > ACTION_RANK[strictest]) {
       strictest = candidate;
     }
   }
 
-  const ruleIds = matches.map((m) => m.rule_id);
+  const ruleIds = finalMatches.map((m) => m.rule_id);
+  // The reason is input_too_long only when the strictest action comes solely
+  // from over-cap fail-closed entries, not from a real match.
+  const reasonExtra =
+    tooLongExtras.input_too_long &&
+    !finalMatches.some((m) => !m.input_too_long && m.action === strictest)
+      ? { reason: INPUT_TOO_LONG_REASON }
+      : {};
 
   if (
     policy.mode === "observe" &&
@@ -774,16 +870,29 @@ export function evaluatePolicy(
     return {
       action: "flag",
       rule_ids: ruleIds,
-      matches,
+      matches: finalMatches,
       downgraded: true,
       original_action: strictest,
+      ...reasonExtra,
+      ...tooLongExtras,
     };
   }
 
   return {
     action: strictest,
     rule_ids: ruleIds,
-    matches,
+    matches: finalMatches,
     downgraded: false,
+    ...reasonExtra,
+    ...tooLongExtras,
   };
+}
+
+function tooLongInfo(
+  matches: PolicyRuleMatch[],
+): { input_too_long?: true; input_too_long_rule_ids?: string[] } {
+  const ids = matches.filter((m) => m.input_too_long).map((m) => m.rule_id);
+  return ids.length > 0
+    ? { input_too_long: true, input_too_long_rule_ids: ids }
+    : {};
 }
