@@ -7,6 +7,7 @@ import {
   logScan,
   scanSession,
 } from "../guard/scanner.js";
+import { capPayloadFields } from "./payload-caps.js";
 import { readGuardConfig } from "../guard/config.js";
 import type { PolicyDecisionRecord } from "../policy/enforce.js";
 import { scrubAny } from "../redact/scrubber.js";
@@ -201,6 +202,11 @@ export function takePendingBatch(
     );
   }
 
+  // Payload fields are capped here, after the guard scan above, which ran on
+  // the full text. Truncating first would let a long payload hide a risky
+  // command or secret behind the cut, and the scan evidence would no longer
+  // match what the user did. The scan result (guard_findings) is computed
+  // from the full payload and uploaded unchanged.
   const events: IngestEvent[] = eventRows.map((e) => ({
     id: e.id,
     session_id: e.session_id,
@@ -208,7 +214,7 @@ export function takePendingBatch(
     type: e.type,
     tool: e.tool,
     cwd: e.cwd,
-    payload: safeParse(e.payload),
+    payload: capPayloadFields(safeParse(e.payload)),
   }));
 
   return {
