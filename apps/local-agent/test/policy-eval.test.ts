@@ -249,6 +249,7 @@ describe("RE2-safe regex compiler, cache, and timeout guard", () => {
       "(DROP|TRUNCATE)\\w+\\s+\\w+",
       "(:|DROP)\\w+\\s+\\w+",
       "curl[^|]*\\|\\s*(ba)?sh",
+      "(curl|wget)[^|]*\\|\\s*(ba|z)?sh",
       "foo[\\x41-\\x5A]+@[\\x41-\\x5A]+",
       // Extra conservative boundary rejects
       "\\s+[a-z]*\\s+",
@@ -280,6 +281,9 @@ describe("RE2-safe regex compiler, cache, and timeout guard", () => {
       "curl\\s+\\|\\s*sh",
       "curl\\s*\\|\\s*(ba)?sh",
       "curl\\s+\\S+\\s+\\|\\s*(ba)?sh",
+      "(curl|wget)\\s+\\S+\\s+\\|\\s*(ba|z)?sh",
+      "git\\s+\\w+\\s+--force",
+      "rm\\s+\\S+\\s+/",
       "(DROP|TRUNCATE)\\s+TABLE\\s+\\w+",
       "(?:DROP|TRUNCATE)\\s+TABLE\\s+\\w+",
       "aws\\s+s3\\s+rb",
