@@ -1,6 +1,19 @@
-# Publishes @agentreel/agent to npm with provenance.
+# Publishes @agentreel/agent to npm with provenance, on the dist-tag that
+# matches the git tag:
+#   vX.Y.Z          -> latest
+#   vX.Y.Z-alpha.N  -> alpha
+#   vX.Y.Z-beta.N   -> beta
+# The tag, apps/local-agent/package.json version and dist-tag must agree, the
+# commit must be on main, and the version must not already be on npm, or the
+# run fails before anything is published (scripts/assert-publish-channel.sh).
+#
 # Auth is npm trusted publishing (OIDC). There is no NODE_AUTH_TOKEN secret.
-# The trusted publisher on npmjs.com must point at agentreel/agent and this file (publish.yml).
+# The trusted publisher on npmjs.com must point at agentreel/agent and this
+# file (publish.yml). Keep this filename.
+#
+# The publish job runs in the protected `npm-publish` GitHub Environment.
+# It must exist, with Navjot as a required reviewer, before any release tag
+# is pushed. GitHub creates a missing environment with no protection.
 name: publish
 
 on:
@@ -11,7 +24,6 @@ on:
 
 permissions:
   contents: read
-  id-token: write
 
 concurrency:
   group: publish
@@ -21,6 +33,14 @@ jobs:
   publish:
     runs-on: ubuntu-latest
     timeout-minutes: 20
+    environment: npm-publish
+    permissions:
+      contents: read
+      id-token: write
+    outputs:
+      channel: ${{ steps.guard.outputs.channel }}
+      version: ${{ steps.guard.outputs.version }}
+      tag: ${{ steps.guard.outputs.tag }}
     steps:
       - name: Checkout
         uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
@@ -43,35 +63,9 @@ jobs:
           npm install -g npm@11
           npm --version
 
-      - name: Check tag matches package version
-        working-directory: apps/local-agent
-        run: |
-          PKG_VERSION="$(node -p "require('./package.json').version")"
-          echo "package.json version: ${PKG_VERSION}"
-          if [ "${GITHUB_REF_TYPE}" = "tag" ]; then
-            if [ "${GITHUB_REF_NAME}" != "v${PKG_VERSION}" ]; then
-              echo "Tag ${GITHUB_REF_NAME} does not match package version v${PKG_VERSION}" >&2
-              exit 1
-            fi
-          else
-            git fetch --tags --force origin
-            if ! git tag --points-at HEAD | grep -qx "v${PKG_VERSION}"; then
-              echo "Manual runs must be on a commit tagged v${PKG_VERSION}" >&2
-              exit 1
-            fi
-          fi
-          if npm view "@agentreel/agent@${PKG_VERSION}" version >/dev/null 2>&1; then
-            echo "@agentreel/agent@${PKG_VERSION} is already on npm" >&2
-            exit 1
-          fi
-
-      - name: Check commit is on main
-        run: |
-          git fetch origin main
-          if ! git merge-base --is-ancestor HEAD origin/main; then
-            echo "Commit is not on main" >&2
-            exit 1
-          fi
+      - name: Check tag, version, channel, main and npm
+        id: guard
+        run: bash scripts/assert-publish-channel.sh
 
       - name: Install
         run: pnpm install --frozen-lockfile
@@ -99,6 +93,54 @@ jobs:
         working-directory: apps/local-agent
         run: npm pack --dry-run
 
-      - name: Publish with provenance
+      - name: Publish with provenance to the matching dist-tag
         working-directory: apps/local-agent
-        run: npm publish --provenance --access public
+        env:
+          CHANNEL: ${{ steps.guard.outputs.channel }}
+          EXPECTED_VERSION: ${{ steps.guard.outputs.version }}
+        run: |
+          set -euo pipefail
+          PKG_VERSION="$(node -p "require('./package.json').version")"
+          case "${CHANNEL}" in
+            latest) [[ "${PKG_VERSION}" != *-* ]] || { echo "Refusing to publish prerelease ${PKG_VERSION} to latest" >&2; exit 1; } ;;
+            alpha|beta) [[ "${PKG_VERSION}" == *"-${CHANNEL}."* ]] || { echo "Refusing to publish ${PKG_VERSION} to ${CHANNEL}" >&2; exit 1; } ;;
+            *) echo "Unexpected channel '${CHANNEL}'" >&2; exit 1 ;;
+          esac
+          if [ "${PKG_VERSION}" != "${EXPECTED_VERSION}" ]; then
+            echo "package.json changed during the run: ${PKG_VERSION} != ${EXPECTED_VERSION}" >&2
+            exit 1
+          fi
+          npm publish --tag "${CHANNEL}" --provenance --access public
+
+  github-release:
+    needs: publish
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    permissions:
+      contents: write
+    steps:
+      - name: Checkout
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+
+      - name: Create GitHub release (prerelease for alpha and beta)
+        env:
+          GH_TOKEN: ${{ github.token }}
+          CHANNEL: ${{ needs.publish.outputs.channel }}
+          TAG: ${{ needs.publish.outputs.tag }}
+          VERSION: ${{ needs.publish.outputs.version }}
+        run: |
+          set -euo pipefail
+          NOTES=".github/release-notes/v${VERSION}.md"
+          if [ "${CHANNEL}" = "latest" ]; then
+            FLAGS=(--latest)
+          else
+            FLAGS=(--prerelease --latest=false)
+          fi
+          gh release create "${TAG}" \
+            --repo "${GITHUB_REPOSITORY}" \
+            --verify-tag \
+            --title "${TAG}" \
+            --notes-file "${NOTES}" \
+            "${FLAGS[@]}"

@@ -9,6 +9,9 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Added
 
+- npm release channels: `alpha`, `beta` and `latest` dist-tags, cut from git tags `vX.Y.Z-alpha.N`, `vX.Y.Z-beta.N` and `vX.Y.Z` on `main`. The publish workflow derives the dist-tag from the tag, refuses any mismatch between the tag, `apps/local-agent/package.json` version and channel, a ref other than a release tag or `main`, and a commit not on `main`, runs in the protected `npm-publish` environment, and creates the GitHub release (prerelease for alpha and beta). Channels start on the 0.3.0 line.
+- `pnpm release:check` (`scripts/release-check.mjs`) validates the version, CHANGELOG section and link, and `.github/release-notes/v<version>.md` locally, and with `--tag` the same tag/version/channel rules as the publish workflow. It never tags or publishes.
+- `agentreel init` run through npx now pins hooks to the exact running version (`npx -y @agentreel/agent@<version>`), so prerelease users keep running the prerelease they installed instead of drifting to `latest`. Re-run `init` to move hooks to a new version.
 - Organization policy cache and local evaluator (`src/policy/*`): fetches `GET /api/v1/policy` with Bearer auth and `If-None-Match`, validates the policy schema, writes `~/.agentreel/policy.json` atomically with mode `0600`, refreshes every 5 minutes in the daemon and once on `agentreel link` and linked `agentreel init`, and falls back offline to the last-known cache or local `guard-config.json` in observe mode.
 - Synchronous, network-free policy evaluator supporting built-in Guard rule overrides, scoped custom rules (`contains`, `starts_with`, `equals`, `glob`, and RE2-safe capped `regex`), allow-list exemptions, strictest-wins precedence, and observe-mode downgrading.
 - `agentreel policy` CLI command showing policy source, ETag, cache age (clock-skew safe), mode, offline setting, and rule/allow counts.

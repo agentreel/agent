@@ -72,6 +72,27 @@ Each command should end with "no leaks found". If one finds a real secret, rotat
 
 The agentreel CLI sends anonymous usage data so we know how many people use it: one event the first time it runs, then at most one heartbeat a day. Each event carries the CLI version, OS type, and the number of sessions recorded. It never includes session content, prompts, code, file paths, or your IP address. It's identified only by a random ID stored in ~/.agentreel. To turn it off, set AGENTREEL_TELEMETRY=0 (or false, off, no) or DO_NOT_TRACK=1. Telemetry is always off in CI.
 
+## Release channels
+
+`@agentreel/agent` publishes to three npm dist-tags:
+
+| Channel | Install | Versions | Who it is for |
+| --- | --- | --- | --- |
+| `latest` | `npx @agentreel/agent init` | `X.Y.Z` | Everyone. This is the default and what agentreel.dev documents. |
+| `beta` | `npx @agentreel/agent@beta init` | `X.Y.Z-beta.N` | Testers who want the next release early. |
+| `alpha` | `npx @agentreel/agent@alpha init` | `X.Y.Z-alpha.N` | Early testers. Expect rough edges. |
+
+You can also pin one version, for example `npx @agentreel/agent@0.3.0-beta.1 init`. A prerelease never moves `latest`.
+
+When `init` runs through npx, the hooks it writes pin the exact version that ran (`npx -y @agentreel/agent@<version>`), so hooks keep using the release you chose until you run `init` again. A global install (`npm i -g @agentreel/agent@beta`, then `agentreel init`) pins the absolute path instead. To switch channel or roll back, re-run `init` from the channel you want:
+
+```bash
+npx @agentreel/agent@latest init   # back to stable
+npx @agentreel/agent@beta init     # back to beta
+```
+
+Channels start on the 0.3.0 line. Releases are cut from git tags on `main`; see [docs/releasing.md](docs/releasing.md).
+
 ## Roadmap
 
 `/govern` and `/defend` are coming soon on [agentreel.dev](https://agentreel.dev).

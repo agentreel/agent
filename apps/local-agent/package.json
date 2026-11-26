@@ -42,7 +42,8 @@
     "typecheck": "tsc --noEmit",
     "prepack": "cp ../../CHANGELOG.md CHANGELOG.md",
     "prepublishOnly": "pnpm build",
-    "test": "vitest run"
+    "test": "vitest run",
+    "release:check": "node ../../scripts/release-check.mjs"
   },
   "dependencies": {
     "better-sqlite3": "^12.11.1",

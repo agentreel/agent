@@ -7,7 +7,8 @@
     "build": "pnpm -r build",
     "agent": "pnpm --filter @agentreel/agent",
     "typecheck": "pnpm -r typecheck",
-    "test": "pnpm -r --if-present test"
+    "test": "pnpm -r --if-present test",
+    "release:check": "node scripts/release-check.mjs"
   },
   "engines": {
     "node": ">=20"
