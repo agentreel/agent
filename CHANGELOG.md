@@ -32,6 +32,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   - `\w+\s+\w+`: add a leading literal whose last char is disjoint from `\w`, e.g. `git\s+\w+\s+--force`.
   - `\S+\s+\S+`: add a leading literal disjoint from `\S`, e.g. `rm\s+\S+\s+/`.
   - `\u{1F600}\s+\w+` (non-ASCII literals are now treated as overlapping every character): use `\u{1F600}\s+\w`, which matches the same commands because rules match anywhere in the input.
+  - Any quantifier (`?`, `??`, `{0}`, `{1}`, `{0,1}`, `{1,1}`) on a group that contains an unbounded quantifier, unless its top-level branch starts with `^`. These were accepted with a single unbounded quantifier and are quadratic on an unanchored scan (`(a+)?b` took about 2.4s on 32KB of `a`). Newly rejected: `(a+)?b`, `(a*)?b`, `(a+){0,1}b`, `(?:a+)?b`, `(a+)??b`, `(a+?)?b`, `(a+){1}b`, `(?:a+){1,1}b`, `(a+){0}b`, `((a+))?b`, `(a+|c)?b`, `(?:x|a+)?b`, `(ab+)?c`, `(?:a+b)?c`, `(\w+)?\.`, `(\s+)?x`, `x(a+)?b`, `(a+)?$`, `(a+)?`, and `(https?://[a-z]+)?`. Replacements: `a*b` for `(a+)?b`, `\w*\.` for `(\w+)?\.`, `\s*x` for `(\s+)?x`, `a*b|cb` for `(a+|c)?b`, `xa*b` for `x(a+)?b`, `a*$` for `(a+)?$`, or anchor the pattern, e.g. `^git push(\s+--force)?$` and `^(https?://[a-z]+)?/admin` stay accepted.
 
 ### Fixed
 

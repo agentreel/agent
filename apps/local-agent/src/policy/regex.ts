@@ -15,6 +15,9 @@ type CharSet = Uint8Array;
 
 interface GroupFrame {
   hasQuantifier: boolean;
+  // True when the group (or any nested group) contains an unbounded
+  // quantifier. Any quantifier applied to such a group is rejected.
+  hasUnbounded: boolean;
   hasAlternation: boolean;
   allBranchesLiteralOnly: boolean;
   currentBranchLiteralOnly: boolean;
@@ -750,6 +753,7 @@ function parseBraceQuantifier(
 function createGroupFrame(): GroupFrame {
   return {
     hasQuantifier: false,
+    hasUnbounded: false,
     hasAlternation: false,
     allBranchesLiteralOnly: true,
     currentBranchLiteralOnly: true,
@@ -774,6 +778,7 @@ export function isRe2SafePattern(pattern: string): boolean {
   const topBranches: SeqToken[][] = [[]];
   let currentBranch = topBranches[0]!;
   let lastAtomWasQuantifiedGroup = false;
+  let lastAtomWasUnboundedGroup = false;
   let lastAtomWasAlternationGroup = false;
   let lastAtomWasGroup = false;
   let justOpenedGroup = false;
@@ -808,6 +813,7 @@ export function isRe2SafePattern(pattern: string): boolean {
       totalUnbounded++;
       if (stack.length > 1) {
         hasUnboundedInsideGroup = true;
+        stack[stack.length - 1]!.hasUnbounded = true;
       }
     }
     if (stack.length > 1) {
@@ -830,6 +836,19 @@ export function isRe2SafePattern(pattern: string): boolean {
       }
     }
   };
+
+  // A quantifier (?, ??, {0}, {1}, {0,1}, ...) on a group that contains an
+  // unbounded quantifier, such as (a+)?b, (?:a+){1}b or ((\w+))?\., is
+  // quadratic on an unanchored backtracking scan (measured about 2.4s on
+  // 32KB of "a" under /iu). Repeating quantifiers on such groups are already
+  // rejected via hasQuantifier. The one exemption is a top-level branch that
+  // begins with ^: patterns never compile with /m, so ^ pins the match to a
+  // single start position and the scan is linear (^(a+)?b, ^git
+  // push(\s+--force)?$). This check runs regardless of totalUnbounded.
+  const quantifiesUnboundedGroup = (): boolean =>
+    lastAtomWasGroup &&
+    lastAtomWasUnboundedGroup &&
+    !(currentBranch.length > 0 && currentBranch[0]!.isCaret);
 
   for (let i = 0; i < pattern.length; i++) {
     const ch = pattern[i]!;
@@ -880,6 +899,7 @@ export function isRe2SafePattern(pattern: string): boolean {
       }
       lastAtomWasGroup = false;
       lastAtomWasQuantifiedGroup = false;
+      lastAtomWasUnboundedGroup = false;
       lastAtomWasAlternationGroup = false;
       i = esc.end;
       continue;
@@ -903,6 +923,7 @@ export function isRe2SafePattern(pattern: string): boolean {
       i = parsed.end;
       lastAtomWasGroup = false;
       lastAtomWasQuantifiedGroup = false;
+      lastAtomWasUnboundedGroup = false;
       lastAtomWasAlternationGroup = false;
       continue;
     }
@@ -930,6 +951,7 @@ export function isRe2SafePattern(pattern: string): boolean {
       }
       lastAtomWasGroup = false;
       lastAtomWasQuantifiedGroup = false;
+      lastAtomWasUnboundedGroup = false;
       lastAtomWasAlternationGroup = false;
       continue;
     }
@@ -950,6 +972,7 @@ export function isRe2SafePattern(pattern: string): boolean {
       justOpenedGroup = true;
       lastAtomWasGroup = false;
       lastAtomWasQuantifiedGroup = false;
+      lastAtomWasUnboundedGroup = false;
       lastAtomWasAlternationGroup = false;
       continue;
     }
@@ -960,6 +983,9 @@ export function isRe2SafePattern(pattern: string): boolean {
       const parent = stack[stack.length - 1]!;
       if (closed.hasQuantifier) {
         parent.hasQuantifier = true;
+      }
+      if (closed.hasUnbounded) {
+        parent.hasUnbounded = true;
       }
       if (closed.hasAlternation) {
         parent.hasAlternation = true;
@@ -988,6 +1014,7 @@ export function isRe2SafePattern(pattern: string): boolean {
       });
       lastAtomWasGroup = true;
       lastAtomWasQuantifiedGroup = closed.hasQuantifier;
+      lastAtomWasUnboundedGroup = closed.hasUnbounded;
       lastAtomWasAlternationGroup = closed.hasAlternation;
       continue;
     }
@@ -1004,16 +1031,19 @@ export function isRe2SafePattern(pattern: string): boolean {
       if (pattern[i + 1] === "?") i++;
       lastAtomWasGroup = false;
       lastAtomWasQuantifiedGroup = false;
+      lastAtomWasUnboundedGroup = false;
       lastAtomWasAlternationGroup = false;
       continue;
     }
 
     if (ch === "?") {
+      if (quantifiesUnboundedGroup()) return false;
       applyQuantifierToLast(0, false);
       stack[stack.length - 1]!.hasQuantifier = true;
       if (pattern[i + 1] === "?") i++;
       lastAtomWasGroup = false;
       lastAtomWasQuantifiedGroup = false;
+      lastAtomWasUnboundedGroup = false;
       lastAtomWasAlternationGroup = false;
       continue;
     }
@@ -1022,6 +1052,7 @@ export function isRe2SafePattern(pattern: string): boolean {
       const parsed = parseBraceQuantifier(pattern, i);
       if (parsed) {
         if (parsed.tooLarge || parsed.invalidRange) return false;
+        if (quantifiesUnboundedGroup()) return false;
         if (parsed.repeating) {
           if (
             lastAtomWasGroup &&
@@ -1036,6 +1067,7 @@ export function isRe2SafePattern(pattern: string): boolean {
         if (pattern[i + 1] === "?") i++;
         lastAtomWasGroup = false;
         lastAtomWasQuantifiedGroup = false;
+        lastAtomWasUnboundedGroup = false;
         lastAtomWasAlternationGroup = false;
         continue;
       }
@@ -1086,6 +1118,7 @@ export function isRe2SafePattern(pattern: string): boolean {
 
     lastAtomWasGroup = false;
     lastAtomWasQuantifiedGroup = false;
+    lastAtomWasUnboundedGroup = false;
     lastAtomWasAlternationGroup = false;
   }
 

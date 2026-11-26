@@ -40,6 +40,8 @@ interface PolicyFixtureCase {
 
 interface PolicyFixturesFile {
   _note: string;
+  regex_validation: { accept: string[]; reject: string[] };
+  shipped_regex_patterns: Array<{ pattern: string; source: string }>;
   cases: PolicyFixtureCase[];
 }
 
@@ -211,7 +213,10 @@ describe("RE2-safe regex compiler, cache, and timeout guard", () => {
     expect(isRe2SafePattern("(\\w+-?)+$")).toBe(false);
     expect(isRe2SafePattern("https?://example\\.com")).toBe(true);
     expect(isRe2SafePattern("(foo|bar)?")).toBe(true);
-    expect(isRe2SafePattern("(https?://[a-z]+)?")).toBe(true);
+    expect(isRe2SafePattern("^(https?://[a-z]+)?")).toBe(true);
+    // An optional group around an unbounded quantifier is only accepted when
+    // its top-level branch is anchored with ^ (see the quantified-group rule).
+    expect(isRe2SafePattern("(https?://[a-z]+)?")).toBe(false);
   });
 
   it("statically rejects overlapping multiple unbounded quantifiers while accepting disjoint-separated org patterns", () => {
@@ -468,6 +473,140 @@ describe("RE2-safe regex compiler, cache, and timeout guard", () => {
     const elapsed = performance.now() - t0;
     expect(matched).toBe(false);
     expect(elapsed).toBeLessThan(250);
+  });
+});
+
+describe("quantified groups containing an unbounded quantifier", () => {
+  const { accept, reject } = fixtures.regex_validation;
+  const ADVERSARIAL_LENGTH = 32_768;
+  const PER_INPUT_BUDGET_MS = 25;
+  // Single-unbounded patterns stay accepted by design, but a plain unanchored
+  // backtracking scan over them is still quadratic on adversarial input (for
+  // example a+b is about 0.7s on 32KB of "a"). They rely on the
+  // REGEX_TIMEOUT_MS / evaluation deadline guard, which fails closed.
+  const KNOWN_QUADRATIC_SINGLE_UNBOUNDED = new Set([
+    ".*foo",
+    "curl[^|]*\\|",
+    "git push .*(--force|-f)\\b",
+    "(a+)b",
+    "(a+)b?",
+    "a+b",
+    "\\w+b",
+    "\\s*x",
+  ]);
+
+  // The checker compiles with /i, or /iu when the pattern needs it. Time the
+  // compiled form and, where it also parses, the /iu form of the same source.
+  function compiledVariants(pattern: string): RegExp[] {
+    const base = compileSafeRegex(pattern);
+    expect(base, `expected compiled: ${pattern}`).toBeInstanceOf(RegExp);
+    const variants = [base!];
+    if (!base!.flags.includes("u")) {
+      try {
+        variants.push(new RegExp(base!.source, "iu"));
+      } catch {
+        // Some /i-only sources (for example []]) are not valid under /u.
+      }
+    }
+    return variants;
+  }
+
+  function adversarialInputs(pattern: string): string[] {
+    const chars = new Set(["a", "A", " ", "\t", "x", "-", "/", "|", "@", ".", "0", "_", ":"]);
+    for (const ch of pattern) {
+      const code = ch.charCodeAt(0);
+      if (code >= 32 && code < 127) chars.add(ch);
+    }
+    const inputs = [...chars].map((ch) => ch.repeat(ADVERSARIAL_LENGTH));
+    const leading = /^\^?([A-Za-z0-9 :_-]+)/.exec(pattern)?.[1];
+    if (leading) {
+      for (const unit of [leading, `${leading} `]) {
+        inputs.push(unit.repeat(Math.ceil(ADVERSARIAL_LENGTH / unit.length)).slice(0, ADVERSARIAL_LENGTH));
+      }
+    }
+    return inputs;
+  }
+
+  it("fixture lists are disjoint, duplicate-free, and cover the optional-group class", () => {
+    expect(new Set(accept).size).toBe(accept.length);
+    expect(new Set(reject).size).toBe(reject.length);
+    for (const pattern of accept) expect(reject).not.toContain(pattern);
+    for (const pattern of [
+      "(a+)?b",
+      "(a*)?b",
+      "(a+){0,1}b",
+      "(?:a+)?b",
+      "(a+|c)?b",
+      "(a+){1}b",
+      "((a+))?b",
+      "(a+)?$",
+      "(https?://[a-z]+)?",
+    ]) {
+      expect(reject).toContain(pattern);
+    }
+    for (const pattern of ["^(a+)?b", "^git push(\\s+--force)?$", "(a{1,5})?b", "a+b"]) {
+      expect(accept).toContain(pattern);
+    }
+  });
+
+  it.each(accept)("accepts fixture %s", (pattern) => {
+    expect(isRe2SafePattern(pattern)).toBe(true);
+    expect(compileSafeRegex(pattern)).toBeInstanceOf(RegExp);
+  });
+
+  it.each(reject)("rejects fixture %s", (pattern) => {
+    expect(isRe2SafePattern(pattern)).toBe(false);
+    expect(compileSafeRegex(pattern)).toBeNull();
+  });
+
+  it("every shipped template, docs example, and fixture-case regex still passes the checker", () => {
+    const shipped = fixtures.shipped_regex_patterns.map((entry) => entry.pattern);
+    const fromCases = fixtures.cases
+      .filter((fixtureCase) => fixtureCase.expected_valid !== false)
+      .flatMap((fixtureCase) => fixtureCase.policy.custom ?? [])
+      .flatMap((rule) => rule.when ?? [])
+      .filter((cond) => cond.op === "regex")
+      .map((cond) => cond.value);
+    expect(shipped.length).toBeGreaterThanOrEqual(11);
+    for (const pattern of [...shipped, ...fromCases]) {
+      expect(isRe2SafePattern(pattern), `shipped pattern rejected: ${pattern}`).toBe(true);
+      expect(accept, `shipped pattern missing from accept fixtures: ${pattern}`).toContain(pattern);
+    }
+  });
+
+  it("each accepted fixture stays under a small budget on 32KB of adversarial input", () => {
+    const slow: string[] = [];
+    for (const pattern of accept) {
+      if (KNOWN_QUADRATIC_SINGLE_UNBOUNDED.has(pattern)) continue;
+      for (const re of compiledVariants(pattern)) {
+        re.test("warmup");
+        for (const input of adversarialInputs(pattern)) {
+          let best = Infinity;
+          for (let attempt = 0; attempt < 3 && best >= PER_INPUT_BUDGET_MS; attempt++) {
+            const t0 = performance.now();
+            re.test(input);
+            best = Math.min(best, performance.now() - t0);
+          }
+          if (best >= PER_INPUT_BUDGET_MS) {
+            slow.push(`${pattern} /${re.flags} on ${JSON.stringify(input.slice(0, 8))}: ${best.toFixed(1)}ms`);
+          }
+        }
+      }
+    }
+    expect(slow).toEqual([]);
+  });
+
+  it("known quadratic single-unbounded accepts stay bounded by the regex timeout guard", () => {
+    const warm = compileSafeRegex("rm\\s+-rf\\s+/")!;
+    testSafeRegex(warm, "rm" + " ".repeat(16));
+    for (const pattern of KNOWN_QUADRATIC_SINGLE_UNBOUNDED) {
+      expect(accept).toContain(pattern);
+      const re = compileSafeRegex(pattern)!;
+      expect(re).toBeInstanceOf(RegExp);
+      const t0 = performance.now();
+      testSafeRegex(re, "a".repeat(ADVERSARIAL_LENGTH), 30);
+      expect(performance.now() - t0, `timeout guard did not bound ${pattern}`).toBeLessThan(250);
+    }
   });
 });
 
