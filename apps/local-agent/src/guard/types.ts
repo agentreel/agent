@@ -50,6 +50,8 @@ export interface Finding {
   category: Category;
   timestamp: number;
   evidence: string;
+  /** "scan_timeout" when the rule hit the scan deadline and failed closed. */
+  reason?: "scan_timeout";
   context?: {
     command?: string;
     file?: string;
@@ -71,6 +73,10 @@ export interface SessionSummary {
     criticalPaths: string[];
   };
   summary: string;
+  /** True when any event hit the scan deadline (findings failed closed). */
+  timedOut?: boolean;
+  /** Rule IDs reported as fail-closed scan_timeout findings, deduplicated. */
+  timedOutRuleIds?: string[];
 }
 
 export interface GuardConfig {

@@ -163,6 +163,13 @@ function printSummary(summary: ReturnType<typeof scanSession>): void {
     );
   }
 
+  if (summary.timedOut) {
+    console.log(
+      pc.yellow(
+        `  Scan deadline: ${summary.timedOutRuleIds?.length ?? 0} rule(s) could not finish in time and are counted as findings (scan_timeout): ${(summary.timedOutRuleIds ?? []).join(", ")}`
+      )
+    );
+  }
   console.log(pc.dim(`\n${summary.summary}\n`));
 
   if (riskScore >= 50) {
