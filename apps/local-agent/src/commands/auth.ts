@@ -1,7 +1,13 @@
+import { randomBytes } from "node:crypto";
 import pc from "picocolors";
 import { readConfig, writeConfig } from "../config.js";
-import { clearCachedPolicy, readPolicyRejection } from "../policy/cache.js";
-import { fetchPolicy } from "../policy/fetch.js";
+import { POLICY_PATH } from "../paths.js";
+import {
+  clearCachedPolicy,
+  clearPolicyRejection,
+  writeCachedPolicyAtomic,
+} from "../policy/cache.js";
+import { fetchPolicy, type FetchPolicyResult } from "../policy/fetch.js";
 import { postIngest } from "../upload/client.js";
 
 export interface LogoutOpts {
@@ -34,8 +40,6 @@ export async function linkCommand(rawKey: string | undefined, opts: LinkOpts): P
   }
 
   const cfg = readConfig();
-  const previousApiKey = cfg.apiKey;
-  const previousApiBaseUrl = cfg.apiBaseUrl;
   const nextCfg = {
     ...cfg,
     apiKey: key,
@@ -50,14 +54,12 @@ export async function linkCommand(rawKey: string | undefined, opts: LinkOpts): P
     process.exit(1);
   }
   writeConfig(nextCfg);
-  const accountChanged =
-    previousApiKey !== key || previousApiBaseUrl !== nextCfg.apiBaseUrl;
-  const pendingOrgSwitch =
-    readPolicyRejection(opts.cachePath)?.reason === "org_mismatch_ignored";
-  if (accountChanged || pendingOrgSwitch) {
-    clearCachedPolicy(opts.cachePath);
-  }
-  const policyRes = await fetchPolicy({ config: nextCfg, cachePath: opts.cachePath });
+  // Explicit auth is the only path allowed to change the cached org. It always
+  // fetches fresh (no ETag) and swaps the cache only once the new policy validates.
+  const policyRes = await replacePolicyCacheForAuth(
+    nextCfg,
+    opts.cachePath ?? POLICY_PATH,
+  );
   console.log(pc.green("✓") + " Linked.");
   console.log(pc.dim("  api: ") + nextCfg.apiBaseUrl);
   console.log(pc.dim("  key: ") + key.slice(0, 12) + "…");
@@ -65,6 +67,37 @@ export async function linkCommand(rawKey: string | undefined, opts: LinkOpts): P
     console.log(
       pc.dim("  policy: ") + `${policyRes.policy.mode} (etag ${policyRes.etag})`,
     );
+  }
+}
+
+/**
+ * Explicit auth replaces the cached policy, etag, and sidecar only after a fresh
+ * policy (fetched without If-None-Match into a private staging file) validates.
+ * The swap is an atomic rename, so hooks never see a gap with no policy. If the
+ * fetch fails for any reason the previous cache stays in force (fail closed).
+ */
+async function replacePolicyCacheForAuth(
+  cfg: ReturnType<typeof readConfig>,
+  cachePath: string,
+): Promise<FetchPolicyResult> {
+  const stagingPath = `${cachePath}.auth.${process.pid}.${randomBytes(6).toString("hex")}`;
+  try {
+    const staged = await fetchPolicy({ config: cfg, cachePath: stagingPath });
+    if (staged.status === "updated") {
+      writeCachedPolicyAtomic(
+        { policy: staged.policy, etag: staged.etag, fetched_at: staged.fetchedAt },
+        cachePath,
+      );
+      clearPolicyRejection(cachePath);
+    } else {
+      console.error(
+        pc.yellow("!") +
+          " Could not fetch a valid policy; keeping the previously cached policy, if any. Run `npx @agentreel/agent auth` again to retry.",
+      );
+    }
+    return staged;
+  } finally {
+    clearCachedPolicy(stagingPath);
   }
 }
 

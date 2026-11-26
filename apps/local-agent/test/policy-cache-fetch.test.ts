@@ -1824,4 +1824,92 @@ describe("govern API v1 (C1) additive fields, repo query, 304, no-org, org_id, e
       rmSync(authHome, { recursive: true, force: true });
     }
   });
+
+  it("explicit auth keeps the old org cache when the post-validation policy fetch fails (5xx, invalid policy, network error)", async () => {
+    vi.resetModules();
+    const prevHome = process.env.HOME;
+    const authHome = mkdtempSync(join(tmpdir(), "agentreel-auth-fetchfail-"));
+    process.env.HOME = authHome;
+
+    const orgAPolicy = makePolicy({
+      etag: "etag-org-a",
+      org_id: "org_a",
+      workspace_id: "org_a",
+      mode: "enforce",
+    });
+    const orgBPolicy = makePolicy({
+      etag: "etag-org-b",
+      org_id: "org_b",
+      workspace_id: "org_b",
+      mode: "enforce",
+    });
+
+    let policyMode: "ok" | "500" | "invalid" | "drop" = "ok";
+    const srv = await startMockServer((req, res) => {
+      const pathname = new URL(req.url ?? "/", "http://127.0.0.1").pathname;
+      const authHeader = req.headers.authorization;
+      if (pathname === "/api/v1/sessions/ingest") {
+        res.writeHead(200, { "content-type": "application/json" });
+        res.end(JSON.stringify({ ok: true }));
+        return;
+      }
+      if (pathname === "/api/v1/policy") {
+        if (policyMode === "500") {
+          res.writeHead(500);
+          res.end();
+          return;
+        }
+        if (policyMode === "invalid") {
+          res.writeHead(200, { "content-type": "application/json" });
+          res.end(JSON.stringify({ version: 1, etag: "bad" }));
+          return;
+        }
+        if (policyMode === "drop") {
+          req.socket.destroy();
+          return;
+        }
+        res.writeHead(200, { "content-type": "application/json" });
+        res.end(
+          JSON.stringify(
+            authHeader === "Bearer ar_live_org_b_key" ? orgBPolicy : orgAPolicy,
+          ),
+        );
+        return;
+      }
+      res.writeHead(404);
+      res.end();
+    });
+
+    const logSpy = vi.spyOn(console, "log").mockImplementation(() => {});
+    const errSpy = vi.spyOn(console, "error").mockImplementation(() => {});
+
+    try {
+      const { linkCommand } = await import("../src/commands/auth.js");
+      const { POLICY_PATH } = await import("../src/paths.js");
+      const { readCachedPolicy: readCachedFresh } = await import("../src/policy/cache.js");
+
+      await linkCommand("ar_live_org_a_key", { api: srv.url });
+      expect(readCachedFresh(POLICY_PATH)?.policy.org_id).toBe("org_a");
+
+      for (const mode of ["500", "invalid", "drop"] as const) {
+        policyMode = mode;
+        await linkCommand("ar_live_org_b_key", { api: srv.url });
+        const cached = readCachedFresh(POLICY_PATH);
+        expect(cached?.policy.org_id, `mode ${mode}`).toBe("org_a");
+        expect(cached?.etag, `mode ${mode}`).toBe("etag-org-a");
+      }
+
+      // A later successful explicit auth still switches orgs.
+      policyMode = "ok";
+      await linkCommand("ar_live_org_b_key", { api: srv.url });
+      expect(readCachedFresh(POLICY_PATH)?.policy.org_id).toBe("org_b");
+      expect(readCachedFresh(POLICY_PATH)?.etag).toBe("etag-org-b");
+    } finally {
+      logSpy.mockRestore();
+      errSpy.mockRestore();
+      await srv.close();
+      process.env.HOME = prevHome;
+      rmSync(authHome, { recursive: true, force: true });
+    }
+  });
 });
