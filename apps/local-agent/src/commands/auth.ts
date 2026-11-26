@@ -1,18 +1,31 @@
+import { randomBytes } from "node:crypto";
 import pc from "picocolors";
 import { readConfig, writeConfig } from "../config.js";
-import { fetchPolicy } from "../policy/fetch.js";
+import { POLICY_PATH } from "../paths.js";
+import {
+  clearCachedPolicy,
+  clearPolicyRejection,
+  writeCachedPolicyAtomic,
+} from "../policy/cache.js";
+import { fetchPolicy, type FetchPolicyResult } from "../policy/fetch.js";
 import { postIngest } from "../upload/client.js";
 
-export async function logoutCommand(): Promise<void> {
+export interface LogoutOpts {
+  cachePath?: string;
+}
+
+export async function logoutCommand(opts: LogoutOpts = {}): Promise<void> {
   const cfg = readConfig();
   cfg.apiKey = undefined;
   cfg.workspaceId = undefined;
   writeConfig(cfg);
+  clearCachedPolicy(opts.cachePath);
   console.log(pc.green("✓") + " Cleared local credentials.");
 }
 
 interface LinkOpts {
   api?: string;
+  cachePath?: string;
 }
 
 export async function linkCommand(rawKey: string | undefined, opts: LinkOpts): Promise<void> {
@@ -27,25 +40,64 @@ export async function linkCommand(rawKey: string | undefined, opts: LinkOpts): P
   }
 
   const cfg = readConfig();
-  cfg.apiKey = key;
-  if (opts.api) cfg.apiBaseUrl = opts.api;
+  const nextCfg = {
+    ...cfg,
+    apiKey: key,
+    ...(opts.api ? { apiBaseUrl: opts.api } : {}),
+  };
 
-  console.log(pc.dim(`  validating against ${cfg.apiBaseUrl}…`));
+  console.log(pc.dim(`  validating against ${nextCfg.apiBaseUrl}…`));
   try {
-    await postIngest(cfg, {});
+    await postIngest(nextCfg, {});
   } catch (err) {
     console.error(pc.red("✗ Validation failed: ") + (err as Error).message);
     process.exit(1);
   }
-  writeConfig(cfg);
-  const policyRes = await fetchPolicy({ config: cfg });
+  writeConfig(nextCfg);
+  // Explicit auth is the only path allowed to change the cached org. It always
+  // fetches fresh (no ETag) and swaps the cache only once the new policy validates.
+  const policyRes = await replacePolicyCacheForAuth(
+    nextCfg,
+    opts.cachePath ?? POLICY_PATH,
+  );
   console.log(pc.green("✓") + " Linked.");
-  console.log(pc.dim("  api: ") + cfg.apiBaseUrl);
+  console.log(pc.dim("  api: ") + nextCfg.apiBaseUrl);
   console.log(pc.dim("  key: ") + key.slice(0, 12) + "…");
   if (policyRes.status === "updated" || policyRes.status === "not_modified") {
     console.log(
       pc.dim("  policy: ") + `${policyRes.policy.mode} (etag ${policyRes.etag})`,
     );
+  }
+}
+
+/**
+ * Explicit auth replaces the cached policy, etag, and sidecar only after a fresh
+ * policy (fetched without If-None-Match into a private staging file) validates.
+ * The swap is an atomic rename, so hooks never see a gap with no policy. If the
+ * fetch fails for any reason the previous cache stays in force (fail closed).
+ */
+async function replacePolicyCacheForAuth(
+  cfg: ReturnType<typeof readConfig>,
+  cachePath: string,
+): Promise<FetchPolicyResult> {
+  const stagingPath = `${cachePath}.auth.${process.pid}.${randomBytes(6).toString("hex")}`;
+  try {
+    const staged = await fetchPolicy({ config: cfg, cachePath: stagingPath });
+    if (staged.status === "updated") {
+      writeCachedPolicyAtomic(
+        { policy: staged.policy, etag: staged.etag, fetched_at: staged.fetchedAt },
+        cachePath,
+      );
+      clearPolicyRejection(cachePath);
+    } else {
+      console.error(
+        pc.yellow("!") +
+          " Could not fetch a valid policy; keeping the previously cached policy, if any. Run `npx @agentreel/agent auth` again to retry.",
+      );
+    }
+    return staged;
+  } finally {
+    clearCachedPolicy(stagingPath);
   }
 }
 

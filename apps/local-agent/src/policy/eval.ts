@@ -2,15 +2,17 @@ import { matchRule } from "../guard/matcher.js";
 import { RULES } from "../guard/rules.js";
 import type { MatchContext, Rule, Severity } from "../guard/types.js";
 import { compileSafeRegex, testSafeRegex } from "./regex.js";
-import type {
-  CustomRule,
-  CustomRuleCondition,
-  CustomRuleScope,
-  Policy,
-  PolicyAction,
-  PolicyDecisionAction,
-  PolicyTool,
-  RuleApprovalConfig,
+import {
+  isNoOrgPolicy,
+  resolveEffectiveRuleApproval,
+  type CustomRule,
+  type CustomRuleCondition,
+  type CustomRuleScope,
+  type Policy,
+  type PolicyAction,
+  type PolicyDecisionAction,
+  type PolicyTool,
+  type RuleApprovalConfig,
 } from "./types.js";
 
 export const POLICY_EVAL_DEADLINE_MS = 50;
@@ -260,6 +262,8 @@ function matchesScope(
       return false;
     }
   }
+
+  // scope.teams is display-only in the CLI; team filtering happens on the server.
 
   if (scope.tools && scope.tools.length > 0) {
     if (!scope.tools.includes(input.tool)) {
@@ -599,7 +603,7 @@ export function evaluatePolicy(
     timedOut: false,
   };
 
-  if (isExemptByAllowLists(input, policy)) {
+  if (isNoOrgPolicy(policy) || isExemptByAllowLists(input, policy)) {
     return {
       action: "allow",
       rule_ids: [],
@@ -657,6 +661,13 @@ export function evaluatePolicy(
     const finding = matchRule(entry.effectiveRule, ctx);
     if (finding) {
       const severity: Severity = entry.override?.severity ?? finding.severity;
+      const effectiveApproval =
+        entry.action === "require_approval"
+          ? resolveEffectiveRuleApproval(
+              entry.override?.approval,
+              policy.approval_defaults,
+            )
+          : entry.override?.approval;
       matches.push({
         rule_id: entry.rule.id,
         name: entry.rule.name,
@@ -664,9 +675,7 @@ export function evaluatePolicy(
         action: entry.action,
         severity,
         source: "builtin",
-        ...(entry.override?.approval
-          ? { approval: entry.override.approval }
-          : {}),
+        ...(effectiveApproval ? { approval: effectiveApproval } : {}),
       });
     }
     const hasMoreRules =
@@ -696,6 +705,10 @@ export function evaluatePolicy(
     const state: RuleEvalState = { compileFailed: false };
     const matched = matchesCustomRule(rule, input, clock, state);
     if (matched) {
+      const effectiveApproval =
+        rule.action === "require_approval"
+          ? resolveEffectiveRuleApproval(rule.approval, policy.approval_defaults)
+          : rule.approval;
       matches.push({
         rule_id: rule.id,
         name: rule.name,
@@ -703,7 +716,7 @@ export function evaluatePolicy(
         action: rule.action,
         severity: rule.severity,
         source: "custom",
-        ...(rule.approval ? { approval: rule.approval } : {}),
+        ...(effectiveApproval ? { approval: effectiveApproval } : {}),
       });
       if (i + 1 < orderedCustom.length && checkExpired(clock)) {
         return finalizeTimeout(

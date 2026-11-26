@@ -718,7 +718,7 @@ describe("remote approval flow", () => {
   });
 
   it("denies on timeout even if offline_fallback is allow", async () => {
-    const policy = makeApprovalPolicy({ expires_s: 0.08, offline_fallback: "allow" });
+    const policy = makeApprovalPolicy({ expires_s: 10, offline_fallback: "allow" });
     cache.writeCachedPolicyAtomic(
       { policy, etag: policy.etag, fetched_at: Date.now() },
       cachePath,
@@ -728,10 +728,17 @@ describe("remote approval flow", () => {
       if (req.method === "POST") {
         await readRequestBody(req);
         res.writeHead(200, { "content-type": "application/json" });
-        res.end(JSON.stringify({ approval_id: "apr_to", status: "pending", poll_after_ms: 5 }));
+        res.end(
+          JSON.stringify({
+            approval_id: "apr_to",
+            status: "pending",
+            poll_after_ms: 5,
+            expires_at: new Date(Date.now() + 80).toISOString(),
+          }),
+        );
         return;
       }
-      // Hang longer than expires_s to force a timeout
+      // Hang longer than effective expiry to force a timeout
       await new Promise((r) => setTimeout(r, 300));
       if (!res.writableEnded) {
         res.writeHead(200, { "content-type": "application/json" });
@@ -2126,7 +2133,7 @@ describe("hook deadline enforcement, timeout pre-check, init recording, and doct
     expect(outcome.decision?.approval_status).toBe("timeout");
   });
 
-  it("denies as timeout (never offline_allow) when expires_s (5s) is tighter than hook deadline (60s) and 500 arrives at 6s", async () => {
+  it("denies as timeout (never offline_allow) when expires_s (10s) is tighter than hook deadline (60s) and 500 arrives at 11s", async () => {
     await import("../src/policy/approval.js");
     vi.useFakeTimers();
     const baseTime = 1_764_405_000_000;
@@ -2138,7 +2145,7 @@ describe("hook deadline enforcement, timeout pre-check, init recording, and doct
         GIT001: {
           enabled: true,
           action: "require_approval",
-          approval: { expires_s: 5, offline_fallback: "allow" },
+          approval: { expires_s: 10, offline_fallback: "allow" },
         },
       },
     });
@@ -2148,12 +2155,12 @@ describe("hook deadline enforcement, timeout pre-check, init recording, and doct
     );
 
     const hookDeadlineMs = baseTime + 60_000;
-    // HTTP 500 arrives at 6s: past expires_s (5s), well before hookDeadlineMs (60s).
+    // HTTP 500 arrives at 11s: past expires_s (10s), well before hookDeadlineMs (60s).
     const fetchImpl: typeof fetch = () =>
       new Promise<Response>((resolve) => {
         setTimeout(() => {
           resolve(new Response(JSON.stringify({ error: "server error" }), { status: 500 }));
-        }, 6_000);
+        }, 11_000);
       });
 
     const outcomePromise = enforce.enforcePreExec(
@@ -2176,7 +2183,7 @@ describe("hook deadline enforcement, timeout pre-check, init recording, and doct
       },
     );
 
-    await vi.advanceTimersByTimeAsync(6_000);
+    await vi.advanceTimersByTimeAsync(11_000);
     const outcome = await outcomePromise;
     expect(outcome.permitted).toBe(false);
     expect(outcome.enforced).toBe(true);
@@ -3112,5 +3119,536 @@ describe("pause and AGENTREEL_DISABLE=1 keep enforcing org policy without captur
     expect(flagPayload.enforced).toBe(false);
     expect(flagPayload.reason).toBe("invalid_rule");
     expect(flagPayload.rule_id).toBe("cust_cached_bad_flag");
+  });
+});
+
+describe("C1 additive enforcement: no-org, approval_defaults, POST 201/200/409, and GET expires_at min", () => {
+  afterEach(() => {
+    vi.useRealTimers();
+  });
+
+  it("permits calls with zero enforcement or decisions when cached policy has org_id null (no-org)", async () => {
+    const noOrgPolicy: Policy = {
+      version: 1,
+      etag: "etag-no-org-enforce",
+      org_id: null,
+      workspace_id: null,
+      updated_at: "2026-11-26T00:00:00Z",
+      mode: "observe",
+      offline: "last_known",
+      builtin: {},
+      custom: [],
+      allow: { commands: [], paths: [], repos: [] },
+    };
+    cache.writeCachedPolicyAtomic(
+      { policy: noOrgPolicy, etag: noOrgPolicy.etag, fetched_at: Date.now() },
+      cachePath,
+    );
+
+    const decisions: AgentEvent[] = [];
+    const res = await enforce.enforcePreExec(
+      {
+        sessionId: "sess-no-org",
+        tool: "claude-code",
+        toolName: "Bash",
+        command: "rm -rf ~",
+      },
+      {
+        cachePath,
+        guardConfigPath,
+        config: makeConfig(),
+        recordDecision: (e) => decisions.push(e),
+      },
+    );
+
+    expect(res.permitted).toBe(true);
+    expect(res.action).toBe("allow");
+    expect(res.enforced).toBe(false);
+    expect(decisions).toEqual([]);
+  });
+
+  it("enforce.ts no-org guard short-circuits enforcePreExec before evaluateFn is invoked", async () => {
+    const noOrgPolicy: Policy = {
+      version: 1,
+      etag: "etag-no-org-guard-direct",
+      org_id: null,
+      workspace_id: null,
+      updated_at: "2026-11-26T00:00:00Z",
+      mode: "observe",
+      offline: "last_known",
+      builtin: {},
+      custom: [],
+      allow: { commands: [], paths: [], repos: [] },
+    };
+    cache.writeCachedPolicyAtomic(
+      { policy: noOrgPolicy, etag: noOrgPolicy.etag, fetched_at: Date.now() },
+      cachePath,
+    );
+
+    const evaluateSpy = vi.fn(() => ({
+      action: "block" as const,
+      rule_ids: ["SHOULD_NOT_RUN"],
+      matches: [
+        {
+          rule_id: "SHOULD_NOT_RUN",
+          name: "Should not run",
+          message: "Should not run",
+          action: "block" as const,
+          severity: "critical" as const,
+          source: "custom" as const,
+        },
+      ],
+      downgraded: false,
+    }));
+    const decisions: AgentEvent[] = [];
+
+    const res = await enforce.enforcePreExec(
+      {
+        sessionId: "sess-no-org-guard-only",
+        tool: "claude-code",
+        toolName: "Bash",
+        command: "sudo rm -rf /",
+      },
+      {
+        cachePath,
+        guardConfigPath,
+        config: makeConfig(),
+        evaluateFn: evaluateSpy,
+        recordDecision: (e) => decisions.push(e),
+      },
+    );
+
+    expect(evaluateSpy).not.toHaveBeenCalled();
+    expect(res).toEqual({
+      permitted: true,
+      action: "allow",
+      enforced: false,
+      downgraded: false,
+    });
+    expect(decisions).toEqual([]);
+  });
+
+  it("applies approval_defaults to builtin require_approval entries and keeps hook_timeout_too_short check", async () => {
+    // 1. approval_defaults.expires_s=180 exceeds installedTimeoutS(130)-5=125 -> hook_timeout_too_short, no POST
+    const tooShortPolicy = makeEnforcePolicy({
+      etag: "etag-defaults-too-short",
+      approval_defaults: { expires_s: 180, offline_fallback: "allow" },
+      builtin: {
+        GIT001: { enabled: true, action: "require_approval" },
+      },
+    });
+    cache.writeCachedPolicyAtomic(
+      { policy: tooShortPolicy, etag: tooShortPolicy.etag, fetched_at: Date.now() },
+      cachePath,
+    );
+
+    let postCalls = 0;
+    const fetchImpl: typeof fetch = async () => {
+      postCalls++;
+      return new Response(JSON.stringify({ approval_id: "apr_unused", status: "approved" }), {
+        status: 201,
+      });
+    };
+
+    const shortRes = await enforce.enforcePreExec(
+      {
+        sessionId: "sess-defaults-short",
+        tool: "claude-code",
+        toolName: "Bash",
+        command: "git push --force origin main",
+      },
+      {
+        cachePath,
+        guardConfigPath,
+        config: makeConfig("https://api.agentreel.dev", "ar_live_key", {
+          installedHookTimeouts: { claude: 130, cursor: 130 },
+        }),
+        fetchImpl,
+        onWaiting: () => {},
+        recordDecision: () => {},
+      },
+    );
+    expect(shortRes.permitted).toBe(false);
+    expect(shortRes.reason).toBe(enforce.HOOK_TIMEOUT_TOO_SHORT_REASON);
+    expect(postCalls).toBe(0);
+
+    // 2. approval_defaults offline_fallback:"allow" applies to builtin without per-rule approval
+    const defaultsAllowPolicy = makeEnforcePolicy({
+      etag: "etag-defaults-allow",
+      approval_defaults: { expires_s: 60, offline_fallback: "allow" },
+      builtin: {
+        GIT001: { enabled: true, action: "require_approval" },
+      },
+    });
+    cache.writeCachedPolicyAtomic(
+      { policy: defaultsAllowPolicy, etag: defaultsAllowPolicy.etag, fetched_at: Date.now() },
+      cachePath,
+    );
+
+    const failingFetch: typeof fetch = async () =>
+      new Response(JSON.stringify({ error: "down" }), { status: 503 });
+
+    const allowRes = await enforce.enforcePreExec(
+      {
+        sessionId: "sess-defaults-allow",
+        tool: "claude-code",
+        toolName: "Bash",
+        command: "git push --force origin main",
+      },
+      {
+        cachePath,
+        guardConfigPath,
+        config: makeConfig("https://api.agentreel.dev", "ar_live_key"),
+        fetchImpl: failingFetch,
+        postRetries: 0,
+        onWaiting: () => {},
+        recordDecision: () => {},
+      },
+    );
+    expect(allowRes.permitted).toBe(true);
+    expect(allowRes.downgraded).toBe(true);
+    expect(allowRes.decision?.approval_status).toBe("offline_allow");
+  });
+
+  it("POST approvals treats 201 created and 200 same-payload replay identically", async () => {
+    const policy = makeEnforcePolicy({
+      etag: "etag-post-200-201",
+      builtin: {
+        GIT001: {
+          enabled: true,
+          action: "require_approval",
+          approval: { expires_s: 30, offline_fallback: "deny" },
+        },
+      },
+    });
+    cache.writeCachedPolicyAtomic(
+      { policy, etag: policy.etag, fetched_at: Date.now() },
+      cachePath,
+    );
+
+    for (const postStatus of [201, 200]) {
+      let polls = 0;
+      const fetchImpl: typeof fetch = async (_url, init) => {
+        if (init?.method === "POST") {
+          return new Response(
+            JSON.stringify({ approval_id: `apr_${postStatus}`, status: "pending", poll_after_ms: 1 }),
+            { status: postStatus, headers: { "content-type": "application/json" } },
+          );
+        }
+        polls++;
+        return new Response(
+          JSON.stringify({ status: "approved", decided_by: "admin@acme.com" }),
+          { status: 200, headers: { "content-type": "application/json" } },
+        );
+      };
+
+      const res = await enforce.enforcePreExec(
+        {
+          sessionId: `sess-post-${postStatus}`,
+          tool: "claude-code",
+          toolName: "Bash",
+          command: "git push --force origin main",
+        },
+        {
+          cachePath,
+          guardConfigPath,
+          config: makeConfig("https://api.agentreel.dev", "ar_live_key"),
+          fetchImpl,
+          minPollDelayMs: 1,
+          onWaiting: () => {},
+          recordDecision: () => {},
+        },
+      );
+      expect(res.permitted).toBe(true);
+      expect(res.decision?.approval_status).toBe("approved");
+      expect(res.decision?.approval_id).toBe(`apr_${postStatus}`);
+      expect(polls).toBe(1);
+    }
+  });
+
+  it("POST approvals 409 logs a client bug, does not retry, falls back to effective offline_fallback (deny default), and respects deadline guard", async () => {
+    // Case A: default offline_fallback (deny) -> offline_deny + logged client bug, no retry
+    const denyPolicy = makeEnforcePolicy({
+      etag: "etag-409-deny",
+      builtin: {
+        GIT001: { enabled: true, action: "require_approval" },
+      },
+    });
+    cache.writeCachedPolicyAtomic(
+      { policy: denyPolicy, etag: denyPolicy.etag, fetched_at: Date.now() },
+      cachePath,
+    );
+
+    let postCountA = 0;
+    const logsA: string[] = [];
+    const fetch409: typeof fetch = async () => {
+      postCountA++;
+      return new Response(JSON.stringify({ error: "decision_id conflict" }), {
+        status: 409,
+        headers: { "content-type": "application/json" },
+      });
+    };
+
+    const resA = await enforce.enforcePreExec(
+      {
+        sessionId: "sess-409-deny",
+        tool: "claude-code",
+        toolName: "Bash",
+        command: "git push --force origin main",
+      },
+      {
+        cachePath,
+        guardConfigPath,
+        config: makeConfig("https://api.agentreel.dev", "ar_live_key"),
+        fetchImpl: fetch409,
+        postRetries: 2,
+        onWaiting: () => {},
+        recordDecision: () => {},
+        log: (m) => logsA.push(m),
+      },
+    );
+
+    expect(postCountA).toBe(1);
+    expect(resA.permitted).toBe(false);
+    expect(resA.enforced).toBe(true);
+    expect(resA.decision?.approval_status).toBe("offline_deny");
+    expect(logsA.some((l) => l.includes("client bug") && l.includes("409"))).toBe(true);
+
+    // Case B: offline_fallback allow -> offline_allow when before deadline, but timeout (deny) when at/past deadline
+    await import("../src/policy/approval.js");
+    vi.useFakeTimers();
+    const baseTime = 1_764_600_000_000;
+    vi.setSystemTime(baseTime);
+
+    const allowPolicy = makeEnforcePolicy({
+      etag: "etag-409-allow-deadline",
+      approval_defaults: { expires_s: 20, offline_fallback: "allow" },
+      builtin: {
+        GIT001: { enabled: true, action: "require_approval" },
+      },
+    });
+    cache.writeCachedPolicyAtomic(
+      { policy: allowPolicy, etag: allowPolicy.etag, fetched_at: baseTime },
+      cachePath,
+    );
+
+    // Before deadline -> offline_allow
+    const logsB: string[] = [];
+    const resB = await enforce.enforcePreExec(
+      {
+        sessionId: "sess-409-allow",
+        tool: "claude-code",
+        toolName: "Bash",
+        command: "git push --force origin main",
+      },
+      {
+        cachePath,
+        guardConfigPath,
+        config: makeConfig("https://api.agentreel.dev", "ar_live_key"),
+        hookDeadlineMs: baseTime + 60_000,
+        fetchImpl: async () => new Response(JSON.stringify({ error: "conflict" }), { status: 409 }),
+        onWaiting: () => {},
+        recordDecision: () => {},
+        log: (m) => logsB.push(m),
+      },
+    );
+    expect(resB.permitted).toBe(true);
+    expect(resB.downgraded).toBe(true);
+    expect(resB.decision?.approval_status).toBe("offline_allow");
+    expect(logsB.some((l) => l.includes("client bug") && l.includes("409"))).toBe(true);
+
+    // At/past deadline -> timeout (never offline_allow)
+    const lateFetch: typeof fetch = () =>
+      new Promise<Response>((resolve) => {
+        setTimeout(() => {
+          resolve(new Response(JSON.stringify({ error: "conflict" }), { status: 409 }));
+        }, 21_000);
+      });
+
+    const latePromise = enforce.enforcePreExec(
+      {
+        sessionId: "sess-409-late",
+        tool: "claude-code",
+        toolName: "Bash",
+        command: "git push --force origin main",
+      },
+      {
+        cachePath,
+        guardConfigPath,
+        config: makeConfig("https://api.agentreel.dev", "ar_live_key"),
+        hookDeadlineMs: baseTime + 60_000,
+        fetchImpl: lateFetch,
+        onWaiting: () => {},
+        recordDecision: () => {},
+        log: () => {},
+      },
+    );
+    await vi.advanceTimersByTimeAsync(21_000);
+    const lateRes = await latePromise;
+    expect(lateRes.permitted).toBe(false);
+    expect(lateRes.enforced).toBe(true);
+    expect(lateRes.decision?.approval_status).toBe("timeout");
+  });
+
+  it("GET approvals reads expires_at and uses min(local expiry, server expires_at) as effective expiry", async () => {
+    await import("../src/policy/approval.js");
+    vi.useFakeTimers();
+    const baseTime = 1_764_610_000_000;
+    vi.setSystemTime(baseTime);
+
+    const policy = makeEnforcePolicy({
+      etag: "etag-get-expires-at",
+      builtin: {
+        GIT001: {
+          enabled: true,
+          action: "require_approval",
+          approval: { expires_s: 90, offline_fallback: "allow" },
+        },
+      },
+    });
+    cache.writeCachedPolicyAtomic(
+      { policy, etag: policy.etag, fetched_at: baseTime },
+      cachePath,
+    );
+
+    // Part 1: GET echoes an EARLIER expires_at (+15s vs local +90s) -> tightens to +15s
+    const seenPollUrls: string[] = [];
+    let pollIdx = 0;
+    const fetchTighter: typeof fetch = async (input, init) => {
+      const url = typeof input === "string" ? input : input.toString();
+      if (init?.method === "POST") {
+        // POST omits expires_at; only GET echoes it.
+        return new Response(
+          JSON.stringify({ approval_id: "apr_tighter", status: "pending" }),
+          { status: 201, headers: { "content-type": "application/json" } },
+        );
+      }
+      seenPollUrls.push(url);
+      pollIdx++;
+      if (pollIdx === 1) {
+        // First poll finishes at +5s and echoes expires_at at +15s (tighter than +90s).
+        return new Promise<Response>((resolve) => {
+          setTimeout(() => {
+            resolve(
+              new Response(
+                JSON.stringify({
+                  status: "pending",
+                  expires_at: new Date(baseTime + 15_000).toISOString(),
+                }),
+                { status: 200, headers: { "content-type": "application/json" } },
+              ),
+            );
+          }, 5_000);
+        });
+      }
+      // Second poll hangs until aborted at the tightened +15s expiry.
+      return new Promise<Response>((_resolve, reject) => {
+        init?.signal?.addEventListener("abort", () => {
+          const err = new Error("aborted");
+          err.name = "AbortError";
+          reject(err);
+        });
+      });
+    };
+
+    const tighterPromise = enforce.enforcePreExec(
+      {
+        sessionId: "sess-get-expires-tighter",
+        tool: "claude-code",
+        toolName: "Bash",
+        command: "git push --force origin main",
+      },
+      {
+        cachePath,
+        guardConfigPath,
+        config: makeConfig("https://api.agentreel.dev", "ar_live_key"),
+        hookDeadlineMs: baseTime + 125_000,
+        fetchImpl: fetchTighter,
+        onWaiting: () => {},
+        recordDecision: () => {},
+      },
+    );
+
+    // Advancing 15s (far less than local 90s) must hit timeout because GET echoed +15s.
+    await vi.advanceTimersByTimeAsync(15_000);
+    const tighterRes = await tighterPromise;
+    expect(tighterRes.permitted).toBe(false);
+    expect(tighterRes.decision?.approval_status).toBe("timeout");
+    expect(seenPollUrls[0]).toContain("?wait=25s");
+    expect(seenPollUrls[1]).toContain("?wait=10s");
+
+    // Part 2: GET echoes a LATER expires_at (+300s vs local +20s) -> stays capped at local +20s
+    const baseTime2 = 1_764_620_000_000;
+    vi.setSystemTime(baseTime2);
+    const shortLocalPolicy = makeEnforcePolicy({
+      etag: "etag-get-expires-later",
+      builtin: {
+        GIT001: {
+          enabled: true,
+          action: "require_approval",
+          approval: { expires_s: 20, offline_fallback: "allow" },
+        },
+      },
+    });
+    cache.writeCachedPolicyAtomic(
+      { policy: shortLocalPolicy, etag: shortLocalPolicy.etag, fetched_at: baseTime2 },
+      cachePath,
+    );
+
+    let pollIdx2 = 0;
+    const fetchLater: typeof fetch = async (_input, init) => {
+      if (init?.method === "POST") {
+        return new Response(
+          JSON.stringify({ approval_id: "apr_later", status: "pending" }),
+          { status: 201, headers: { "content-type": "application/json" } },
+        );
+      }
+      pollIdx2++;
+      if (pollIdx2 === 1) {
+        return new Promise<Response>((resolve) => {
+          setTimeout(() => {
+            resolve(
+              new Response(
+                JSON.stringify({
+                  status: "pending",
+                  expires_at: new Date(baseTime2 + 300_000).toISOString(),
+                }),
+                { status: 200, headers: { "content-type": "application/json" } },
+              ),
+            );
+          }, 5_000);
+        });
+      }
+      return new Promise<Response>((_resolve, reject) => {
+        init?.signal?.addEventListener("abort", () => {
+          const err = new Error("aborted");
+          err.name = "AbortError";
+          reject(err);
+        });
+      });
+    };
+
+    const laterPromise = enforce.enforcePreExec(
+      {
+        sessionId: "sess-get-expires-later",
+        tool: "claude-code",
+        toolName: "Bash",
+        command: "git push --force origin main",
+      },
+      {
+        cachePath,
+        guardConfigPath,
+        config: makeConfig("https://api.agentreel.dev", "ar_live_key"),
+        hookDeadlineMs: baseTime2 + 125_000,
+        fetchImpl: fetchLater,
+        onWaiting: () => {},
+        recordDecision: () => {},
+      },
+    );
+
+    await vi.advanceTimersByTimeAsync(20_000);
+    const laterRes = await laterPromise;
+    expect(laterRes.permitted).toBe(false);
+    expect(laterRes.decision?.approval_status).toBe("timeout");
   });
 });

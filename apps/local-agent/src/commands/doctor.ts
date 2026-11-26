@@ -26,6 +26,7 @@ import {
   computeMaxPolicyApprovalExpiresS,
   computePreExecTimeoutS,
   HOOK_DEADLINE_MARGIN_S,
+  isNoOrgPolicy,
 } from "../policy/types.js";
 
 function formatDuration(ms: number): string {
@@ -50,6 +51,7 @@ export interface DoctorInspectOptions {
 
 export interface DoctorReport {
   policyLoaded: boolean;
+  noOrgPolicy: boolean;
   policySource: PolicySource;
   mode: string;
   offline: string;
@@ -117,10 +119,13 @@ export function inspectDoctorState(opts: DoctorInspectOptions = {}): DoctorRepor
 
   const capturePaused = isCapturePaused(cfg);
   const lastRejection = readPolicyRejection(opts.cachePath ?? POLICY_PATH);
+  const noOrgPolicy =
+    loaded.source === "server_cache" && isNoOrgPolicy(policy);
 
   const enforcementActive =
     loaded.source === "server_cache" &&
     policy !== null &&
+    !noOrgPolicy &&
     policy.mode === "enforce" &&
     !(policy.offline === "fail_open" && stale);
 
@@ -160,6 +165,7 @@ export function inspectDoctorState(opts: DoctorInspectOptions = {}): DoctorRepor
 
   return {
     policyLoaded: policy !== null,
+    noOrgPolicy,
     policySource: loaded.source,
     mode: policy ? policy.mode : "none",
     offline: policy ? policy.offline : "none",
@@ -207,14 +213,16 @@ function formatRecordedTimeoutLabel(
 export function formatDoctorReport(report: DoctorReport): string {
   const enforcementLabel = report.enforcementActive
     ? pc.green("active (enforce)")
-    : report.policySource === "server_cache" &&
-        report.mode === "enforce" &&
-        report.offline === "fail_open" &&
-        report.stale
-      ? pc.yellow("paused (policy stale, fail_open)")
-      : report.policyLoaded
-        ? pc.yellow(`observe only (${report.mode})`)
-        : pc.dim("inactive (no policy loaded)");
+    : report.noOrgPolicy
+      ? pc.dim("inactive (no org policy)")
+      : report.policySource === "server_cache" &&
+          report.mode === "enforce" &&
+          report.offline === "fail_open" &&
+          report.stale
+        ? pc.yellow("paused (policy stale, fail_open)")
+        : report.policyLoaded
+          ? pc.yellow(`observe only (${report.mode})`)
+          : pc.dim("inactive (no policy loaded)");
 
   const captureLabel = report.capturePaused
     ? pc.yellow("paused (recording stopped; org policy still enforced)")
@@ -242,7 +250,7 @@ export function formatDoctorReport(report: DoctorReport): string {
     "",
     `  capture:        ${captureLabel}`,
     `  enforcement:    ${enforcementLabel}`,
-    `  policy loaded:  ${report.policyLoaded ? pc.green("yes") : pc.dim("no")} (${report.policySource})`,
+    `  policy loaded:  ${report.noOrgPolicy ? pc.dim("no org policy (cached)") : report.policyLoaded ? `${pc.green("yes")} (${report.policySource})` : `${pc.dim("no")} (${report.policySource})`}`,
     `  mode:           ${report.policyLoaded ? report.mode : pc.dim("none")}`,
     `  offline:        ${report.policyLoaded ? report.offline : pc.dim("none")}`,
     `  etag:           ${report.etag ?? pc.dim("none")}`,
@@ -263,15 +271,20 @@ export function formatDoctorReport(report: DoctorReport): string {
   }
 
   if (report.lastRejection) {
-    const hasCachedServerPolicy = report.policySource === "server_cache";
+    const hasCachedServerPolicy =
+      report.policySource === "server_cache" && !report.noOrgPolicy;
     const suffix = hasCachedServerPolicy
       ? "last known policy still in use"
       : "the rejected policy was not installed and org enforcement is off until a valid policy is cached";
     const rejectionMsg =
-      report.lastRejection.reason === "unsupported_regex" &&
-      report.lastRejection.rule_id
-        ? `policy rejected by agent: rule ${report.lastRejection.rule_id} has an unsupported regex; ${suffix}`
-        : `policy rejected by agent: ${report.lastRejection.error}; ${suffix}`;
+      report.lastRejection.reason === "no_org_ignored"
+        ? report.lastRejection.error
+        : report.lastRejection.reason === "org_mismatch_ignored"
+          ? `${report.lastRejection.error}; run \`npx @agentreel/agent auth\` to switch orgs`
+          : report.lastRejection.reason === "unsupported_regex" &&
+              report.lastRejection.rule_id
+            ? `policy rejected by agent: rule ${report.lastRejection.rule_id} has an unsupported regex; ${suffix}`
+            : `policy rejected by agent: ${report.lastRejection.error}; ${suffix}`;
     lines.push("", pc.yellow(`  warning:        ${rejectionMsg}`));
   }
 

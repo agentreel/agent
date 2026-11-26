@@ -6,6 +6,7 @@ import {
   type LoadPolicyOptions,
   type PolicySource,
 } from "../policy/cache.js";
+import { isNoOrgPolicy } from "../policy/types.js";
 
 function formatDuration(ms: number): string {
   const totalSec = Math.floor(ms / 1000);
@@ -65,8 +66,9 @@ export function buildPolicySummary(
   const paths = policy ? policy.allow.paths.length : 0;
   const repos = policy ? policy.allow.repos.length : 0;
 
+  const noOrg = isNoOrgPolicy(policy);
   return {
-    source: formatSourceLabel(loaded.source),
+    source: noOrg ? "no org policy (server cache)" : formatSourceLabel(loaded.source),
     etag: loaded.etag ?? "none",
     age,
     mode: policy ? policy.mode : "none",

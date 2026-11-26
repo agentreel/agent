@@ -23,15 +23,19 @@ import {
   computeHookDeadlineMs,
   DEFAULT_APPROVAL_EXPIRES_S,
   HOOK_DEADLINE_MARGIN_S,
+  isNoOrgPolicy,
   policyToolToHookHost,
+  repoSlugFromRemoteUrl,
+  resolveEffectiveRuleApproval,
   type ApprovalOfflineFallback,
   type Policy,
   type PolicyAction,
   type PolicyDecisionAction,
   type PolicyTool,
+  type RuleApprovalConfig,
 } from "./types.js";
 
-export { EVAL_TIMEOUT_REASON, INVALID_RULE_REASON };
+export { EVAL_TIMEOUT_REASON, INVALID_RULE_REASON, repoSlugFromRemoteUrl };
 export const STALE_FAIL_OPEN_REASON = "policy stale, fail_open";
 export const HOOK_TIMEOUT_TOO_SHORT_REASON = "hook_timeout_too_short";
 
@@ -125,29 +129,6 @@ function defaultOnWaiting(message: string): void {
   } catch {
     // Ignore stderr write failures.
   }
-}
-
-export function repoSlugFromRemoteUrl(
-  remoteUrl: string | undefined,
-): string | undefined {
-  if (!remoteUrl) return undefined;
-  const trimmed = remoteUrl.trim();
-  if (!trimmed) return undefined;
-  if (trimmed.includes("://")) {
-    try {
-      const u = new URL(trimmed);
-      const slug = u.pathname.replace(/^\/+/, "").replace(/\.git$/i, "");
-      return slug || undefined;
-    } catch {
-      return undefined;
-    }
-  }
-  const scp = /^[^@]+@[^:]+:(.+)$/.exec(trimmed);
-  if (scp && scp[1]) {
-    const slug = scp[1].replace(/^\/+/, "").replace(/\.git$/i, "");
-    return slug || undefined;
-  }
-  return undefined;
 }
 
 export function formatBlockMessage(
@@ -245,22 +226,32 @@ function selectPrimaryMatch(
   return matches.find((m) => m.action === targetAction) ?? matches[0]!;
 }
 
-function resolveApprovalConfig(matches: PolicyRuleMatch[]): {
+function resolveApprovalConfig(
+  matches: PolicyRuleMatch[],
+  policyDefaults?: RuleApprovalConfig,
+): {
   expiresS: number;
   offlineFallback: ApprovalOfflineFallback;
 } {
   const approvalMatches = matches.filter((m) => m.action === "require_approval");
   const candidates = approvalMatches.length > 0 ? approvalMatches : matches;
 
+  if (candidates.length === 0) {
+    const eff = resolveEffectiveRuleApproval(undefined, policyDefaults);
+    return {
+      expiresS: eff.expires_s,
+      offlineFallback: eff.offline_fallback,
+    };
+  }
+
   let minExpiresS: number | undefined;
-  let allAllowOffline = candidates.length > 0;
+  let allAllowOffline = true;
 
   for (const m of candidates) {
-    const exp = m.approval?.expires_s;
-    if (typeof exp === "number" && Number.isFinite(exp) && exp > 0) {
-      minExpiresS = minExpiresS === undefined ? exp : Math.min(minExpiresS, exp);
-    }
-    if (m.approval?.offline_fallback !== "allow") {
+    const eff = resolveEffectiveRuleApproval(m.approval, policyDefaults);
+    minExpiresS =
+      minExpiresS === undefined ? eff.expires_s : Math.min(minExpiresS, eff.expires_s);
+    if (eff.offline_fallback !== "allow") {
       allAllowOffline = false;
     }
   }
@@ -346,7 +337,7 @@ export async function enforcePreExec(
       guardConfigPath: deps.guardConfigPath,
     });
 
-    if (!loaded.policy) {
+    if (!loaded.policy || isNoOrgPolicy(loaded.policy)) {
       return {
         permitted: true,
         action: "allow",
@@ -582,7 +573,10 @@ export async function enforcePreExec(
     // require_approval: the only hook path permitted to reach the network.
     if (evalResult.action === "require_approval") {
       recordPartialFlags();
-      const approvalCfg = resolveApprovalConfig(evalResult.matches);
+      const approvalCfg = resolveApprovalConfig(
+        evalResult.matches,
+        loaded.policy.approval_defaults,
+      );
       const installedTimeoutS =
         deps.installedTimeoutS ??
         getInstalledPreExecTimeoutS(cfg, policyToolToHookHost(req.tool));
@@ -643,6 +637,7 @@ export async function enforcePreExec(
         minPollDelayMs: deps.minPollDelayMs,
         retryDelayMs: deps.retryDelayMs,
         postRetries: deps.postRetries,
+        log,
       });
 
       const downgraded = approval.outcome === "offline_allow";

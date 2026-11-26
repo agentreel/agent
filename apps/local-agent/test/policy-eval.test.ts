@@ -249,6 +249,7 @@ describe("RE2-safe regex compiler, cache, and timeout guard", () => {
       "(DROP|TRUNCATE)\\w+\\s+\\w+",
       "(:|DROP)\\w+\\s+\\w+",
       "curl[^|]*\\|\\s*(ba)?sh",
+      "(curl|wget)[^|]*\\|\\s*(ba|z)?sh",
       "foo[\\x41-\\x5A]+@[\\x41-\\x5A]+",
       // Non-ASCII literals are universal in the disjointness model, so a
       // Kelvin / long-s leading literal or separator is never disjoint.
@@ -289,6 +290,9 @@ describe("RE2-safe regex compiler, cache, and timeout guard", () => {
       "curl\\s+\\|\\s*sh",
       "curl\\s*\\|\\s*(ba)?sh",
       "curl\\s+\\S+\\s+\\|\\s*(ba)?sh",
+      "(curl|wget)\\s+\\S+\\s+\\|\\s*(ba|z)?sh",
+      "git\\s+\\w+\\s+--force",
+      "rm\\s+\\S+\\s+/",
       "(DROP|TRUNCATE)\\s+TABLE\\s+\\w+",
       "(?:DROP|TRUNCATE)\\s+TABLE\\s+\\w+",
       "aws\\s+s3\\s+rb",
@@ -1216,5 +1220,186 @@ describe("validatePolicy regex safety and eval invalid_rule defense in depth", (
     expect(observeRes.downgraded).toBe(true);
     expect(observeRes.original_action).toBe("block");
     expect(observeRes.reason).toBe(INVALID_RULE_REASON);
+  });
+});
+
+describe("C1 additive evaluation: no-org, scope.teams, and approval_defaults merging", () => {
+  it("evaluates org_id null (no-org) policy as allow with no enforcement or builtin flags", () => {
+    const noOrg: Policy = {
+      version: 1,
+      etag: "etag-no-org",
+      org_id: null,
+      workspace_id: null,
+      updated_at: "2026-11-26T00:00:00Z",
+      mode: "observe",
+      offline: "last_known",
+      builtin: {},
+      custom: [],
+      allow: { commands: [], paths: [], repos: [] },
+    };
+
+    const res = evaluatePolicy(
+      { tool: "claude-code", toolName: "Bash", command: "rm -rf ~" },
+      noOrg,
+    );
+    expect(res.action).toBe("allow");
+    expect(res.matches).toEqual([]);
+    expect(res.rule_ids).toEqual([]);
+  });
+
+  it("treats scope.teams as display-only (always applies subject to other scope fields) and ignores unknown current_user_teams", () => {
+    const rawPayload = {
+      version: 1,
+      etag: "etag-teams",
+      workspace_id: "ws_1",
+      updated_at: "2026-11-26T00:00:00Z",
+      mode: "enforce",
+      offline: "last_known",
+      current_user_teams: ["other-team"],
+      builtin: {},
+      custom: [
+        {
+          id: "cust_team_scoped",
+          name: "Team x deploy block",
+          enabled: true,
+          version: 1,
+          message: "Blocked for team x",
+          when: [{ field: "command", op: "contains", value: "deploy-prod" }],
+          action: "block",
+          severity: "high",
+          scope: { teams: ["x"] },
+        },
+        {
+          id: "cust_team_and_repo",
+          name: "Team x prod-repo block",
+          enabled: true,
+          version: 1,
+          message: "Blocked for team x in prod repo",
+          when: [{ field: "command", op: "contains", value: "migrate-db" }],
+          action: "block",
+          severity: "high",
+          scope: { teams: ["x"], repos: ["acme/prod-*"] },
+        },
+      ],
+      allow: { commands: [], paths: [], repos: [] },
+    };
+
+    const validated = validatePolicy(rawPayload);
+    expect(validated.ok).toBe(true);
+    if (!validated.ok) return;
+    // Unknown current_user_teams field is ignored and not stored on Policy
+    expect(
+      (validated.value as unknown as Record<string, unknown>).current_user_teams,
+    ).toBeUndefined();
+
+    // Rule with scope.teams ['x'] applies even though current_user_teams did not include 'x'
+    const applied = evaluatePolicy(
+      { tool: "claude-code", toolName: "Bash", command: "deploy-prod now" },
+      validated.value,
+    );
+    expect(applied.action).toBe("block");
+    expect(applied.rule_ids).toEqual(["cust_team_scoped"]);
+
+    // Other scope fields (e.g. repos) still apply normally alongside scope.teams
+    const wrongRepo = evaluatePolicy(
+      {
+        tool: "claude-code",
+        toolName: "Bash",
+        command: "migrate-db",
+        repo: "acme/staging",
+      },
+      validated.value,
+    );
+    expect(wrongRepo.action).toBe("allow");
+
+    const rightRepo = evaluatePolicy(
+      {
+        tool: "claude-code",
+        toolName: "Bash",
+        command: "migrate-db",
+        repo: "acme/prod-api",
+      },
+      validated.value,
+    );
+    expect(rightRepo.action).toBe("block");
+    expect(rightRepo.rule_ids).toEqual(["cust_team_and_repo"]);
+  });
+
+  it("merges effective approval config as rule.approval over approval_defaults over (120, deny) for builtin and custom rules", () => {
+    const policy: Policy = {
+      version: 1,
+      etag: "etag-approval-merge",
+      workspace_id: "ws_1",
+      updated_at: "2026-11-26T00:00:00Z",
+      mode: "enforce",
+      offline: "last_known",
+      approval_defaults: { expires_s: 90, offline_fallback: "allow" },
+      builtin: {
+        GIT001: { enabled: true, action: "require_approval" },
+        FS001: {
+          enabled: true,
+          action: "require_approval",
+          approval: { offline_fallback: "deny" },
+        },
+      },
+      custom: [
+        {
+          id: "cust_partial_approval",
+          name: "Partial custom approval",
+          enabled: true,
+          version: 1,
+          message: "Approve release",
+          when: [{ field: "command", op: "contains", value: "release-prod" }],
+          action: "require_approval",
+          severity: "high",
+          approval: { expires_s: 45 },
+        },
+      ],
+      allow: { commands: [], paths: [], repos: [] },
+    };
+
+    // Builtin without rule.approval inherits approval_defaults
+    const builtinInherited = evaluatePolicy(
+      { tool: "claude-code", toolName: "Bash", command: "git push --force origin main" },
+      policy,
+    );
+    expect(builtinInherited.action).toBe("require_approval");
+    expect(builtinInherited.matches[0]?.approval).toEqual({
+      expires_s: 90,
+      offline_fallback: "allow",
+    });
+
+    // Builtin with partial rule.approval merges over approval_defaults
+    const builtinOverride = evaluatePolicy(
+      { tool: "claude-code", toolName: "Bash", command: "rm -rf ~" },
+      policy,
+    );
+    expect(builtinOverride.action).toBe("require_approval");
+    expect(builtinOverride.matches[0]?.approval).toEqual({
+      expires_s: 90,
+      offline_fallback: "deny",
+    });
+
+    // Custom with partial rule.approval merges over approval_defaults
+    const customPartial = evaluatePolicy(
+      { tool: "claude-code", toolName: "Bash", command: "release-prod v1" },
+      policy,
+    );
+    expect(customPartial.action).toBe("require_approval");
+    expect(customPartial.matches[0]?.approval).toEqual({
+      expires_s: 45,
+      offline_fallback: "allow",
+    });
+
+    // Without approval_defaults, falls back to built-in (120, deny)
+    const noDefaultsPolicy: Policy = { ...policy, approval_defaults: undefined };
+    const builtinDefault = evaluatePolicy(
+      { tool: "claude-code", toolName: "Bash", command: "git push --force origin main" },
+      noDefaultsPolicy,
+    );
+    expect(builtinDefault.matches[0]?.approval).toEqual({
+      expires_s: 120,
+      offline_fallback: "deny",
+    });
   });
 });
