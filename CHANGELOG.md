@@ -31,6 +31,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   - `(curl|wget)[^|]*\|\s*(ba|z)?sh`: use `(curl|wget)\s+\S+\s+\|\s*(ba|z)?sh`.
   - `\w+\s+\w+`: add a leading literal whose last char is disjoint from `\w`, e.g. `git\s+\w+\s+--force`.
   - `\S+\s+\S+`: add a leading literal disjoint from `\S`, e.g. `rm\s+\S+\s+/`.
+  - `\u{1F600}\s+\w+` (non-ASCII literals are now treated as overlapping every character): use `\u{1F600}\s+\w`, which matches the same commands because rules match anywhere in the input.
 
 ### Fixed
 

@@ -50,9 +50,10 @@ You must re-run `npx @agentreel/agent init` after upgrading to 0.3.0 so approval
 
 ### Changed: now rejected regex patterns
 
-The stricter RE2-safe regex subset rejects four multi-quantifier patterns that 0.2.x accepted. Update any custom rules using them to these verified replacements:
+The stricter RE2-safe regex subset rejects these multi-quantifier patterns that earlier builds accepted. Update any custom rules using them to these verified replacements:
 
 - `curl[^|]*\|\s*(ba)?sh`: use `curl\s+\S+\s+\|\s*(ba)?sh`, or the single-unbounded `curl[^|]*\|`.
 - `(curl|wget)[^|]*\|\s*(ba|z)?sh`: use `(curl|wget)\s+\S+\s+\|\s*(ba|z)?sh`.
 - `\w+\s+\w+`: add a leading literal whose last char is disjoint from `\w`, e.g. `git\s+\w+\s+--force`.
 - `\S+\s+\S+`: add a leading literal disjoint from `\S`, e.g. `rm\s+\S+\s+/`.
+- `\u{1F600}\s+\w+` (non-ASCII literals are now treated as overlapping every character): use `\u{1F600}\s+\w`, which matches the same commands because rules match anywhere in the input.
