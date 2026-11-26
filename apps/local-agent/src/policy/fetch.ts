@@ -2,7 +2,7 @@ import { appendFileSync } from "node:fs";
 import { readConfig, type AgentConfig } from "../config.js";
 import { ensureAgentreelDir, LOG_PATH, POLICY_PATH } from "../paths.js";
 import {
-  clearPolicyRejection,
+  clearTransientPolicyRejection,
   POLICY_REFRESH_INTERVAL_MS,
   readCachedPolicy,
   shouldRefreshPolicy,
@@ -128,7 +128,7 @@ export async function fetchPolicy(
         },
         cachePath,
       );
-      clearPolicyRejection(cachePath);
+      clearTransientPolicyRejection(cachePath);
       return {
         status: "not_modified",
         policy: cached.policy,
@@ -269,7 +269,7 @@ export async function fetchPolicy(
         },
         cachePath,
       );
-      clearPolicyRejection(cachePath);
+      clearTransientPolicyRejection(cachePath);
       return {
         status: "updated",
         policy,
