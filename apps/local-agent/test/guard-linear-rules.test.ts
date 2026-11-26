@@ -245,6 +245,25 @@ describe("linear built-in rules: 32KB padded inputs are fast", () => {
     });
   }
 
+  it("padding does not change the cost: 1KB, 8KB and 32KB of spaces all finish together", () => {
+    // A bounded guard that fails fast (instead of hanging for hours) if
+    // INSTALL001 ever goes back to its cubic regex: that took about 250ms
+    // at 1KB and 16s at 4KB.
+    for (const n of [1024, 8 * 1024, 32 * 1024]) {
+      for (const [id, cmd] of [
+        ["INSTALL001", "curl" + " ".repeat(n)],
+        ["INSTALL001", "curl x" + " ".repeat(n) + "|" + " ".repeat(n)],
+        ["GIT001", "git push" + " ".repeat(n)],
+        ["GIT003", "git push" + " ".repeat(n)],
+        ["SAFETY002", "git commit" + " ".repeat(n)],
+      ] as Array<[RuleId, string]>) {
+        const t0 = performance.now();
+        fires(id, cmd);
+        expect(performance.now() - t0, `${id} n=${n}`).toBeLessThan(25);
+      }
+    }
+  });
+
   it("scanSession on padded commands finishes with real results, not scan_timeout", () => {
     for (const [label, { cmd }] of Object.entries(PADDED)) {
       const lines: string[] = [];
