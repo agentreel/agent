@@ -51,7 +51,7 @@ export interface Finding {
   timestamp: number;
   evidence: string;
   /** "scan_timeout" when the rule hit the scan deadline and failed closed. */
-  reason?: "scan_timeout";
+  reason?: "scan_timeout" | "scan_budget_exceeded";
   context?: {
     command?: string;
     file?: string;
@@ -77,6 +77,11 @@ export interface SessionSummary {
   timedOut?: boolean;
   /** Rule IDs reported as fail-closed scan_timeout findings, deduplicated. */
   timedOutRuleIds?: string[];
+  /**
+   * Events never scanned because the batch scan budget ran out. They are
+   * reported as fail-closed scan_budget_exceeded findings, never as clean.
+   */
+  unscannedEvents?: number;
 }
 
 export interface GuardConfig {
