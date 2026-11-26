@@ -1,5 +1,5 @@
 import { existsSync, readFileSync, writeFileSync } from "node:fs";
-import { GUARD_CONFIG_PATH } from "../paths.js";
+import { guardConfigPath } from "../paths.js";
 import type { GuardConfig } from "./types.js";
 
 const DEFAULT_CONFIG: GuardConfig = {
@@ -14,12 +14,12 @@ const DEFAULT_CONFIG: GuardConfig = {
 };
 
 export function readGuardConfig(): GuardConfig {
-  if (!existsSync(GUARD_CONFIG_PATH)) {
+  if (!existsSync(guardConfigPath())) {
     return { ...DEFAULT_CONFIG };
   }
 
   try {
-    const raw = readFileSync(GUARD_CONFIG_PATH, "utf8");
+    const raw = readFileSync(guardConfigPath(), "utf8");
     const parsed = JSON.parse(raw) as Partial<GuardConfig>;
     return { ...DEFAULT_CONFIG, ...parsed };
   } catch {
@@ -28,7 +28,7 @@ export function readGuardConfig(): GuardConfig {
 }
 
 export function writeGuardConfig(config: GuardConfig): void {
-  writeFileSync(GUARD_CONFIG_PATH, JSON.stringify(config, null, 2) + "\n", {
+  writeFileSync(guardConfigPath(), JSON.stringify(config, null, 2) + "\n", {
     encoding: "utf8",
   });
 }

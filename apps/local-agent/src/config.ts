@@ -1,5 +1,5 @@
 import { readFileSync, writeFileSync, existsSync, chmodSync } from "node:fs";
-import { CONFIG_PATH, ensureAgentreelDir } from "./paths.js";
+import { configPath, ensureAgentreelDir } from "./paths.js";
 import { DEFAULT_HOOK_TIMEOUT_S, type HookHost } from "./policy/types.js";
 
 export type HostnameMode = "plain" | "hash" | "omit";
@@ -58,9 +58,9 @@ const DEFAULT: AgentConfig = {
 };
 
 export function readConfig(): AgentConfig {
-  if (!existsSync(CONFIG_PATH)) return { ...DEFAULT };
+  if (!existsSync(configPath())) return { ...DEFAULT };
   try {
-    const raw = readFileSync(CONFIG_PATH, "utf8");
+    const raw = readFileSync(configPath(), "utf8");
     return { ...DEFAULT, ...JSON.parse(raw) };
   } catch {
     return { ...DEFAULT };
@@ -98,12 +98,12 @@ export function writeConfig(cfg: AgentConfig): void {
   // mode 0o600 — config.json holds the API key; only the owning user
   // should ever be able to read it. chmod after write to be sure even
   // if the file already existed with looser perms.
-  writeFileSync(CONFIG_PATH, JSON.stringify(cfg, null, 2) + "\n", {
+  writeFileSync(configPath(), JSON.stringify(cfg, null, 2) + "\n", {
     encoding: "utf8",
     mode: 0o600,
   });
   try {
-    chmodSync(CONFIG_PATH, 0o600);
+    chmodSync(configPath(), 0o600);
   } catch {
     // Non-Unix or filesystem without mode bits — best effort.
   }

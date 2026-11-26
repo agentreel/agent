@@ -1,16 +1,18 @@
 import { appendFileSync } from "node:fs";
 import type { AgentEvent, Session } from "@agentreel/shared-types";
-import type { Finding, SessionSummary, MatchContext } from "./types.js";
+import type { Finding, SessionSummary, MatchContext, Rule } from "./types.js";
 import { RULES } from "./rules.js";
 import {
   calculateRiskScore,
   createRulePass,
   matchAllRulesWithDeadline,
   SCAN_TIMEOUT_REASON,
+  SCAN_BUDGET_REASON,
+  budgetFindings,
 } from "./matcher.js";
 import { readGuardConfig } from "./config.js";
 import { runWithTimeout } from "../policy/regex.js";
-import { LOG_PATH, ensureAgentreelDir } from "../paths.js";
+import { logPath, ensureAgentreelDir } from "../paths.js";
 
 /**
  * Hard per-event budget for the built-in rule pass (and, separately, the
@@ -23,20 +25,74 @@ import { LOG_PATH, ensureAgentreelDir } from "../paths.js";
  * payload), capped at 1000ms. The per-KB allowance keeps legitimate large
  * payloads clean: a 500KB Read result takes about 50ms through all rules,
  * linear in size, and gets a 300ms budget. Crafted superlinear inputs blow
- * far past it: "git push" plus 32KB of spaces took 3.3s natively and now
- * stops at its 66ms budget.
+ * far past it. The command counts twice, once as itself and once inside the
+ * JSON payload, so a 32KB command gets 50 + 65 * 0.5 = 82.5ms. (Before the
+ * built-in rules were made linear, "git push" plus 32KB of spaces took 3.3s
+ * natively and stopped at that budget.)
  */
 export const SCAN_DEADLINE_BASE_MS = 50;
 export const SCAN_DEADLINE_PER_KB_MS = 0.5;
 export const SCAN_DEADLINE_MAX_MS = 1000;
 
-export { SCAN_TIMEOUT_REASON };
+/**
+ * Total scan budget for one upload batch (takePendingBatch), on top of the
+ * per-event deadline. Without it a batch of crafted events costs up to
+ * (events x per-event deadline) on every flush, and again on every retry:
+ * 32 crafted 32KB events took 2.7s per flush on 3b1145b, and 500 small ones
+ * about 25s.
+ *
+ * 1500ms. Honest batches are far below it. Scanning is linear in payload
+ * size, and the slowest honest batch measured is a full 1MB batch (the cap in
+ * queue.ts) of real source text: 469 events of 2KB took 273ms, including the
+ * database read and JSON parsing, and 500 ordinary Bash commands took 88ms.
+ * 1500ms is about 5x that worst case, so a slow laptop or a loaded daemon
+ * does not turn honest uploads into scan_budget_exceeded findings. It is
+ * also above SCAN_DEADLINE_MAX_MS (1000ms), so one pathological event
+ * cannot use the whole budget on its own and still leave room for others.
+ * A crafted batch is now bounded at about 1.5s per flush, down from
+ * (events x per-event deadline).
+ */
+export const SCAN_BATCH_BUDGET_MS = 1500;
+
+/** Wall-clock scan budget shared by every scanSession call in one batch. */
+export class ScanBudget {
+  private readonly startedAt: number;
+  /** Events skipped because the budget ran out, across the batch. */
+  unscannedEvents = 0;
+  /** Sessions that had at least one skipped event. */
+  unscannedSessions = 0;
+
+  constructor(
+    readonly totalMs: number = SCAN_BATCH_BUDGET_MS,
+    private readonly nowMs: () => number = () => performance.now(),
+  ) {
+    this.startedAt = nowMs();
+  }
+
+  remainingMs(): number {
+    return this.totalMs - (this.nowMs() - this.startedAt);
+  }
+
+  get exhausted(): boolean {
+    return this.remainingMs() <= 0;
+  }
+}
+
+export { SCAN_TIMEOUT_REASON, SCAN_BUDGET_REASON };
 
 export interface ScanOptions {
   /** Fixed per-event budget, overriding the size-scaled default. */
   deadlineMs?: number;
   /** Receives one line per scan that hit the deadline. */
   log?: (message: string) => void;
+  /** Rule set to scan with. Defaults to the built-in RULES; tests inject slow rules. */
+  rules?: Rule[];
+  /**
+   * Shared batch budget. Each event's deadline is capped at what is left, and
+   * once it is gone the remaining events are not scanned and fail closed as
+   * scan_budget_exceeded findings.
+   */
+  budget?: ScanBudget;
 }
 
 export function scanDeadlineMs(context: MatchContext): number {
@@ -51,11 +107,12 @@ export function scanDeadlineMs(context: MatchContext): number {
   return Math.min(SCAN_DEADLINE_MAX_MS, budget);
 }
 
-function defaultLog(message: string): void {
+/** Appends one line to ~/.agentreel/agent.log. Never throws. */
+export function logScan(message: string): void {
   try {
     ensureAgentreelDir();
     appendFileSync(
-      LOG_PATH,
+      logPath(),
       `[${new Date().toISOString()}] guard scan: ${message}\n`,
     );
   } catch {
@@ -75,9 +132,9 @@ export function scanEvent(event: AgentEvent, opts: ScanOptions = {}): Finding[] 
   };
 
   const deadlineMs = opts.deadlineMs ?? scanDeadlineMs(context);
-  const result = matchAllRulesWithDeadline(RULES, context, config, deadlineMs);
+  const result = matchAllRulesWithDeadline(opts.rules ?? RULES, context, config, deadlineMs);
   if (result.timedOut) {
-    (opts.log ?? defaultLog)(
+    (opts.log ?? logScan)(
       `${SCAN_TIMEOUT_REASON}: event ${event.id} exceeded ${Math.floor(deadlineMs)}ms; rule(s) ${result.timedOutRuleIds.join(", ") || "none"} failed closed as findings`,
     );
   }
@@ -93,11 +150,15 @@ export function scanSession(
   const allFindings: Finding[] = [];
   const timedOutRuleIds = new Set<string>();
   const timedOutEventIds: string[] = [];
+  // Events whose blast-radius stats pass ran out of time. Rule-pass timeouts
+  // are tracked separately in timedOutEventIds: they fail closed as findings
+  // and are not a blast-radius problem.
   let blastRadiusTimeouts = 0;
   const commandsExecuted = new Set<string>();
   const filesAccessed = new Set<string>();
   const hostsContacted = new Set<string>();
   const criticalPaths = new Set<string>();
+  const unscanned: MatchContext[] = [];
 
   for (let i = 0; i < events.length; i++) {
     const event = events[i];
@@ -120,10 +181,22 @@ export function scanSession(
       recentEvents,
     };
 
+    // The batch budget is spent: do not scan this event at all, it fails
+    // closed below. (The check comes before any regex work.)
+    const remainingMs = opts.budget ? opts.budget.remainingMs() : Infinity;
+    if (remainingMs <= 0) {
+      unscanned.push(context);
+      continue;
+    }
+
     // One VM call per event (each costs about 80us): the rule pass first,
-    // then the blast-radius stats, under one hard deadline.
-    const deadlineMs = opts.deadlineMs ?? scanDeadlineMs(context);
-    const pass = createRulePass(RULES, context, readGuardConfig(), deadlineMs);
+    // then the blast-radius stats, under one hard deadline, never longer
+    // than what is left of the batch budget.
+    const deadlineMs = Math.min(
+      opts.deadlineMs ?? scanDeadlineMs(context),
+      remainingMs,
+    );
+    const pass = createRulePass(opts.rules ?? RULES, context, readGuardConfig(), deadlineMs);
     let blastPhase = false;
     const run = runWithTimeout(() => {
       pass.run();
@@ -143,7 +216,20 @@ export function scanSession(
       timedOutEventIds.push(event.id);
       for (const id of result.timedOutRuleIds) timedOutRuleIds.add(id);
     }
-    if (!run.ok) blastRadiusTimeouts++;
+    if (!run.ok && blastPhase) blastRadiusTimeouts++;
+  }
+
+  if (unscanned.length > 0 && opts.budget) {
+    const rules = opts.rules ?? RULES;
+    const failed = budgetFindings(
+      rules,
+      unscanned,
+      readGuardConfig(),
+      opts.budget.totalMs,
+    );
+    allFindings.push(...failed.findings);
+    opts.budget.unscannedEvents += unscanned.length;
+    opts.budget.unscannedSessions += 1;
   }
 
   if (timedOutEventIds.length > 0 || blastRadiusTimeouts > 0) {
@@ -156,7 +242,7 @@ export function scanSession(
     if (blastRadiusTimeouts > 0) {
       parts.push(`${blastRadiusTimeouts} event(s) did not finish blast-radius stats; stats are partial`);
     }
-    (opts.log ?? defaultLog)(
+    (opts.log ?? logScan)(
       `${SCAN_TIMEOUT_REASON}: session ${sessionId}: ${parts.join("; ")}`
     );
   }
@@ -183,6 +269,7 @@ export function scanSession(
     ...(timedOutEventIds.length > 0
       ? { timedOut: true, timedOutRuleIds: [...timedOutRuleIds] }
       : {}),
+    ...(unscanned.length > 0 ? { unscannedEvents: unscanned.length } : {}),
   };
 }
 

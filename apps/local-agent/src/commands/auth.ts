@@ -1,7 +1,7 @@
 import { randomBytes } from "node:crypto";
 import pc from "picocolors";
 import { readConfig, writeConfig } from "../config.js";
-import { POLICY_PATH } from "../paths.js";
+import { policyPath } from "../paths.js";
 import {
   clearCachedPolicy,
   clearPolicyRejection,
@@ -58,7 +58,7 @@ export async function linkCommand(rawKey: string | undefined, opts: LinkOpts): P
   // fetches fresh (no ETag) and swaps the cache only once the new policy validates.
   const policyRes = await replacePolicyCacheForAuth(
     nextCfg,
-    opts.cachePath ?? POLICY_PATH,
+    opts.cachePath ?? policyPath(),
   );
   console.log(pc.green("✓") + " Linked.");
   console.log(pc.dim("  api: ") + nextCfg.apiBaseUrl);

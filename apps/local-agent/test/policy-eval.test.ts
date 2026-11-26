@@ -4,6 +4,7 @@ import { fileURLToPath } from "node:url";
 import ts from "typescript";
 import { describe, expect, it } from "vitest";
 import { RULES } from "../src/guard/rules.js";
+import type { Rule } from "../src/guard/types.js";
 import {
   EVAL_TIMEOUT_REASON,
   evaluatePolicy,
@@ -652,12 +653,25 @@ describe("regex input cap with fail-closed semantics", () => {
     expect(res.reason).toBe(INPUT_TOO_LONG_REASON);
   });
 
-  it("built-in rules are hard-preempted at the deadline on adversarial long input", () => {
+  it("built-in rules are hard-preempted at the deadline when one runs long", () => {
+    // The shipped built-ins are linear on padded input now (they used to take
+    // seconds on "git push" plus 32KB of spaces), so GIT001 is swapped for a
+    // rule that busy-waits 3s to exercise the VM watchdog.
+    const spin = (): boolean => {
+      const end = Date.now() + 3000;
+      while (Date.now() < end) {
+        /* busy */
+      }
+      return false;
+    };
+    const slowRules: Rule[] = RULES.map((r) =>
+      r.id === "GIT001" ? { ...r, matcher: { type: "command" as const, customMatcher: spin } } : r,
+    );
     const cmd = "git push" + " ".repeat(32_768);
     const flagOnly = policyWith([]);
-    evaluatePolicy({ tool: "claude-code", toolName: "Bash", command: "warm" }, flagOnly, RULES);
+    evaluatePolicy({ tool: "claude-code", toolName: "Bash", command: "warm" }, flagOnly, slowRules);
     let t0 = performance.now();
-    const res = evaluatePolicy({ tool: "claude-code", toolName: "Bash", command: cmd }, flagOnly, RULES, { deadlineMs: 50 });
+    const res = evaluatePolicy({ tool: "claude-code", toolName: "Bash", command: cmd }, flagOnly, slowRules, { deadlineMs: 50 });
     let elapsed = performance.now() - t0;
     expect(res.timed_out).toBe(true);
     expect(res.reason).toBe(EVAL_TIMEOUT_REASON);
@@ -665,7 +679,7 @@ describe("regex input cap with fail-closed semantics", () => {
 
     const blockGit = { ...flagOnly, builtin: { GIT001: { enabled: true, action: "block" as const } } };
     t0 = performance.now();
-    const blocked = evaluatePolicy({ tool: "claude-code", toolName: "Bash", command: cmd }, blockGit, RULES, { deadlineMs: 50 });
+    const blocked = evaluatePolicy({ tool: "claude-code", toolName: "Bash", command: cmd }, blockGit, slowRules, { deadlineMs: 50 });
     elapsed = performance.now() - t0;
     expect(blocked.action).toBe("block");
     expect(blocked.unevaluated_enforcing).toBe(true);

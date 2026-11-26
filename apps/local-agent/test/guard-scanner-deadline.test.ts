@@ -77,27 +77,33 @@ const spin = (): boolean => {
 };
 
 describe("guard scanner hard regex deadline", () => {
-  it("preempts git push plus 32KB of spaces near the deadline, not seconds", () => {
+  it("preempts a rule that would run for seconds near the deadline, not seconds later", () => {
+    // Built-in rules are linear now, so a slow rule is injected. On 3b1145b
+    // "git push" plus 32KB of spaces took about 3.3s here.
     const { lines, log } = collectLog();
     const event = bashEvent("git push" + " ".repeat(32 * 1024));
     const t0 = performance.now();
-    const summary = scanSession("s1", [event], undefined, { log });
+    const summary = scanSession("s1", [event], undefined, {
+      log,
+      rules: [rule("SLOW", "high", spin), ...RULES],
+    });
     const ms = performance.now() - t0;
-    // main took about 3.3s here (GIT001 1.7s, GIT003 0.9s, SAFETY002 0.7s).
     expect(ms).toBeLessThan(120);
     expect(summary.timedOut).toBe(true);
-    expect(summary.timedOutRuleIds).toContain("GIT001");
+    expect(summary.timedOutRuleIds).toContain("SLOW");
     expect(lines.join("\n")).toContain(SCAN_TIMEOUT_REASON);
   });
 
-  it("preempts the cubic INSTALL001 backtrack on curl plus spaces", () => {
-    // main: 1.9s at 2048 spaces, 16s at 4096 (cubic growth).
+  it("scanEvent preempts a slow rule at a fixed deadline", () => {
     const event = bashEvent("curl" + " ".repeat(2048));
     const t0 = performance.now();
-    const findings = scanEvent(event, { deadlineMs: 20, log: () => {} });
+    const findings = scanEvent(event, {
+      deadlineMs: 20,
+      log: () => {},
+      rules: [rule("SLOW", "high", spin)],
+    });
     expect(performance.now() - t0).toBeLessThan(120);
-    const install = findings.find((f) => f.ruleId === "INSTALL001");
-    expect(install?.reason).toBe(SCAN_TIMEOUT_REASON);
+    expect(findings.find((f) => f.ruleId === "SLOW")?.reason).toBe(SCAN_TIMEOUT_REASON);
   });
 
   it("fails closed: the running rule and every later enabled rule become findings", () => {
@@ -136,7 +142,7 @@ describe("guard scanner hard regex deadline", () => {
       "s1",
       [bashEvent("git push" + " ".repeat(32 * 1024), "evt-crafted")],
       undefined,
-      { log },
+      { log, rules: [rule("GIT001", "high", spin), ...RULES.filter((r) => r.id !== "GIT001")] },
     );
     expect(summary.findings.length).toBeGreaterThan(0);
     expect(summary.findings.every((f) => f.reason === SCAN_TIMEOUT_REASON)).toBe(true);
@@ -167,6 +173,63 @@ describe("guard scanner hard regex deadline", () => {
     expect(summary.timedOut).toBeUndefined();
     expect(summary.findings.some((f) => f.reason === SCAN_TIMEOUT_REASON)).toBe(false);
     expect(lines.join("\n")).toMatch(/blast-radius stats; stats are partial/);
+  });
+
+  it("a rule-pass timeout is not counted as a blast-radius timeout", () => {
+    const { lines, log } = collectLog();
+    const summary = scanSession("s1", [bashEvent("echo hi", "evt-slow")], undefined, {
+      log,
+      rules: [rule("SLOW", "high", spin)],
+      deadlineMs: 20,
+    });
+    expect(summary.timedOut).toBe(true);
+    expect(lines).toHaveLength(1);
+    expect(lines[0]).toMatch(/1 event\(s\) exceeded the rule deadline \(evt-slow\)/);
+    expect(lines[0]).not.toMatch(/blast-radius/);
+    expect(lines[0]).not.toMatch(/stats are partial/);
+  });
+
+  it("a blast-radius timeout is not counted as a rule-pass timeout", () => {
+    const { lines, log } = collectLog();
+    const event: AgentEvent = {
+      ...bashEvent("ls"),
+      payload: { tool_name: "Bash", tool_input: { command: "ls" }, note: "file:".repeat(16 * 1024) },
+    };
+    const summary = scanSession("s1", [event], undefined, { log, deadlineMs: 20 });
+    expect(summary.timedOut).toBeUndefined();
+    expect(lines).toHaveLength(1);
+    expect(lines[0]).toMatch(/1 event\(s\) did not finish blast-radius stats; stats are partial/);
+    expect(lines[0]).not.toMatch(/exceeded the rule deadline/);
+  });
+
+  it("counts both kinds separately when a session has one of each", () => {
+    const { lines, log } = collectLog();
+    const slowEvent = bashEvent("echo slow", "evt-rule");
+    const blastEvent: AgentEvent = {
+      ...bashEvent("ls", "evt-blast"),
+      payload: { tool_name: "Bash", tool_input: { command: "ls" }, note: "file:".repeat(16 * 1024) },
+    };
+    // The spin rule only spins on the slow event, so the blast event reaches
+    // the blast-radius pass.
+    const spinOnSlow = rule("SLOW", "high", (ctx) => (ctx.command === "echo slow" ? spin() : false));
+    const summary = scanSession("s1", [slowEvent, blastEvent], undefined, {
+      log,
+      rules: [spinOnSlow],
+      deadlineMs: 20,
+    });
+    expect(summary.timedOutRuleIds).toEqual(["SLOW"]);
+    expect(lines).toHaveLength(1);
+    expect(lines[0]).toMatch(/1 event\(s\) exceeded the rule deadline \(evt-rule\)/);
+    expect(lines[0]).toMatch(/1 event\(s\) did not finish blast-radius stats/);
+  });
+
+  it("gives a 32KB command an 82.5ms budget because the payload JSON counts", () => {
+    const command = "x".repeat(32 * 1024);
+    const ms = scanDeadlineMs({
+      command,
+      payload: { tool_name: "Bash", tool_input: { command } },
+    });
+    expect(ms).toBeCloseTo(82.5, 5);
   });
 
   it("resumable rule pass reports no timeout once it has finished", () => {

@@ -2902,7 +2902,7 @@ describe("pause and AGENTREEL_DISABLE=1 keep enforcing org policy without captur
     const policy = makeEnforcePolicy({ etag: "etag-paused-enforce" });
     cache.writeCachedPolicyAtomic(
       { policy, etag: policy.etag, fetched_at: Date.now() },
-      pathsMod.POLICY_PATH,
+      pathsMod.policyPath(),
     );
 
     const modes = [
@@ -3044,7 +3044,7 @@ describe("pause and AGENTREEL_DISABLE=1 keep enforcing org policy without captur
     claudeInstall.installClaudeCodeHooks("/usr/local/bin/agentreel", claudeSettings);
     cursorInstall.installCursorHooks("/usr/local/bin/agentreel", cursorHooks);
     const report = doctor.inspectDoctorState({
-      cachePath: pathsMod.POLICY_PATH,
+      cachePath: pathsMod.policyPath(),
       guardConfigPath,
       claudeSettingsPath: claudeSettings,
       cursorHooksPath: cursorHooks,

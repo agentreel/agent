@@ -1,7 +1,13 @@
 import { getDb } from "../db.js";
 import type { IngestEvent, IngestSession } from "./client.js";
 import type { AgentEvent } from "@agentreel/shared-types";
-import { scanSession } from "../guard/scanner.js";
+import {
+  ScanBudget,
+  SCAN_BUDGET_REASON,
+  logScan,
+  scanSession,
+} from "../guard/scanner.js";
+import { capPayloadFields } from "./payload-caps.js";
 import { readGuardConfig } from "../guard/config.js";
 import type { PolicyDecisionRecord } from "../policy/enforce.js";
 import { scrubAny } from "../redact/scrubber.js";
@@ -40,10 +46,21 @@ export interface PendingBatch {
 export const MAX_BATCH_BYTES = 1024 * 1024; // 1 MB
 export const MAX_BATCH_EVENTS = 500;
 
+export interface TakeBatchOptions {
+  /**
+   * Total scan budget shared by every session in this batch. Defaults to a
+   * fresh ScanBudget(SCAN_BATCH_BUDGET_MS). Tests inject one with a fake clock.
+   */
+  scanBudget?: ScanBudget;
+  /** Receives the one log line written when the budget ran out. */
+  scanLog?: (message: string) => void;
+}
+
 export function takePendingBatch(
   maxEvents = MAX_BATCH_EVENTS,
   maxBytes = MAX_BATCH_BYTES,
   now = Date.now(),
+  opts: TakeBatchOptions = {},
 ): PendingBatch {
   const db = getDb();
   // Skip sessions the server parked (plan limit) until their hold expires,
@@ -85,6 +102,9 @@ export function takePendingBatch(
 
   const guardConfig = readGuardConfig();
   const shouldScan = guardConfig.enabled;
+  // One budget for the whole flush: bounds the time spent scanning no matter
+  // how many events or sessions the batch holds, and on every retry.
+  const scanBudget = opts.scanBudget ?? new ScanBudget();
 
   const sessions: IngestSession[] = sessionRows.map((s) => {
     const base: IngestSession = {
@@ -113,7 +133,9 @@ export function takePendingBatch(
         payload: safeParse(e.payload),
       }));
 
-      const summary = scanSession(s.id, parsedEvents);
+      const summary = scanSession(s.id, parsedEvents, undefined, {
+        budget: scanBudget,
+      });
 
       base.guard_findings = {
         version: 1,
@@ -174,6 +196,17 @@ export function takePendingBatch(
     return base;
   });
 
+  if (scanBudget.unscannedEvents > 0) {
+    (opts.scanLog ?? logScan)(
+      `${SCAN_BUDGET_REASON}: batch scan budget of ${Math.floor(scanBudget.totalMs)}ms used up; ${scanBudget.unscannedEvents} event(s) in ${scanBudget.unscannedSessions} session(s) were not scanned and are counted as findings`,
+    );
+  }
+
+  // Payload fields are capped here, after the guard scan above, which ran on
+  // the full text. Truncating first would let a long payload hide a risky
+  // command or secret behind the cut, and the scan evidence would no longer
+  // match what the user did. The scan result (guard_findings) is computed
+  // from the full payload and uploaded unchanged.
   const events: IngestEvent[] = eventRows.map((e) => ({
     id: e.id,
     session_id: e.session_id,
@@ -181,7 +214,7 @@ export function takePendingBatch(
     type: e.type,
     tool: e.tool,
     cwd: e.cwd,
-    payload: safeParse(e.payload),
+    payload: capPayloadFields(safeParse(e.payload)),
   }));
 
   return {

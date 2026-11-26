@@ -8,8 +8,8 @@ import {
   writeFileSync,
 } from "node:fs";
 import {
-  DAEMON_LOG_PATH,
-  DAEMON_PID_PATH,
+  daemonLogPath,
+  daemonPidPath,
   ensureAgentreelDir,
 } from "../paths.js";
 import { pendingByteSize } from "../db.js";
@@ -68,7 +68,7 @@ export async function daemonCommand(opts: DaemonOpts = {}): Promise<void> {
 
   const release = () => {
     try {
-      unlinkSync(DAEMON_PID_PATH);
+      unlinkSync(daemonPidPath());
     } catch {
       /* ignore */
     }
@@ -158,17 +158,17 @@ export async function daemonCommand(opts: DaemonOpts = {}): Promise<void> {
 
 function claimPidFile(): boolean {
   ensureAgentreelDir();
-  if (existsSync(DAEMON_PID_PATH)) {
-    const raw = readFileSync(DAEMON_PID_PATH, "utf8").trim();
+  if (existsSync(daemonPidPath())) {
+    const raw = readFileSync(daemonPidPath(), "utf8").trim();
     const pid = Number(raw);
     if (Number.isFinite(pid) && pid > 0 && isAlive(pid)) {
       console.error(pc.red(`✗ daemon already running (pid ${pid})`));
-      console.error(pc.dim(`  if this is wrong, remove ${DAEMON_PID_PATH}`));
+      console.error(pc.dim(`  if this is wrong, remove ${daemonPidPath()}`));
       return false;
     }
     // Stale pid file — overwrite.
   }
-  writeFileSync(DAEMON_PID_PATH, String(process.pid), { encoding: "utf8", mode: 0o600 });
+  writeFileSync(daemonPidPath(), String(process.pid), { encoding: "utf8", mode: 0o600 });
   return true;
 }
 
@@ -198,8 +198,8 @@ function spawnDetached(): void {
   ensureAgentreelDir();
   // If a live pid is already on disk, refuse — we'd just hit the same
   // claimPidFile check from inside the child and lose stderr to the log.
-  if (existsSync(DAEMON_PID_PATH)) {
-    const raw = readFileSync(DAEMON_PID_PATH, "utf8").trim();
+  if (existsSync(daemonPidPath())) {
+    const raw = readFileSync(daemonPidPath(), "utf8").trim();
     const pid = Number(raw);
     if (Number.isFinite(pid) && pid > 0 && isAlive(pid)) {
       console.error(pc.red(`✗ daemon already running (pid ${pid})`));
@@ -211,8 +211,8 @@ function spawnDetached(): void {
   // Open the log in append mode so child stdout/stderr persist across
   // restarts. argv[0] is the same node binary; pass `daemon` (no
   // --detach) so the child runs the foreground loop.
-  const out = openSync(DAEMON_LOG_PATH, "a");
-  const err = openSync(DAEMON_LOG_PATH, "a");
+  const out = openSync(daemonLogPath(), "a");
+  const err = openSync(daemonLogPath(), "a");
   const child = spawn(process.execPath, [process.argv[1]!, "daemon"], {
     detached: true,
     stdio: ["ignore", out, err],
@@ -223,20 +223,20 @@ function spawnDetached(): void {
   // even though we passed `ignore` — defensive.
   child.unref();
   console.log(pc.green("●") + ` daemon started (pid ${child.pid})`);
-  console.log(pc.dim(`  log: ${DAEMON_LOG_PATH}`));
+  console.log(pc.dim(`  log: ${daemonLogPath()}`));
   console.log(pc.dim(`  stop: agentreel stop`));
 }
 
 export function stopCommand(): void {
-  if (!existsSync(DAEMON_PID_PATH)) {
+  if (!existsSync(daemonPidPath())) {
     console.log(pc.dim("· daemon not running"));
     return;
   }
-  const raw = readFileSync(DAEMON_PID_PATH, "utf8").trim();
+  const raw = readFileSync(daemonPidPath(), "utf8").trim();
   const pid = Number(raw);
   if (!Number.isFinite(pid) || pid <= 0) {
     try {
-      unlinkSync(DAEMON_PID_PATH);
+      unlinkSync(daemonPidPath());
     } catch {
       /* ignore */
     }
@@ -245,7 +245,7 @@ export function stopCommand(): void {
   }
   if (!isAlive(pid)) {
     try {
-      unlinkSync(DAEMON_PID_PATH);
+      unlinkSync(daemonPidPath());
     } catch {
       /* ignore */
     }

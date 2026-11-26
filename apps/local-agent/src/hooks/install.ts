@@ -1,6 +1,6 @@
 import { readFileSync, writeFileSync, existsSync, copyFileSync, mkdirSync } from "node:fs";
 import { dirname } from "node:path";
-import { CLAUDE_SETTINGS_PATH } from "../paths.js";
+import { claudeSettingsPath } from "../paths.js";
 import {
   DEFAULT_HOOK_TIMEOUT_S,
   DEFAULT_PRE_EXEC_HOOK_TIMEOUT_S,
@@ -96,7 +96,7 @@ export function installClaudeCodeHooks(
   hookCommandPrefix: string,
   opts: InstallClaudeHooksOptions = {},
 ): InstallResult {
-  const settingsPath = opts.settingsPath ?? CLAUDE_SETTINGS_PATH;
+  const settingsPath = opts.settingsPath ?? claudeSettingsPath();
   const preExecTimeoutS = opts.preExecTimeoutS ?? DEFAULT_PRE_EXEC_HOOK_TIMEOUT_S;
 
   mkdirSync(dirname(settingsPath), { recursive: true });
@@ -127,7 +127,7 @@ export function installClaudeCodeHooks(
 }
 
 export function uninstallClaudeCodeHooks(
-  settingsPath: string = CLAUDE_SETTINGS_PATH,
+  settingsPath: string = claudeSettingsPath(),
 ): { backup: string | null } {
   if (!existsSync(settingsPath)) return { backup: null };
   const backup = backupSettings(settingsPath);
@@ -152,7 +152,7 @@ export interface ClaudePreExecHookCheck {
 }
 
 export function inspectClaudePreExecHook(
-  settingsPath: string = CLAUDE_SETTINGS_PATH,
+  settingsPath: string = claudeSettingsPath(),
 ): ClaudePreExecHookCheck {
   if (!existsSync(settingsPath)) {
     return {

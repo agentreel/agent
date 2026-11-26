@@ -1,11 +1,11 @@
 import pc from "picocolors";
 import { existsSync, readFileSync } from "node:fs";
 import {
-  CLAUDE_SETTINGS_PATH,
-  CURSOR_HOOKS_PATH,
-  DB_PATH,
-  CONFIG_PATH,
-  DAEMON_PID_PATH,
+  claudeSettingsPath,
+  cursorHooksPath,
+  dbPath,
+  configPath,
+  daemonPidPath,
 } from "../paths.js";
 import { countEvents, getMeta, listHeldSessions, listRecentSessions, pendingByteSize } from "../db.js";
 import { isCaptureDisabledByEnv, readConfig } from "../config.js";
@@ -40,9 +40,9 @@ function fmtBytes(n: number): string {
 }
 
 function daemonStatus(): { running: boolean; pid: number | null } {
-  if (!existsSync(DAEMON_PID_PATH)) return { running: false, pid: null };
+  if (!existsSync(daemonPidPath())) return { running: false, pid: null };
   try {
-    const pid = Number(readFileSync(DAEMON_PID_PATH, "utf8").trim());
+    const pid = Number(readFileSync(daemonPidPath(), "utf8").trim());
     if (!Number.isFinite(pid) || pid <= 0) return { running: false, pid: null };
     process.kill(pid, 0);
     return { running: true, pid };
@@ -54,15 +54,15 @@ function daemonStatus(): { running: boolean; pid: number | null } {
 export async function statusCommand(): Promise<void> {
   const cfg = readConfig();
   console.log(pc.bold(pc.cyan("AgentReel status\n")));
-  console.log("  config:        " + (existsSync(CONFIG_PATH) ? CONFIG_PATH : pc.red("missing")));
-  console.log("  database:      " + (existsSync(DB_PATH) ? DB_PATH : pc.red("not initialized")));
+  console.log("  config:        " + (existsSync(configPath()) ? configPath() : pc.red("missing")));
+  console.log("  database:      " + (existsSync(dbPath()) ? dbPath() : pc.red("not initialized")));
   console.log(
     "  claude hooks:  " +
-      (existsSync(CLAUDE_SETTINGS_PATH) ? CLAUDE_SETTINGS_PATH : pc.red("not installed")),
+      (existsSync(claudeSettingsPath()) ? claudeSettingsPath() : pc.red("not installed")),
   );
   console.log(
     "  cursor hooks:  " +
-      (nativeCursorHooksInstalled() ? CURSOR_HOOKS_PATH : pc.yellow("not installed (run `agentreel init`)")),
+      (nativeCursorHooksInstalled() ? cursorHooksPath() : pc.yellow("not installed (run `agentreel init`)")),
   );
   console.log(
     "  attribution:   " +
@@ -89,7 +89,7 @@ export async function statusCommand(): Promise<void> {
   );
   console.log();
 
-  if (!existsSync(DB_PATH)) {
+  if (!existsSync(dbPath())) {
     console.log(pc.yellow("Run `agentreel init` to install hooks."));
     return;
   }

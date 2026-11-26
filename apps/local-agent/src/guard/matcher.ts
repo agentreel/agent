@@ -113,6 +113,7 @@ export function matchAllRules(
 }
 
 export const SCAN_TIMEOUT_REASON = "scan_timeout";
+export const SCAN_BUDGET_REASON = "scan_budget_exceeded";
 
 export interface DeadlineMatchResult {
   findings: Finding[];
@@ -192,6 +193,45 @@ export function matchAllRulesWithDeadline(
   const pass = createRulePass(rules, context, config, deadlineMs);
   const run = runWithTimeout(() => pass.run(), deadlineMs);
   return pass.finish(!run.ok);
+}
+
+/**
+ * Fail-closed findings for events the batch scan budget left unscanned.
+ * Same style as scan_timeout: every enabled rule is reported at its
+ * effective severity, because "not scanned" must never read as "clean".
+ * One finding per rule per call rather than per event, so a batch of 500
+ * unscanned events adds at most one finding per rule to a session. Config
+ * overrides, disabled rules and the user's allowlists apply as for real
+ * matches: a rule is skipped when every unscanned event is allowlisted.
+ * No command text in the evidence (see timeoutFinding).
+ */
+export function budgetFindings(
+  rules: Rule[],
+  unscanned: MatchContext[],
+  config: GuardConfig | undefined,
+  budgetMs: number
+): { findings: Finding[]; ruleIds: string[] } {
+  const findings: Finding[] = [];
+  const ruleIds: string[] = [];
+  if (unscanned.length === 0) return { findings, ruleIds };
+  for (const rule of rules) {
+    const ruleConfig = config?.rules?.[rule.id];
+    if (ruleConfig?.enabled === false || !rule.enabled) continue;
+    const finding: Finding = {
+      ruleId: rule.id,
+      severity: rule.severity,
+      category: rule.category,
+      timestamp: Date.now(),
+      reason: SCAN_BUDGET_REASON,
+      evidence: `${SCAN_BUDGET_REASON}: ${unscanned.length} event(s) not scanned within the ${Math.floor(budgetMs)}ms batch scan budget; counted as a match`,
+      context: { location: unscanned[0]?.cwd },
+    };
+    if (ruleConfig?.severity) finding.severity = ruleConfig.severity;
+    if (unscanned.every((ctx) => isAllowlisted(finding, ctx, config))) continue;
+    findings.push(finding);
+    ruleIds.push(rule.id);
+  }
+  return { findings, ruleIds };
 }
 
 function timeoutFinding(
