@@ -175,6 +175,63 @@ describe("guard scanner hard regex deadline", () => {
     expect(lines.join("\n")).toMatch(/blast-radius stats; stats are partial/);
   });
 
+  it("a rule-pass timeout is not counted as a blast-radius timeout", () => {
+    const { lines, log } = collectLog();
+    const summary = scanSession("s1", [bashEvent("echo hi", "evt-slow")], undefined, {
+      log,
+      rules: [rule("SLOW", "high", spin)],
+      deadlineMs: 20,
+    });
+    expect(summary.timedOut).toBe(true);
+    expect(lines).toHaveLength(1);
+    expect(lines[0]).toMatch(/1 event\(s\) exceeded the rule deadline \(evt-slow\)/);
+    expect(lines[0]).not.toMatch(/blast-radius/);
+    expect(lines[0]).not.toMatch(/stats are partial/);
+  });
+
+  it("a blast-radius timeout is not counted as a rule-pass timeout", () => {
+    const { lines, log } = collectLog();
+    const event: AgentEvent = {
+      ...bashEvent("ls"),
+      payload: { tool_name: "Bash", tool_input: { command: "ls" }, note: "file:".repeat(16 * 1024) },
+    };
+    const summary = scanSession("s1", [event], undefined, { log, deadlineMs: 20 });
+    expect(summary.timedOut).toBeUndefined();
+    expect(lines).toHaveLength(1);
+    expect(lines[0]).toMatch(/1 event\(s\) did not finish blast-radius stats; stats are partial/);
+    expect(lines[0]).not.toMatch(/exceeded the rule deadline/);
+  });
+
+  it("counts both kinds separately when a session has one of each", () => {
+    const { lines, log } = collectLog();
+    const slowEvent = bashEvent("echo slow", "evt-rule");
+    const blastEvent: AgentEvent = {
+      ...bashEvent("ls", "evt-blast"),
+      payload: { tool_name: "Bash", tool_input: { command: "ls" }, note: "file:".repeat(16 * 1024) },
+    };
+    // The spin rule only spins on the slow event, so the blast event reaches
+    // the blast-radius pass.
+    const spinOnSlow = rule("SLOW", "high", (ctx) => (ctx.command === "echo slow" ? spin() : false));
+    const summary = scanSession("s1", [slowEvent, blastEvent], undefined, {
+      log,
+      rules: [spinOnSlow],
+      deadlineMs: 20,
+    });
+    expect(summary.timedOutRuleIds).toEqual(["SLOW"]);
+    expect(lines).toHaveLength(1);
+    expect(lines[0]).toMatch(/1 event\(s\) exceeded the rule deadline \(evt-rule\)/);
+    expect(lines[0]).toMatch(/1 event\(s\) did not finish blast-radius stats/);
+  });
+
+  it("gives a 32KB command an 82.5ms budget because the payload JSON counts", () => {
+    const command = "x".repeat(32 * 1024);
+    const ms = scanDeadlineMs({
+      command,
+      payload: { tool_name: "Bash", tool_input: { command } },
+    });
+    expect(ms).toBeCloseTo(82.5, 5);
+  });
+
   it("resumable rule pass reports no timeout once it has finished", () => {
     const pass = createRulePass([rule("X", "warn", () => true)], ctxFor("x"), CONFIG, 50);
     pass.run();

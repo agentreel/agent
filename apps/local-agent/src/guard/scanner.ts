@@ -23,8 +23,10 @@ import { LOG_PATH, ensureAgentreelDir } from "../paths.js";
  * payload), capped at 1000ms. The per-KB allowance keeps legitimate large
  * payloads clean: a 500KB Read result takes about 50ms through all rules,
  * linear in size, and gets a 300ms budget. Crafted superlinear inputs blow
- * far past it: "git push" plus 32KB of spaces took 3.3s natively and now
- * stops at its 66ms budget.
+ * far past it. The command counts twice, once as itself and once inside the
+ * JSON payload, so a 32KB command gets 50 + 65 * 0.5 = 82.5ms. (Before the
+ * built-in rules were made linear, "git push" plus 32KB of spaces took 3.3s
+ * natively and stopped at that budget.)
  */
 export const SCAN_DEADLINE_BASE_MS = 50;
 export const SCAN_DEADLINE_PER_KB_MS = 0.5;
@@ -95,6 +97,9 @@ export function scanSession(
   const allFindings: Finding[] = [];
   const timedOutRuleIds = new Set<string>();
   const timedOutEventIds: string[] = [];
+  // Events whose blast-radius stats pass ran out of time. Rule-pass timeouts
+  // are tracked separately in timedOutEventIds: they fail closed as findings
+  // and are not a blast-radius problem.
   let blastRadiusTimeouts = 0;
   const commandsExecuted = new Set<string>();
   const filesAccessed = new Set<string>();
@@ -145,7 +150,7 @@ export function scanSession(
       timedOutEventIds.push(event.id);
       for (const id of result.timedOutRuleIds) timedOutRuleIds.add(id);
     }
-    if (!run.ok) blastRadiusTimeouts++;
+    if (!run.ok && blastPhase) blastRadiusTimeouts++;
   }
 
   if (timedOutEventIds.length > 0 || blastRadiusTimeouts > 0) {
