@@ -1554,6 +1554,52 @@
         "reason": "invalid_rule",
         "invalid_rule_ids": ["cust_alt_branch_overlap_regex"]
       }
+    },
+    {
+      "name": "Unicode case-fold leading literal Kelvin U+212A overlapping \\w is rejected by validatePolicy and fails closed in eval",
+      "expected_valid": false,
+      "expected_rejected_rule_id": "cust_unicode_casefold_overlap_regex",
+      "expected_rejected_condition_index": 0,
+      "policy": {
+        "version": 1,
+        "etag": "etag-42",
+        "workspace_id": "ws_test",
+        "updated_at": "2026-11-25T00:00:00Z",
+        "mode": "enforce",
+        "offline": "last_known",
+        "builtin": {},
+        "custom": [
+          {
+            "id": "cust_unicode_casefold_overlap_regex",
+            "name": "Unicode case-fold overlapping leading literal regex",
+            "enabled": true,
+            "version": 1,
+            "message": "Non-ASCII leading literals are not disjoint from unbounded atoms",
+            "when": [
+              {
+                "field": "command",
+                "op": "regex",
+                "value": "\\u212A\\w+\\s+\\w+\\u{1F600}?"
+              }
+            ],
+            "action": "block",
+            "severity": "high",
+            "scope": {}
+          }
+        ],
+        "allow": { "commands": [], "paths": [], "repos": [] }
+      },
+      "input": {
+        "tool": "claude-code",
+        "toolName": "Bash",
+        "command": "echo hi"
+      },
+      "expected": {
+        "action": "block",
+        "rule_ids": [],
+        "reason": "invalid_rule",
+        "invalid_rule_ids": ["cust_unicode_casefold_overlap_regex"]
+      }
     }
   ]
 }
