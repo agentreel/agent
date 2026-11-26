@@ -1,15 +1,31 @@
+import { appendFileSync } from "node:fs";
 import type { AgentConfig } from "../config.js";
+import { ensureAgentreelDir, LOG_PATH } from "../paths.js";
 import { scrubString } from "../redact/scrubber.js";
 import {
   DEFAULT_APPROVAL_EXPIRES_S,
+  DEFAULT_APPROVAL_OFFLINE_FALLBACK,
   type ApprovalOfflineFallback,
   type PolicyTool,
 } from "./types.js";
 
+export { DEFAULT_APPROVAL_OFFLINE_FALLBACK };
+
 export const APPROVAL_LONG_POLL_WAIT_S = 25;
 export const APPROVAL_POST_TIMEOUT_MS = 10_000;
 export const APPROVAL_POLL_BUFFER_MS = 5_000;
-export const DEFAULT_APPROVAL_OFFLINE_FALLBACK: ApprovalOfflineFallback = "deny";
+
+function defaultApprovalLog(message: string): void {
+  try {
+    ensureAgentreelDir();
+    appendFileSync(
+      LOG_PATH,
+      `[${new Date().toISOString()}] policy approval: ${message}\n`,
+    );
+  } catch {
+    // Logging must never crash or block a hook.
+  }
+}
 
 export interface ApprovalRequestParams {
   decisionId: string;
@@ -29,6 +45,7 @@ export interface ApprovalRequestParams {
   retryDelayMs?: number;
   postRetries?: number;
   pollRetries?: number;
+  log?: (message: string) => void;
 }
 
 export type ApprovalOutcome =
@@ -59,6 +76,7 @@ interface ApprovalPostResponse {
 
 interface ApprovalPollResponse {
   status?: string;
+  expires_at?: string | number;
   decided_by?: string;
   reason?: string;
 }
@@ -214,6 +232,7 @@ export async function requestRemoteApproval(
   const nowFn = params.now ?? Date.now;
   const sleepFn = params.sleep ?? defaultSleep;
   const fetchImpl = params.fetchImpl ?? globalThis.fetch;
+  const log = params.log ?? defaultApprovalLog;
   const fallback = params.offlineFallback ?? DEFAULT_APPROVAL_OFFLINE_FALLBACK;
   const expiresS = params.expiresS ?? DEFAULT_APPROVAL_EXPIRES_S;
   const minPollDelayMs = params.minPollDelayMs ?? 100;
@@ -232,6 +251,13 @@ export async function requestRemoteApproval(
     effectiveDeadlineMs = params.hookDeadlineMs;
     hookDeadlineBinding = true;
   }
+  const tightenServerExpiry = (expiresAt: string | number | undefined): void => {
+    const serverExpiresMs = parseExpiresAtMs(expiresAt);
+    if (serverExpiresMs !== null && serverExpiresMs < effectiveDeadlineMs) {
+      effectiveDeadlineMs = serverExpiresMs;
+      hookDeadlineBinding = false;
+    }
+  };
   const timeoutReason = (): string =>
     hookDeadlineBinding
       ? "hook deadline reached waiting for approval"
@@ -321,6 +347,15 @@ export async function requestRemoteApproval(
       return offlineOrTimeout(lastErrorReason);
     }
 
+    if (result.status === 409) {
+      log(
+        `client bug: POST /api/v1/approvals returned HTTP 409 Conflict for decision_id=${params.decisionId} (decision_id reused with a different payload); applying offline_fallback=${fallback}`,
+      );
+      return offlineOrTimeout(
+        "approval conflict (HTTP 409): decision_id reused with a different payload",
+      );
+    }
+
     if (!result.ok) {
       return offlineOrTimeout(`approval server returned HTTP ${result.status}`);
     }
@@ -343,11 +378,7 @@ export async function requestRemoteApproval(
   );
   if (immediate) return immediate;
 
-  const serverExpiresMs = parseExpiresAtMs(postData.expires_at);
-  if (serverExpiresMs !== null && serverExpiresMs < effectiveDeadlineMs) {
-    effectiveDeadlineMs = serverExpiresMs;
-    hookDeadlineBinding = false;
-  }
+  tightenServerExpiry(postData.expires_at);
 
   let nextDelayMs =
     typeof postData.poll_after_ms === "number" && postData.poll_after_ms > 0
@@ -429,6 +460,11 @@ export async function requestRemoteApproval(
         `unexpected approval status: ${String(pollData.status)}`,
         approvalId,
       );
+    }
+
+    tightenServerExpiry(pollData.expires_at);
+    if (nowFn() >= effectiveDeadlineMs) {
+      break;
     }
 
     const elapsed = nowFn() - pollStartedAt;

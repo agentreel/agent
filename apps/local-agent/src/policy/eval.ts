@@ -2,15 +2,17 @@ import { matchRule } from "../guard/matcher.js";
 import { RULES } from "../guard/rules.js";
 import type { MatchContext, Rule, Severity } from "../guard/types.js";
 import { compileSafeRegex, testSafeRegex } from "./regex.js";
-import type {
-  CustomRule,
-  CustomRuleCondition,
-  CustomRuleScope,
-  Policy,
-  PolicyAction,
-  PolicyDecisionAction,
-  PolicyTool,
-  RuleApprovalConfig,
+import {
+  isNoOrgPolicy,
+  resolveEffectiveRuleApproval,
+  type CustomRule,
+  type CustomRuleCondition,
+  type CustomRuleScope,
+  type Policy,
+  type PolicyAction,
+  type PolicyDecisionAction,
+  type PolicyTool,
+  type RuleApprovalConfig,
 } from "./types.js";
 
 export const POLICY_EVAL_DEADLINE_MS = 50;
@@ -28,6 +30,7 @@ export interface PolicyEvalInput {
   repo?: string;
   branch?: string;
   member?: string;
+  teams?: string[];
 }
 
 export interface PolicyRuleMatch {
@@ -237,6 +240,7 @@ function isExemptByAllowLists(input: PolicyEvalInput, policy: Policy): boolean {
 function matchesScope(
   scope: CustomRuleScope | undefined,
   input: PolicyEvalInput,
+  policyTeams?: string[],
 ): boolean {
   if (!scope) return true;
 
@@ -257,6 +261,14 @@ function matchesScope(
   if (scope.members && scope.members.length > 0) {
     if (!input.member) return false;
     if (!scope.members.includes(input.member)) {
+      return false;
+    }
+  }
+
+  if (scope.teams && scope.teams.length > 0) {
+    const userTeams = input.teams ?? policyTeams;
+    if (!userTeams || userTeams.length === 0) return false;
+    if (!scope.teams.some((t) => userTeams.includes(t))) {
       return false;
     }
   }
@@ -428,11 +440,12 @@ function matchesCustomRule(
   input: PolicyEvalInput,
   clock: EvalClock,
   state: RuleEvalState,
+  policyTeams?: string[],
 ): boolean {
   if (checkExpired(clock)) return false;
   if (!rule.enabled) return false;
   if (!rule.when || rule.when.length === 0) return false;
-  if (!matchesScope(rule.scope, input)) return false;
+  if (!matchesScope(rule.scope, input, policyTeams)) return false;
   for (const cond of rule.when) {
     if (!matchesCondition(cond, input, clock, state)) return false;
     if (clock.timedOut || state.compileFailed) return false;
@@ -599,7 +612,7 @@ export function evaluatePolicy(
     timedOut: false,
   };
 
-  if (isExemptByAllowLists(input, policy)) {
+  if (isNoOrgPolicy(policy) || isExemptByAllowLists(input, policy)) {
     return {
       action: "allow",
       rule_ids: [],
@@ -657,6 +670,13 @@ export function evaluatePolicy(
     const finding = matchRule(entry.effectiveRule, ctx);
     if (finding) {
       const severity: Severity = entry.override?.severity ?? finding.severity;
+      const effectiveApproval =
+        entry.action === "require_approval"
+          ? resolveEffectiveRuleApproval(
+              entry.override?.approval,
+              policy.approval_defaults,
+            )
+          : entry.override?.approval;
       matches.push({
         rule_id: entry.rule.id,
         name: entry.rule.name,
@@ -664,9 +684,7 @@ export function evaluatePolicy(
         action: entry.action,
         severity,
         source: "builtin",
-        ...(entry.override?.approval
-          ? { approval: entry.override.approval }
-          : {}),
+        ...(effectiveApproval ? { approval: effectiveApproval } : {}),
       });
     }
     const hasMoreRules =
@@ -692,10 +710,20 @@ export function evaluatePolicy(
       );
     }
     const rule = orderedCustom[i]!;
-    if (!matchesScope(rule.scope, input)) continue;
+    if (!matchesScope(rule.scope, input, policy.current_user_teams)) continue;
     const state: RuleEvalState = { compileFailed: false };
-    const matched = matchesCustomRule(rule, input, clock, state);
+    const matched = matchesCustomRule(
+      rule,
+      input,
+      clock,
+      state,
+      policy.current_user_teams,
+    );
     if (matched) {
+      const effectiveApproval =
+        rule.action === "require_approval"
+          ? resolveEffectiveRuleApproval(rule.approval, policy.approval_defaults)
+          : rule.approval;
       matches.push({
         rule_id: rule.id,
         name: rule.name,
@@ -703,7 +731,7 @@ export function evaluatePolicy(
         action: rule.action,
         severity: rule.severity,
         source: "custom",
-        ...(rule.approval ? { approval: rule.approval } : {}),
+        ...(effectiveApproval ? { approval: effectiveApproval } : {}),
       });
       if (i + 1 < orderedCustom.length && checkExpired(clock)) {
         return finalizeTimeout(

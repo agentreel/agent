@@ -247,6 +247,7 @@ describe("policy fetch and cache", () => {
       const result = await fetchPolicy({
         config: makeConfig(srv.url, "ar_live_testkey123"),
         cachePath,
+        cwd: workDir,
         now: () => now,
         log: () => {},
       });
@@ -665,7 +666,8 @@ describe("initCommand policy fetch behaviour", () => {
     const policy = makePolicy({ etag: "etag-init-linked" });
     let policyCalls = 0;
     const srv = await startMockServer((req, res) => {
-      if (req.url === "/api/v1/policy") {
+      const pathname = new URL(req.url ?? "/", "http://127.0.0.1").pathname;
+      if (pathname === "/api/v1/policy") {
         policyCalls++;
         res.writeHead(200, { "content-type": "application/json" });
         res.end(JSON.stringify(policy));
@@ -711,13 +713,14 @@ describe("initCommand policy fetch behaviour", () => {
     let ingestCalls = 0;
     let policyCalls = 0;
     const srv = await startMockServer((req, res) => {
-      if (req.url === "/api/v1/sessions/ingest") {
+      const pathname = new URL(req.url ?? "/", "http://127.0.0.1").pathname;
+      if (pathname === "/api/v1/sessions/ingest") {
         ingestCalls++;
         res.writeHead(200, { "content-type": "application/json" });
         res.end(JSON.stringify({ ok: true }));
         return;
       }
-      if (req.url === "/api/v1/policy") {
+      if (pathname === "/api/v1/policy") {
         policyCalls++;
         res.writeHead(404);
         res.end();

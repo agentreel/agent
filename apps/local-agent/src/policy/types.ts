@@ -9,6 +9,9 @@ export type PolicyTool = "claude-code" | "cursor";
 export type ApprovalOfflineFallback = "deny" | "allow";
 
 export const DEFAULT_APPROVAL_EXPIRES_S = 120;
+export const DEFAULT_APPROVAL_OFFLINE_FALLBACK: ApprovalOfflineFallback = "deny";
+export const MIN_APPROVAL_EXPIRES_S = 10;
+export const MAX_APPROVAL_EXPIRES_S = 3600;
 export const PRE_EXEC_TIMEOUT_BUFFER_S = 10;
 export const DEFAULT_PRE_EXEC_HOOK_TIMEOUT_S =
   DEFAULT_APPROVAL_EXPIRES_S + PRE_EXEC_TIMEOUT_BUFFER_S;
@@ -29,9 +32,75 @@ export function computeHookDeadlineMs(
   return startMs + usableS * 1000;
 }
 
+export function repoSlugFromRemoteUrl(
+  remoteUrl: string | undefined,
+): string | undefined {
+  if (!remoteUrl) return undefined;
+  const trimmed = remoteUrl.trim();
+  if (!trimmed) return undefined;
+  if (trimmed.includes("://")) {
+    try {
+      const u = new URL(trimmed);
+      if (
+        u.protocol !== "https:" &&
+        u.protocol !== "http:" &&
+        u.protocol !== "ssh:"
+      ) {
+        return undefined;
+      }
+      const slug = u.pathname
+        .replace(/^\/+/, "")
+        .replace(/\/+$/, "")
+        .replace(/\.git$/i, "");
+      return slug || undefined;
+    } catch {
+      return undefined;
+    }
+  }
+  const scp = /^[^@]+@[^:]+:(.+)$/.exec(trimmed);
+  if (scp && scp[1]) {
+    const slug = scp[1]
+      .replace(/^\/+/, "")
+      .replace(/\/+$/, "")
+      .replace(/\.git$/i, "");
+    return slug || undefined;
+  }
+  return undefined;
+}
+
 export interface RuleApprovalConfig {
   expires_s?: number;
   offline_fallback?: ApprovalOfflineFallback;
+}
+
+export interface ResolvedApprovalConfig {
+  expires_s: number;
+  offline_fallback: ApprovalOfflineFallback;
+}
+
+export function resolveEffectiveRuleApproval(
+  ruleApproval?: RuleApprovalConfig,
+  policyDefaults?: RuleApprovalConfig,
+): ResolvedApprovalConfig {
+  const ruleExp = ruleApproval?.expires_s;
+  const defaultExp = policyDefaults?.expires_s;
+  const expires_s =
+    typeof ruleExp === "number" && Number.isFinite(ruleExp) && ruleExp > 0
+      ? ruleExp
+      : typeof defaultExp === "number" &&
+          Number.isFinite(defaultExp) &&
+          defaultExp > 0
+        ? defaultExp
+        : DEFAULT_APPROVAL_EXPIRES_S;
+  const offline_fallback =
+    ruleApproval?.offline_fallback ??
+    policyDefaults?.offline_fallback ??
+    DEFAULT_APPROVAL_OFFLINE_FALLBACK;
+  return { expires_s, offline_fallback };
+}
+
+export function isNoOrgPolicy(policy: Policy | null | undefined): boolean {
+  return policy !== null && policy !== undefined && policy.org_id === null;
 }
 
 /**
@@ -41,30 +110,26 @@ export interface RuleApprovalConfig {
 export function computeMaxPolicyApprovalExpiresS(
   policy?: Policy | null,
 ): number | null {
-  if (!policy) return null;
+  if (!policy || isNoOrgPolicy(policy)) return null;
   let maxExpiresS: number | null = null;
 
   for (const override of Object.values(policy.builtin)) {
     if (override.enabled === false) continue;
     if (override.action !== "require_approval") continue;
-    const exp =
-      typeof override.approval?.expires_s === "number" &&
-      Number.isFinite(override.approval.expires_s) &&
-      override.approval.expires_s > 0
-        ? override.approval.expires_s
-        : DEFAULT_APPROVAL_EXPIRES_S;
+    const exp = resolveEffectiveRuleApproval(
+      override.approval,
+      policy.approval_defaults,
+    ).expires_s;
     maxExpiresS = maxExpiresS === null ? exp : Math.max(maxExpiresS, exp);
   }
 
   for (const rule of policy.custom) {
     if (!rule.enabled) continue;
     if (rule.action !== "require_approval") continue;
-    const exp =
-      typeof rule.approval?.expires_s === "number" &&
-      Number.isFinite(rule.approval.expires_s) &&
-      rule.approval.expires_s > 0
-        ? rule.approval.expires_s
-        : DEFAULT_APPROVAL_EXPIRES_S;
+    const exp = resolveEffectiveRuleApproval(
+      rule.approval,
+      policy.approval_defaults,
+    ).expires_s;
     maxExpiresS = maxExpiresS === null ? exp : Math.max(maxExpiresS, exp);
   }
 
@@ -73,7 +138,15 @@ export function computeMaxPolicyApprovalExpiresS(
 
 export function computePreExecTimeoutS(policy?: Policy | null): number {
   let maxExpiresS = DEFAULT_APPROVAL_EXPIRES_S;
-  if (policy) {
+  if (policy && !isNoOrgPolicy(policy)) {
+    const defaultExp = policy.approval_defaults?.expires_s;
+    if (
+      typeof defaultExp === "number" &&
+      Number.isFinite(defaultExp) &&
+      defaultExp > maxExpiresS
+    ) {
+      maxExpiresS = defaultExp;
+    }
     for (const override of Object.values(policy.builtin)) {
       const exp = override.approval?.expires_s;
       if (typeof exp === "number" && Number.isFinite(exp) && exp > maxExpiresS) {
@@ -123,6 +196,7 @@ export interface CustomRuleScope {
   repos?: string[];
   branches?: string[];
   members?: string[];
+  teams?: string[];
   tools?: PolicyTool[];
 }
 
@@ -148,12 +222,16 @@ export interface PolicyAllowLists {
 export interface Policy {
   version: 1;
   etag: string;
-  workspace_id: string;
+  workspace_id: string | null;
+  org_id?: string | null;
   org_name?: string;
   org_slug?: string;
   updated_at: string | number;
+  fetched_at?: string | number;
   mode: PolicyMode;
   offline: PolicyOfflineMode;
+  approval_defaults?: RuleApprovalConfig;
+  current_user_teams?: string[];
   builtin: Record<string, BuiltinRuleOverride>;
   custom: CustomRule[];
   allow: PolicyAllowLists;
@@ -170,6 +248,7 @@ export type ValidationResult<T> =
   | {
       ok: false;
       error: string;
+      rejectedReason?: "unsupported_regex" | "invalid_policy";
       rejectedRuleId?: string;
       rejectedConditionIndex?: number;
     };
@@ -204,6 +283,7 @@ const APPROVAL_OFFLINE_FALLBACKS = new Set<string>(["deny", "allow"]);
 function validateRuleApproval(
   input: unknown,
   path: string,
+  ruleId?: string,
 ): ValidationResult<RuleApprovalConfig> {
   if (!isPlainObject(input)) {
     return { ok: false, error: `${path} must be an object` };
@@ -212,12 +292,16 @@ function validateRuleApproval(
   if (input.expires_s !== undefined) {
     if (
       typeof input.expires_s !== "number" ||
-      !Number.isFinite(input.expires_s) ||
-      input.expires_s <= 0
+      !Number.isInteger(input.expires_s) ||
+      input.expires_s < MIN_APPROVAL_EXPIRES_S ||
+      input.expires_s > MAX_APPROVAL_EXPIRES_S
     ) {
+      const target = ruleId ? `rule ${ruleId} (${path}.expires_s)` : `${path}.expires_s`;
       return {
         ok: false,
-        error: `${path}.expires_s must be a positive finite number`,
+        error: `${target} must be an integer between ${MIN_APPROVAL_EXPIRES_S} and ${MAX_APPROVAL_EXPIRES_S}`,
+        rejectedReason: "invalid_policy",
+        ...(ruleId ? { rejectedRuleId: ruleId } : {}),
       };
     }
     out.expires_s = input.expires_s;
@@ -286,6 +370,7 @@ function validateCondition(
     return {
       ok: false,
       error: `rule ${ruleId} has an unsupported regex at when[${condIndex}]`,
+      rejectedReason: "unsupported_regex",
       rejectedRuleId: ruleId,
       rejectedConditionIndex: condIndex,
     };
@@ -328,6 +413,12 @@ function validateScope(
       return { ok: false, error: `${path}.members must be a string array` };
     }
     scope.members = [...input.members];
+  }
+  if (input.teams !== undefined) {
+    if (!isStringArray(input.teams)) {
+      return { ok: false, error: `${path}.teams must be a string array` };
+    }
+    scope.teams = [...input.teams];
   }
   if (input.tools !== undefined) {
     if (
@@ -401,7 +492,7 @@ function validateCustomRule(
   }
   let approval: RuleApprovalConfig | undefined;
   if (input.approval !== undefined) {
-    const a = validateRuleApproval(input.approval, `${path}.approval`);
+    const a = validateRuleApproval(input.approval, `${path}.approval`, input.id);
     if (!a.ok) return a;
     approval = a.value;
   }
@@ -435,9 +526,56 @@ export function validatePolicy(
   if (!isNonEmptyString(input.etag)) {
     return { ok: false, error: "policy.etag must be a non-empty string" };
   }
-  if (!isNonEmptyString(input.workspace_id)) {
-    return { ok: false, error: "policy.workspace_id must be a non-empty string" };
+
+  let orgId: string | null | undefined;
+  let workspaceId: string | null;
+  if (input.org_id === null) {
+    orgId = null;
+    if (
+      input.workspace_id !== undefined &&
+      input.workspace_id !== null &&
+      typeof input.workspace_id !== "string"
+    ) {
+      return {
+        ok: false,
+        error: "policy.workspace_id must be a string or null when org_id is null",
+      };
+    }
+    workspaceId =
+      typeof input.workspace_id === "string" && input.workspace_id.trim().length > 0
+        ? input.workspace_id
+        : null;
+  } else if (input.org_id !== undefined) {
+    if (!isNonEmptyString(input.org_id)) {
+      return {
+        ok: false,
+        error: "policy.org_id must be a non-empty string or null",
+      };
+    }
+    orgId = input.org_id;
+    if (input.workspace_id !== undefined && input.workspace_id !== null) {
+      if (!isNonEmptyString(input.workspace_id)) {
+        return {
+          ok: false,
+          error: "policy.workspace_id must be a non-empty string",
+        };
+      }
+      if (input.org_id !== input.workspace_id) {
+        return {
+          ok: false,
+          error: `policy org_id (${input.org_id}) does not match workspace_id (${input.workspace_id})`,
+          rejectedReason: "invalid_policy",
+        };
+      }
+    }
+    workspaceId = input.org_id;
+  } else {
+    if (!isNonEmptyString(input.workspace_id)) {
+      return { ok: false, error: "policy.workspace_id must be a non-empty string" };
+    }
+    workspaceId = input.workspace_id;
   }
+
   if (input.org_name !== undefined && !isNonEmptyString(input.org_name)) {
     return { ok: false, error: "policy.org_name must be a non-empty string" };
   }
@@ -453,6 +591,21 @@ export function validatePolicy(
       error: "policy.updated_at must be a non-empty string or finite number",
     };
   }
+  let fetchedAt: string | number | undefined;
+  if (input.fetched_at !== undefined) {
+    const validFetchedAt =
+      isNonEmptyString(input.fetched_at) ||
+      (typeof input.fetched_at === "number" &&
+        Number.isFinite(input.fetched_at) &&
+        input.fetched_at >= 0);
+    if (!validFetchedAt) {
+      return {
+        ok: false,
+        error: "policy.fetched_at must be a non-empty string or finite non-negative number",
+      };
+    }
+    fetchedAt = input.fetched_at as string | number;
+  }
   if (typeof input.mode !== "string" || !POLICY_MODES.has(input.mode)) {
     return { ok: false, error: 'policy.mode must be "observe" or "enforce"' };
   }
@@ -461,6 +614,27 @@ export function validatePolicy(
       ok: false,
       error: 'policy.offline must be "last_known" or "fail_open"',
     };
+  }
+
+  let approvalDefaults: RuleApprovalConfig | undefined;
+  if (input.approval_defaults !== undefined) {
+    const ad = validateRuleApproval(
+      input.approval_defaults,
+      "policy.approval_defaults",
+    );
+    if (!ad.ok) return ad;
+    approvalDefaults = ad.value;
+  }
+
+  let currentUserTeams: string[] | undefined;
+  if (input.current_user_teams !== undefined) {
+    if (!isStringArray(input.current_user_teams)) {
+      return {
+        ok: false,
+        error: "policy.current_user_teams must be a string array",
+      };
+    }
+    currentUserTeams = [...input.current_user_teams];
   }
 
   if (!isPlainObject(input.builtin)) {
@@ -503,6 +677,7 @@ export function validatePolicy(
       const a = validateRuleApproval(
         rawOverride.approval,
         `policy.builtin.${ruleId}.approval`,
+        ruleId,
       );
       if (!a.ok) return a;
       approval = a.value;
@@ -541,17 +716,45 @@ export function validatePolicy(
     return { ok: false, error: "policy.allow.repos must be a string array" };
   }
 
+  if (orgId === null) {
+    const isEmptyAllow =
+      input.allow.commands.length === 0 &&
+      input.allow.paths.length === 0 &&
+      input.allow.repos.length === 0;
+    if (
+      input.mode !== "observe" ||
+      Object.keys(builtin).length > 0 ||
+      custom.length > 0 ||
+      !isEmptyAllow
+    ) {
+      return {
+        ok: false,
+        error:
+          'policy with org_id null must have mode "observe" and empty builtin, custom, and allow',
+        rejectedReason: "invalid_policy",
+      };
+    }
+  }
+
   return {
     ok: true,
     value: {
       version: 1,
       etag: input.etag,
-      workspace_id: input.workspace_id,
+      workspace_id: workspaceId,
+      ...(orgId !== undefined ? { org_id: orgId } : {}),
       ...(input.org_name !== undefined ? { org_name: input.org_name } : {}),
       ...(input.org_slug !== undefined ? { org_slug: input.org_slug } : {}),
       updated_at: input.updated_at as string | number,
+      ...(fetchedAt !== undefined ? { fetched_at: fetchedAt } : {}),
       mode: input.mode as PolicyMode,
       offline: input.offline as PolicyOfflineMode,
+      ...(approvalDefaults !== undefined
+        ? { approval_defaults: approvalDefaults }
+        : {}),
+      ...(currentUserTeams !== undefined
+        ? { current_user_teams: currentUserTeams }
+        : {}),
       builtin,
       custom,
       allow: {

@@ -718,7 +718,7 @@ describe("remote approval flow", () => {
   });
 
   it("denies on timeout even if offline_fallback is allow", async () => {
-    const policy = makeApprovalPolicy({ expires_s: 0.08, offline_fallback: "allow" });
+    const policy = makeApprovalPolicy({ expires_s: 10, offline_fallback: "allow" });
     cache.writeCachedPolicyAtomic(
       { policy, etag: policy.etag, fetched_at: Date.now() },
       cachePath,
@@ -728,10 +728,17 @@ describe("remote approval flow", () => {
       if (req.method === "POST") {
         await readRequestBody(req);
         res.writeHead(200, { "content-type": "application/json" });
-        res.end(JSON.stringify({ approval_id: "apr_to", status: "pending", poll_after_ms: 5 }));
+        res.end(
+          JSON.stringify({
+            approval_id: "apr_to",
+            status: "pending",
+            poll_after_ms: 5,
+            expires_at: new Date(Date.now() + 80).toISOString(),
+          }),
+        );
         return;
       }
-      // Hang longer than expires_s to force a timeout
+      // Hang longer than effective expiry to force a timeout
       await new Promise((r) => setTimeout(r, 300));
       if (!res.writableEnded) {
         res.writeHead(200, { "content-type": "application/json" });
@@ -2126,7 +2133,7 @@ describe("hook deadline enforcement, timeout pre-check, init recording, and doct
     expect(outcome.decision?.approval_status).toBe("timeout");
   });
 
-  it("denies as timeout (never offline_allow) when expires_s (5s) is tighter than hook deadline (60s) and 500 arrives at 6s", async () => {
+  it("denies as timeout (never offline_allow) when expires_s (10s) is tighter than hook deadline (60s) and 500 arrives at 11s", async () => {
     await import("../src/policy/approval.js");
     vi.useFakeTimers();
     const baseTime = 1_764_405_000_000;
@@ -2138,7 +2145,7 @@ describe("hook deadline enforcement, timeout pre-check, init recording, and doct
         GIT001: {
           enabled: true,
           action: "require_approval",
-          approval: { expires_s: 5, offline_fallback: "allow" },
+          approval: { expires_s: 10, offline_fallback: "allow" },
         },
       },
     });
@@ -2148,12 +2155,12 @@ describe("hook deadline enforcement, timeout pre-check, init recording, and doct
     );
 
     const hookDeadlineMs = baseTime + 60_000;
-    // HTTP 500 arrives at 6s: past expires_s (5s), well before hookDeadlineMs (60s).
+    // HTTP 500 arrives at 11s: past expires_s (10s), well before hookDeadlineMs (60s).
     const fetchImpl: typeof fetch = () =>
       new Promise<Response>((resolve) => {
         setTimeout(() => {
           resolve(new Response(JSON.stringify({ error: "server error" }), { status: 500 }));
-        }, 6_000);
+        }, 11_000);
       });
 
     const outcomePromise = enforce.enforcePreExec(
@@ -2176,7 +2183,7 @@ describe("hook deadline enforcement, timeout pre-check, init recording, and doct
       },
     );
 
-    await vi.advanceTimersByTimeAsync(6_000);
+    await vi.advanceTimersByTimeAsync(11_000);
     const outcome = await outcomePromise;
     expect(outcome.permitted).toBe(false);
     expect(outcome.enforced).toBe(true);

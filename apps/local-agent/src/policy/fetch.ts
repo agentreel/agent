@@ -1,3 +1,4 @@
+import { execFileSync } from "node:child_process";
 import { appendFileSync } from "node:fs";
 import { readConfig, type AgentConfig } from "../config.js";
 import { ensureAgentreelDir, LOG_PATH, POLICY_PATH } from "../paths.js";
@@ -9,11 +10,30 @@ import {
   writeCachedPolicyAtomic,
   writePolicyRejectionAtomic,
 } from "./cache.js";
-import { validatePolicy, type Policy } from "./types.js";
+import {
+  repoSlugFromRemoteUrl,
+  validatePolicy,
+  type Policy,
+} from "./types.js";
 
-export { POLICY_REFRESH_INTERVAL_MS, shouldRefreshPolicy };
+export { POLICY_REFRESH_INTERVAL_MS, repoSlugFromRemoteUrl, shouldRefreshPolicy };
 
 export const POLICY_FETCH_TIMEOUT_MS = 10_000;
+
+export function detectOriginRepo(cwd: string = process.cwd()): string | undefined {
+  try {
+    const out = execFileSync("git", ["-C", cwd, "remote", "get-url", "origin"], {
+      encoding: "utf8",
+      timeout: 1500,
+      stdio: ["ignore", "pipe", "ignore"],
+      env: { ...process.env, GIT_TERMINAL_PROMPT: "0", GIT_OPTIONAL_LOCKS: "0" },
+    }).trim();
+    if (!out) return undefined;
+    return repoSlugFromRemoteUrl(out);
+  } catch {
+    return undefined;
+  }
+}
 
 export type FetchPolicyResult =
   | { status: "unlinked" }
@@ -30,6 +50,8 @@ export type FetchPolicyResult =
 export interface FetchPolicyOptions {
   config?: AgentConfig;
   cachePath?: string;
+  cwd?: string;
+  repo?: string | null;
   timeoutMs?: number;
   now?: () => number;
   fetchImpl?: typeof fetch;
@@ -69,7 +91,14 @@ export async function fetchPolicy(
     }
 
     const cached = readCachedPolicy(cachePath);
-    const url = `${cfg.apiBaseUrl.replace(/\/$/, "")}/api/v1/policy`;
+    const repoSlug =
+      opts.repo !== undefined
+        ? opts.repo?.trim() || undefined
+        : detectOriginRepo(opts.cwd ?? process.cwd());
+    const basePolicyUrl = `${cfg.apiBaseUrl.replace(/\/$/, "")}/api/v1/policy`;
+    const url = repoSlug
+      ? `${basePolicyUrl}?repo=${encodeURIComponent(repoSlug)}`
+      : basePolicyUrl;
     const headers: Record<string, string> = {
       accept: "application/json",
       authorization: `Bearer ${cfg.apiKey}`,
@@ -169,9 +198,10 @@ export async function fetchPolicy(
             {
               ts: nowFn(),
               error: validated.error,
-              reason: validated.rejectedRuleId
-                ? "unsupported_regex"
-                : "invalid_policy",
+              reason:
+                validated.rejectedReason === "unsupported_regex"
+                  ? "unsupported_regex"
+                  : "invalid_policy",
               ...(validated.rejectedRuleId
                 ? { rule_id: validated.rejectedRuleId }
                 : {}),
