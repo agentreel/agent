@@ -1,6 +1,7 @@
 import type { Rule, MatchContext, Finding } from "./types.js";
 import type { GuardConfig } from "./types.js";
 import { scrubString, scrubAny } from "../redact/scrubber.js";
+import { runWithTimeout } from "../policy/regex.js";
 
 export function matchRule(rule: Rule, context: MatchContext): Finding | null {
   if (!rule.enabled) return null;
@@ -109,6 +110,108 @@ export function matchAllRules(
   }
 
   return findings;
+}
+
+export const SCAN_TIMEOUT_REASON = "scan_timeout";
+
+export interface DeadlineMatchResult {
+  findings: Finding[];
+  /** True when the deadline preempted the rule pass before it finished. */
+  timedOut: boolean;
+  /** Rules that never finished and were reported as fail-closed findings. */
+  timedOutRuleIds: string[];
+}
+
+/**
+ * A resumable built-in rule pass. run() does the same work as matchAllRules
+ * and records which rule it is on, so a caller can run it under a hard VM
+ * deadline (runWithTimeout) together with other work in a single VM call.
+ * finish(true) fails closed: the rule that was running and every enabled
+ * rule after it are unevaluated, and each is reported as a finding at its
+ * effective severity with reason "scan_timeout" (unknown counts as matched,
+ * never clean). Findings from rules that finished are kept. Disabled rules
+ * and the user's allowlists apply exactly as they do to real matches.
+ */
+export interface RulePass {
+  run(): void;
+  finish(timedOut: boolean): DeadlineMatchResult;
+}
+
+export function createRulePass(
+  rules: Rule[],
+  context: MatchContext,
+  config: GuardConfig | undefined,
+  deadlineMs: number
+): RulePass {
+  const findings: Finding[] = [];
+  let next = 0;
+  let done = false;
+
+  return {
+    run() {
+      for (; next < rules.length; next++) {
+        const rule = rules[next]!;
+        const ruleConfig = config?.rules?.[rule.id];
+        if (ruleConfig?.enabled === false) continue;
+
+        const finding = matchRule(rule, context);
+        if (!finding) continue;
+        if (ruleConfig?.severity) finding.severity = ruleConfig.severity;
+        if (isAllowlisted(finding, context, config)) continue;
+        findings.push(finding);
+      }
+      done = true;
+    },
+    finish(timedOut) {
+      if (!timedOut || done) {
+        return { findings, timedOut: false, timedOutRuleIds: [] };
+      }
+      const timedOutRuleIds: string[] = [];
+      for (let i = next; i < rules.length; i++) {
+        const rule = rules[i]!;
+        const ruleConfig = config?.rules?.[rule.id];
+        if (ruleConfig?.enabled === false || !rule.enabled) continue;
+        const finding = timeoutFinding(rule, context, deadlineMs);
+        if (ruleConfig?.severity) finding.severity = ruleConfig.severity;
+        if (isAllowlisted(finding, context, config)) continue;
+        findings.push(finding);
+        timedOutRuleIds.push(rule.id);
+      }
+      return { findings, timedOut: true, timedOutRuleIds };
+    },
+  };
+}
+
+/** createRulePass run alone under a hard deadline of deadlineMs. */
+export function matchAllRulesWithDeadline(
+  rules: Rule[],
+  context: MatchContext,
+  config: GuardConfig | undefined,
+  deadlineMs: number
+): DeadlineMatchResult {
+  const pass = createRulePass(rules, context, config, deadlineMs);
+  const run = runWithTimeout(() => pass.run(), deadlineMs);
+  return pass.finish(!run.ok);
+}
+
+function timeoutFinding(
+  rule: Rule,
+  context: MatchContext,
+  deadlineMs: number
+): Finding {
+  // No command text in the evidence: scrubbing a crafted input is itself
+  // regex work that the deadline no longer bounds, and an unscrubbed slice
+  // could leak part of a secret.
+  const length = context.command?.length ?? 0;
+  return {
+    ruleId: rule.id,
+    severity: rule.severity,
+    category: rule.category,
+    timestamp: Date.now(),
+    reason: SCAN_TIMEOUT_REASON,
+    evidence: `${SCAN_TIMEOUT_REASON}: rule not evaluated within ${Math.floor(deadlineMs)}ms on a ${length}-char command; counted as a match`,
+    context: { location: context.cwd },
+  };
 }
 
 function isAllowlisted(
