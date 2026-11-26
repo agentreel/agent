@@ -872,4 +872,75 @@ describe("unsupported regex rejection on policy fetch and doctor output", () => 
       await srv.close();
     }
   });
+
+  it("uses no-cache wording in doctor and fetch log on first fetch rejection with no cached policy", async () => {
+    const t0 = 1_764_000_000_000;
+    const badPolicy = makePolicy({
+      etag: "etag-first-bad",
+      custom: [
+        {
+          id: "cust_first_fetch_bad",
+          name: "Bad first-fetch regex",
+          enabled: true,
+          version: 1,
+          message: "Bad regex on first fetch",
+          when: [
+            { field: "command", op: "regex", value: "\\w+\\s+\\w+" },
+          ],
+          action: "block",
+          severity: "high",
+          scope: {},
+        },
+      ],
+    });
+
+    const srv = await startMockServer((_req, res) => {
+      res.writeHead(200, { "content-type": "application/json" });
+      res.end(JSON.stringify(badPolicy));
+    });
+
+    const logs: string[] = [];
+    try {
+      const rejected = await fetchPolicy({
+        config: makeConfig(srv.url, "ar_live_key"),
+        cachePath,
+        now: () => t0,
+        log: (m) => logs.push(m),
+      });
+
+      expect(rejected.status).toBe("invalid_policy");
+      if (rejected.status === "invalid_policy") {
+        expect(rejected.keptCache).toBe(false);
+        expect(rejected.error).toContain("cust_first_fetch_bad");
+      }
+
+      expect(readCachedPolicy(cachePath)).toBeNull();
+      expect(logs.some((l) => l.includes("keeping last-known cache"))).toBe(
+        false,
+      );
+      expect(
+        logs.some((l) =>
+          l.includes(
+            "the rejected policy was not installed and org enforcement is off until a valid policy is cached",
+          ),
+        ),
+      ).toBe(true);
+
+      const report = inspectDoctorState({
+        cachePath,
+        guardConfigPath,
+        claudeSettingsPath: join(tmpDir, "missing-claude.json"),
+        cursorHooksPath: join(tmpDir, "missing-cursor.json"),
+        config: makeConfig(srv.url, "ar_live_key"),
+        now: () => t0 + 5_000,
+      });
+      const output = formatDoctorReport(report);
+      expect(output).toContain(
+        "policy rejected by agent: rule cust_first_fetch_bad has an unsupported regex; the rejected policy was not installed and org enforcement is off until a valid policy is cached",
+      );
+      expect(output).not.toContain("last known policy still in use");
+    } finally {
+      await srv.close();
+    }
+  });
 });

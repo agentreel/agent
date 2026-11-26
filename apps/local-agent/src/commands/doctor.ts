@@ -263,11 +263,15 @@ export function formatDoctorReport(report: DoctorReport): string {
   }
 
   if (report.lastRejection) {
+    const hasCachedServerPolicy = report.policySource === "server_cache";
+    const suffix = hasCachedServerPolicy
+      ? "last known policy still in use"
+      : "the rejected policy was not installed and org enforcement is off until a valid policy is cached";
     const rejectionMsg =
       report.lastRejection.reason === "unsupported_regex" &&
       report.lastRejection.rule_id
-        ? `policy rejected by agent: rule ${report.lastRejection.rule_id} has an unsupported regex; last known policy still in use`
-        : `policy rejected by agent: ${report.lastRejection.error}; last known policy still in use`;
+        ? `policy rejected by agent: rule ${report.lastRejection.rule_id} has an unsupported regex; ${suffix}`
+        : `policy rejected by agent: ${report.lastRejection.error}; ${suffix}`;
     lines.push("", pc.yellow(`  warning:        ${rejectionMsg}`));
   }
 

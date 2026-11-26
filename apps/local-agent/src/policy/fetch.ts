@@ -133,7 +133,11 @@ export async function fetchPolicy(
       try {
         body = await res.json();
       } catch {
-        log("received invalid JSON from policy endpoint; keeping last-known cache");
+        log(
+          cached
+            ? "received invalid JSON from policy endpoint; keeping last-known cache"
+            : "received invalid JSON from policy endpoint; no cached policy available, org enforcement is off until a valid policy is cached",
+        );
         try {
           writePolicyRejectionAtomic(
             {
@@ -155,7 +159,11 @@ export async function fetchPolicy(
 
       const validated = validatePolicy(body);
       if (!validated.ok) {
-        log(`rejected invalid policy (${validated.error}); keeping last-known cache`);
+        log(
+          cached
+            ? `rejected invalid policy (${validated.error}); keeping last-known cache`
+            : `rejected invalid policy (${validated.error}); the rejected policy was not installed and org enforcement is off until a valid policy is cached`,
+        );
         try {
           writePolicyRejectionAtomic(
             {

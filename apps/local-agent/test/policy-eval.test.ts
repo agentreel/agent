@@ -231,6 +231,34 @@ describe("RE2-safe regex compiler, cache, and timeout guard", () => {
       ".*passwd.*",
       "kubectl\\s+delete\\s+.*prod",
       "\\w+\\s*\\w+",
+      // Leading-literal rejects (2+ unbounded without mandatory leading literal
+      // or where the last char of the leading literal overlaps the first unbounded atom)
+      "\\w+\\s+\\w+",
+      "\\S+\\s+\\S+",
+      "[a-z]+@[a-z]+",
+      "a+\\s+b+",
+      "[a-z]\\s+foo\\s+bar",
+      "(DROP|)\\s+TABLE\\s+\\w+",
+      "a?\\s+foo\\s+bar",
+      "(ba)?\\s+foo\\s+bar",
+      "A\\w+\\s+\\w+",
+      "a\\w+\\s+\\w+",
+      "(?:a)\\w+\\s+\\w+",
+      "\\x41\\w+\\s+\\w+",
+      "a[a-z]+\\s+\\w+",
+      "(DROP|TRUNCATE)\\w+\\s+\\w+",
+      "(:|DROP)\\w+\\s+\\w+",
+      "curl[^|]*\\|\\s*(ba)?sh",
+      "foo[\\x41-\\x5A]+@[\\x41-\\x5A]+",
+      // Non-ASCII literals are universal in the disjointness model, so a
+      // Kelvin / long-s leading literal or separator is never disjoint.
+      // "\\u{1F600}\\s+\\w+" was accepted before this rule.
+      "\\u212A\\w+\\s+\\w+\\u{1F600}?",
+      "\\u017F\\w+\\s+\\w+\\u{1F600}?",
+      "\\u212A\\w+\\s+\\w+",
+      "\\w+\\u212A\\w+",
+      "x\\u212A[a-z]+\\s+\\w+",
+      "\\u{1F600}\\s+\\w+",
       // Extra conservative boundary rejects
       "\\s+[a-z]*\\s+",
       "a+x?a+",
@@ -245,23 +273,26 @@ describe("RE2-safe regex compiler, cache, and timeout guard", () => {
     }
 
     const accepted = [
-      // Single-unbounded legitimate fixtures
+      // Single-unbounded legitimate fixtures (unaffected by leading-literal rule)
       "^https://[a-z0-9-]+\\.internal\\.corp/admin",
       "^deploy-service-0 --env=(prod|staging) --region=[a-z0-9-]+$",
       "https?://example\\.com/[a-z0-9/_-]+",
       "[a*+]+",
       "a\\*b\\+.*c",
       "^rule_1_[0-9]{1,4}_[a-z]+$",
-      // Round 5 required multi-quantifier org patterns
+      "\\w+",
+      "[a-z]+",
+      ".*foo",
+      "curl[^|]*\\|",
+      // Multi-quantifier org patterns with mandatory disjoint leading literal + disjoint barriers
       "rm\\s+-rf\\s+/",
       "curl\\s+\\|\\s*sh",
       "curl\\s*\\|\\s*(ba)?sh",
+      "curl\\s+\\S+\\s+\\|\\s*(ba)?sh",
       "(DROP|TRUNCATE)\\s+TABLE\\s+\\w+",
+      "(?:DROP|TRUNCATE)\\s+TABLE\\s+\\w+",
       "aws\\s+s3\\s+rb",
-      "curl[^|]*\\|\\s*(ba)?sh",
-      // Extra valid disjoint-separated patterns
-      "\\w+\\s+\\w+",
-      "\\S+\\s+\\S+",
+      "^git\\s+push\\s+--force",
       "^deploy-service-0\\s+--env=(prod|staging)\\s+--region=[a-z0-9-]+$",
     ];
     for (const pat of accepted) {
@@ -272,29 +303,143 @@ describe("RE2-safe regex compiler, cache, and timeout guard", () => {
     }
   });
 
-  it("evaluates every accepted multi-quantifier org pattern against adversarial 10KB inputs well under 50ms", () => {
-    clearRegexCache();
-    const cases: Array<{ pattern: string; adversarial: string }> = [
-      { pattern: "rm\\s+-rf\\s+/", adversarial: "rm" + " ".repeat(10_000) + "x" },
-      { pattern: "curl\\s+\\|\\s*sh", adversarial: "curl" + " ".repeat(10_000) },
-      { pattern: "curl\\s*\\|\\s*(ba)?sh", adversarial: "curl" + " ".repeat(10_000) + "|" + " ".repeat(10_000) + "x" },
-      { pattern: "(DROP|TRUNCATE)\\s+TABLE\\s+\\w+", adversarial: "DROP" + " ".repeat(10_000) + "TABLE" + " ".repeat(10_000) + "!" },
-      { pattern: "aws\\s+s3\\s+rb", adversarial: "aws" + " ".repeat(10_000) + "s3" + " ".repeat(10_000) + "x" },
-      { pattern: "curl[^|]*\\|\\s*(ba)?sh", adversarial: "curl" + "a".repeat(10_000) },
-    ];
+  it("records that the Kelvin Unicode case-fold repro is quadratic under /iu", () => {
+    // compileSafeRegex now rejects this pattern. Time a raw /iu RegExp to
+    // show why: U+212A folds to "k", so the leading literal does not pin
+    // the two unbounded \\w+ quantifiers on a long run of "k".
+    const source = "\\u212A\\w+\\s+\\w+\\u{1F600}?";
+    expect(isRe2SafePattern(source)).toBe(false);
+    expect(compileSafeRegex(source)).toBeNull();
+    const re = new RegExp(source, "iu");
+    const input = "k".repeat(32_768);
+    const t0 = performance.now();
+    const matched = re.test(input);
+    const elapsed = performance.now() - t0;
+    expect(matched).toBe(false);
+    expect(
+      elapsed,
+      `expected Kelvin /iu repro to be slow on 32KB of k, got ${elapsed.toFixed(2)}ms`,
+    ).toBeGreaterThan(50);
+  });
 
-    for (const c of cases) {
+  it("decodes \\xHH, \\uHHHH, and \\u{H...} escapes and rejects forbidden, octal, or malformed escapes", () => {
+    const rejected = [
+      // Escape-encoded overlapping/adjacent unbounded quantifiers
+      "\\x41+\\x42+",
+      "\\u0041+\\u0042+",
+      "\\u{41}+\\u{42}+",
+      "[\\x41]+[\\x42]+",
+      "x\\x41+\\x42+",
+      "x\\u0041+\\u0042+",
+      "x\\u{41}+\\u{42}+",
+      "x[\\x41]+[\\x42]+",
+      // Octal escapes (\0 followed by any digit, outside and inside [...])
+      "\\012+\\s+\\w+",
+      "\\01+\\s+\\w+",
+      "\\07+\\s+\\w+",
+      "[\\012]+\\s+\\w+",
+      "a\\00b",
+      // Forbidden \p, \P, \c escapes anywhere
+      "\\p{L}+",
+      "\\P{L}+",
+      "[\\p{L}]+",
+      "\\cA",
+      "[\\cA]",
+      // Malformed hex and unicode escapes (bad hex or > 0x10FFFF)
+      "\\x",
+      "\\x4",
+      "\\xZZ",
+      "[\\xZZ]",
+      "\\u",
+      "\\u004",
+      "\\uGGGG",
+      "[\\uGGGG]",
+      "\\u{}",
+      "\\u{41",
+      "\\u{ZZZZ}",
+      "\\u{110000}",
+      "[\\u{110000}]",
+    ];
+    for (const pat of rejected) {
+      expect(isRe2SafePattern(pat), `expected reject: ${pat}`).toBe(false);
+      expect(compileSafeRegex(pat), `expected null compile: ${pat}`).toBeNull();
+    }
+
+    const accepted: Array<{ pattern: string; sampleMatch: string }> = [
+      { pattern: "curl\\x20\\|\\x20sh", sampleMatch: "curl | sh" },
+      { pattern: "a\\x2Db", sampleMatch: "a-b" },
+      { pattern: "a\\u002Db", sampleMatch: "a-b" },
+      { pattern: "a\\u{2D}b", sampleMatch: "a-b" },
+      { pattern: "a\\0b", sampleMatch: "a\0b" },
+      { pattern: "rm\\x20+-rf\\x20+/", sampleMatch: "rm   -rf  /" },
+      { pattern: "foo:[\\x41-\\x5A]+@[\\x41-\\x5A]+", sampleMatch: "foo:ABC@XYZ" },
+    ];
+    for (const c of accepted) {
+      expect(isRe2SafePattern(c.pattern), `expected accept: ${c.pattern}`).toBe(
+        true,
+      );
       const re = compileSafeRegex(c.pattern);
       expect(re, `expected compiled: ${c.pattern}`).toBeInstanceOf(RegExp);
-      let timedOut = false;
-      const t0 = performance.now();
-      const matched = testSafeRegex(re!, c.adversarial, POLICY_EVAL_DEADLINE_MS, () => {
-        timedOut = true;
-      });
-      const elapsed = performance.now() - t0;
-      expect(matched, `should not match: ${c.pattern}`).toBe(false);
-      expect(timedOut, `should not time out: ${c.pattern}`).toBe(false);
-      expect(elapsed, `too slow (${elapsed.toFixed(2)}ms): ${c.pattern}`).toBeLessThan(POLICY_EVAL_DEADLINE_MS);
+      expect(
+        testSafeRegex(re!, c.sampleMatch),
+        `expected match for ${c.pattern} on ${c.sampleMatch}`,
+      ).toBe(true);
+    }
+  });
+
+  it("evaluates every accepted multi-quantifier org pattern against adversarial 32KB inputs under 5ms", () => {
+    clearRegexCache();
+    const patterns = [
+      "rm\\s+-rf\\s+/",
+      "curl\\s+\\|\\s*sh",
+      "curl\\s*\\|\\s*(ba)?sh",
+      "curl\\s+\\S+\\s+\\|\\s*(ba)?sh",
+      "(DROP|TRUNCATE)\\s+TABLE\\s+\\w+",
+      "(?:DROP|TRUNCATE)\\s+TABLE\\s+\\w+",
+      "aws\\s+s3\\s+rb",
+      "^git\\s+push\\s+--force",
+      "rm\\x20+-rf\\x20+/",
+      "foo:[\\x41-\\x5A]+@[\\x41-\\x5A]+",
+      "^deploy-service-0\\s+--env=(prod|staging)\\s+--region=[a-z0-9-]+$",
+    ];
+    const adversarialInputs = [
+      { label: "a*32768", value: "a".repeat(32_768) },
+      { label: "space*32768", value: " ".repeat(32_768) },
+      { label: "rm+space*32768", value: "rm" + " ".repeat(32_768) },
+      { label: "A+a*32767", value: "A" + "a".repeat(32_767) },
+      { label: "nl*32768", value: "\n".repeat(32_768) },
+    ];
+
+    // Pre-warm VM script once so per-pattern timings measure regex matching rather than V8 cold-start JIT.
+    const warmupRe = compileSafeRegex("rm\\s+-rf\\s+/")!;
+    testSafeRegex(warmupRe, "rm" + " ".repeat(16), POLICY_EVAL_DEADLINE_MS);
+
+    for (const pattern of patterns) {
+      const re = compileSafeRegex(pattern);
+      expect(re, `expected compiled: ${pattern}`).toBeInstanceOf(RegExp);
+      for (const adv of adversarialInputs) {
+        let timedOut = false;
+        const t0 = performance.now();
+        const matched = testSafeRegex(
+          re!,
+          adv.value,
+          POLICY_EVAL_DEADLINE_MS,
+          () => {
+            timedOut = true;
+          },
+        );
+        const elapsed = performance.now() - t0;
+        expect(matched, `should not match ${pattern} on ${adv.label}`).toBe(
+          false,
+        );
+        expect(timedOut, `should not time out ${pattern} on ${adv.label}`).toBe(
+          false,
+        );
+        expect(
+          elapsed,
+          `too slow (${elapsed.toFixed(2)}ms) for ${pattern} on ${adv.label}`,
+        ).toBeLessThan(5);
+      }
     }
   });
 
