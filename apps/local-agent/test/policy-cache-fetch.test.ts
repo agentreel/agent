@@ -1702,6 +1702,21 @@ describe("govern API v1 (C1) additive fields, repo query, 304, no-org, org_id, e
         "etag-org-a",
         "etag-org-a",
       ]);
+      expect(readPolicyRejection(cachePath)?.reason).toBe("org_mismatch_ignored");
+      const doctorAfter304 = formatDoctorReport(
+        inspectDoctorState({
+          cachePath,
+          guardConfigPath,
+          claudeSettingsPath: join(tmpDir, "missing-claude.json"),
+          cursorHooksPath: join(tmpDir, "missing-cursor.json"),
+          config: makeConfig(srv.url, "ar_live_key"),
+          now: t0 + 51_000,
+        }),
+      );
+      expect(doctorAfter304).toContain(
+        "policy for org org_b ignored; keeping cached org org_a",
+      );
+      expect(doctorAfter304).toContain("run `npx @agentreel/agent auth` to switch orgs");
       await assertOrgAEnforced();
     } finally {
       await srv.close();
@@ -1912,4 +1927,284 @@ describe("govern API v1 (C1) additive fields, repo query, 304, no-org, org_id, e
       rmSync(authHome, { recursive: true, force: true });
     }
   });
+
+  it("keeps org_mismatch_ignored sidecar after a later 304 or same-org 200, and doctor still warns until explicit auth succeeds", async () => {
+    const t0 = 1_764_550_000_000;
+    const orgAPolicy = makePolicy({
+      etag: "etag-org-a",
+      org_id: "org_a",
+      workspace_id: "org_a",
+      mode: "enforce",
+    });
+    const orgAUpdated = makePolicy({
+      etag: "etag-org-a-v2",
+      org_id: "org_a",
+      workspace_id: "org_a",
+      mode: "enforce",
+    });
+    const orgBPolicy = makePolicy({
+      etag: "etag-org-b",
+      org_id: "org_b",
+      workspace_id: "org_b",
+      mode: "observe",
+    });
+    writeCachedPolicyAtomic(
+      { policy: orgAPolicy, etag: orgAPolicy.etag, fetched_at: t0 },
+      cachePath,
+    );
+
+    let step = 0;
+    const srv = await startMockServer((_req, res) => {
+      step++;
+      if (step === 1) {
+        res.writeHead(200, { "content-type": "application/json" });
+        res.end(JSON.stringify(orgBPolicy));
+        return;
+      }
+      if (step === 2) {
+        res.writeHead(304);
+        res.end();
+        return;
+      }
+      res.writeHead(200, { "content-type": "application/json" });
+      res.end(JSON.stringify(orgAUpdated));
+    });
+
+    const doctorOpts = {
+      cachePath,
+      guardConfigPath,
+      claudeSettingsPath: join(tmpDir, "missing-claude.json"),
+      cursorHooksPath: join(tmpDir, "missing-cursor.json"),
+      config: makeConfig(srv.url, "ar_live_key"),
+    };
+
+    try {
+      const ignored = await fetchPolicy({
+        config: makeConfig(srv.url, "ar_live_key"),
+        cachePath,
+        now: () => t0 + 10_000,
+      });
+      expect(ignored.status).toBe("kept_cache");
+      if (ignored.status === "kept_cache") {
+        expect(ignored.reason).toBe("org_mismatch_ignored");
+      }
+      expect(readPolicyRejection(cachePath)?.reason).toBe("org_mismatch_ignored");
+
+      const notModified = await fetchPolicy({
+        config: makeConfig(srv.url, "ar_live_key"),
+        cachePath,
+        now: () => t0 + 20_000,
+      });
+      expect(notModified.status).toBe("not_modified");
+      expect(readCachedPolicy(cachePath)?.fetched_at).toBe(t0 + 20_000);
+      expect(readCachedPolicy(cachePath)?.policy.org_id).toBe("org_a");
+      expect(readCachedPolicy(cachePath)?.etag).toBe("etag-org-a");
+      expect(readPolicyRejection(cachePath)?.reason).toBe("org_mismatch_ignored");
+      const after304 = formatDoctorReport(
+        inspectDoctorState({ ...doctorOpts, now: t0 + 21_000 }),
+      );
+      expect(after304).toContain(
+        "policy for org org_b ignored; keeping cached org org_a",
+      );
+      expect(after304).toContain("run `npx @agentreel/agent auth` to switch orgs");
+
+      const sameOrg = await fetchPolicy({
+        config: makeConfig(srv.url, "ar_live_key"),
+        cachePath,
+        now: () => t0 + 30_000,
+      });
+      expect(sameOrg.status).toBe("updated");
+      expect(readCachedPolicy(cachePath)?.etag).toBe("etag-org-a-v2");
+      expect(readCachedPolicy(cachePath)?.fetched_at).toBe(t0 + 30_000);
+      expect(readPolicyRejection(cachePath)?.reason).toBe("org_mismatch_ignored");
+      const afterSameOrg = formatDoctorReport(
+        inspectDoctorState({ ...doctorOpts, now: t0 + 31_000 }),
+      );
+      expect(afterSameOrg).toContain("run `npx @agentreel/agent auth` to switch orgs");
+    } finally {
+      await srv.close();
+    }
+
+    vi.resetModules();
+    const prevHome = process.env.HOME;
+    const authHome = mkdtempSync(join(tmpdir(), "agentreel-sidecar-auth-"));
+    process.env.HOME = authHome;
+
+    const authOrgB = makePolicy({
+      etag: "etag-org-b-auth",
+      org_id: "org_b",
+      workspace_id: "org_b",
+      mode: "enforce",
+    });
+    const authSrv = await startMockServer((req, res) => {
+      const pathname = new URL(req.url ?? "/", "http://127.0.0.1").pathname;
+      if (pathname === "/api/v1/sessions/ingest") {
+        res.writeHead(200, { "content-type": "application/json" });
+        res.end(JSON.stringify({ ok: true }));
+        return;
+      }
+      if (pathname === "/api/v1/policy") {
+        res.writeHead(200, { "content-type": "application/json" });
+        res.end(JSON.stringify(authOrgB));
+        return;
+      }
+      res.writeHead(404);
+      res.end();
+    });
+    const logSpy = vi.spyOn(console, "log").mockImplementation(() => {});
+    const errSpy = vi.spyOn(console, "error").mockImplementation(() => {});
+    try {
+      const { linkCommand } = await import("../src/commands/auth.js");
+      const { POLICY_PATH } = await import("../src/paths.js");
+      const {
+        readCachedPolicy: readCachedFresh,
+        readPolicyRejection: readRejectionFresh,
+        writeCachedPolicyAtomic: writeCachedFresh,
+        writePolicyRejectionAtomic: writeRejectionFresh,
+      } = await import("../src/policy/cache.js");
+      const { formatDoctorReport: formatDoctorFresh, inspectDoctorState: inspectDoctorFresh } =
+        await import("../src/commands/doctor.js");
+
+      writeCachedFresh(
+        { policy: orgAPolicy, etag: orgAPolicy.etag, fetched_at: t0 },
+        POLICY_PATH,
+      );
+      writeRejectionFresh(
+        {
+          ts: t0 + 10_000,
+          error: "policy for org org_b ignored; keeping cached org org_a",
+          reason: "org_mismatch_ignored",
+          cached_org_id: "org_a",
+          incoming_org_id: "org_b",
+        },
+        POLICY_PATH,
+      );
+
+      await linkCommand("ar_live_org_b_key", { api: authSrv.url });
+      expect(readCachedFresh(POLICY_PATH)?.policy.org_id).toBe("org_b");
+      expect(readRejectionFresh(POLICY_PATH)).toBeNull();
+      const afterAuth = formatDoctorFresh(
+        inspectDoctorFresh({
+          cachePath: POLICY_PATH,
+          guardConfigPath: join(authHome, "guard.json"),
+          claudeSettingsPath: join(authHome, "missing-claude.json"),
+          cursorHooksPath: join(authHome, "missing-cursor.json"),
+          config: makeConfig(authSrv.url, "ar_live_org_b_key"),
+          now: t0 + 40_000,
+        }),
+      );
+      expect(afterAuth).not.toContain("run `npx @agentreel/agent auth` to switch orgs");
+      expect(afterAuth).not.toContain("policy for org org_b ignored");
+    } finally {
+      logSpy.mockRestore();
+      errSpy.mockRestore();
+      await authSrv.close();
+      process.env.HOME = prevHome;
+      rmSync(authHome, { recursive: true, force: true });
+    }
+  });
+
+  it("keeps no_org_ignored sidecar after a later 304 or same-org 200, and doctor still shows the notice", async () => {
+    const t0 = 1_764_560_000_000;
+    const orgAcmePolicy = makePolicy({
+      etag: "etag-org-acme",
+      org_id: "org_acme",
+      workspace_id: "org_acme",
+      mode: "enforce",
+    });
+    const orgAcmeUpdated = makePolicy({
+      etag: "etag-org-acme-v2",
+      org_id: "org_acme",
+      workspace_id: "org_acme",
+      mode: "enforce",
+    });
+    const noOrgPayload = {
+      version: 1,
+      etag: "etag-no-org",
+      org_id: null,
+      workspace_id: null,
+      updated_at: "2026-11-26T00:00:00Z",
+      mode: "observe",
+      offline: "last_known",
+      builtin: {},
+      custom: [],
+      allow: { commands: [], paths: [], repos: [] },
+    };
+    writeCachedPolicyAtomic(
+      { policy: orgAcmePolicy, etag: orgAcmePolicy.etag, fetched_at: t0 },
+      cachePath,
+    );
+
+    let step = 0;
+    const srv = await startMockServer((_req, res) => {
+      step++;
+      if (step === 1) {
+        res.writeHead(200, { "content-type": "application/json" });
+        res.end(JSON.stringify(noOrgPayload));
+        return;
+      }
+      if (step === 2) {
+        res.writeHead(304);
+        res.end();
+        return;
+      }
+      res.writeHead(200, { "content-type": "application/json" });
+      res.end(JSON.stringify(orgAcmeUpdated));
+    });
+
+    const doctorOpts = {
+      cachePath,
+      guardConfigPath,
+      claudeSettingsPath: join(tmpDir, "missing-claude.json"),
+      cursorHooksPath: join(tmpDir, "missing-cursor.json"),
+      config: makeConfig(srv.url, "ar_live_key"),
+    };
+
+    try {
+      const ignored = await fetchPolicy({
+        config: makeConfig(srv.url, "ar_live_key"),
+        cachePath,
+        now: () => t0 + 10_000,
+      });
+      expect(ignored.status).toBe("kept_cache");
+      if (ignored.status === "kept_cache") {
+        expect(ignored.reason).toBe("no_org_ignored");
+      }
+      expect(readPolicyRejection(cachePath)?.reason).toBe("no_org_ignored");
+
+      const notModified = await fetchPolicy({
+        config: makeConfig(srv.url, "ar_live_key"),
+        cachePath,
+        now: () => t0 + 20_000,
+      });
+      expect(notModified.status).toBe("not_modified");
+      expect(readCachedPolicy(cachePath)?.fetched_at).toBe(t0 + 20_000);
+      expect(readCachedPolicy(cachePath)?.policy.org_id).toBe("org_acme");
+      expect(readPolicyRejection(cachePath)?.reason).toBe("no_org_ignored");
+      const after304 = formatDoctorReport(
+        inspectDoctorState({ ...doctorOpts, now: t0 + 21_000 }),
+      );
+      expect(after304).toContain(
+        "no-org response ignored; keeping cached org policy org_acme",
+      );
+
+      const sameOrg = await fetchPolicy({
+        config: makeConfig(srv.url, "ar_live_key"),
+        cachePath,
+        now: () => t0 + 30_000,
+      });
+      expect(sameOrg.status).toBe("updated");
+      expect(readCachedPolicy(cachePath)?.etag).toBe("etag-org-acme-v2");
+      expect(readPolicyRejection(cachePath)?.reason).toBe("no_org_ignored");
+      const afterSameOrg = formatDoctorReport(
+        inspectDoctorState({ ...doctorOpts, now: t0 + 31_000 }),
+      );
+      expect(afterSameOrg).toContain(
+        "no-org response ignored; keeping cached org policy org_acme",
+      );
+    } finally {
+      await srv.close();
+    }
+  });
+
 });

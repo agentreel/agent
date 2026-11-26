@@ -141,6 +141,25 @@ export function clearPolicyRejection(cachePath: string = POLICY_PATH): void {
   }
 }
 
+/**
+ * Clears payload-rejection sidecars (invalid_policy, unsupported_regex) after
+ * a successful 304 or same-org 200. Leaves org_mismatch_ignored and
+ * no_org_ignored in place until explicit auth or logout.
+ */
+export function clearTransientPolicyRejection(
+  cachePath: string = POLICY_PATH,
+): void {
+  const existing = readPolicyRejection(cachePath);
+  if (
+    existing &&
+    (existing.reason === "org_mismatch_ignored" ||
+      existing.reason === "no_org_ignored")
+  ) {
+    return;
+  }
+  clearPolicyRejection(cachePath);
+}
+
 export function clearCachedPolicy(cachePath: string = POLICY_PATH): void {
   try {
     if (existsSync(cachePath)) {
