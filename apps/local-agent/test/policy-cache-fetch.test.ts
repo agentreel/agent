@@ -970,7 +970,7 @@ describe("govern API v1 (C1) additive fields, repo query, 304, no-org, org_id, e
     rmSync(tmpDir, { recursive: true, force: true });
   });
 
-  it("derives owner/name from https and ssh git remotes (stripping .git) and sends URL-encoded ?repo= on GET /api/v1/policy", async () => {
+  it("keeps repoSlugFromRemoteUrl parsing intact while never sending ?repo= on GET /api/v1/policy regardless of cwd", async () => {
     expect(repoSlugFromRemoteUrl("https://github.com/acme/webapp.git")).toBe("acme/webapp");
     expect(repoSlugFromRemoteUrl("https://github.com/acme/webapp")).toBe("acme/webapp");
     expect(repoSlugFromRemoteUrl("https://token@github.com/acme/webapp.git")).toBe("acme/webapp");
@@ -1026,10 +1026,18 @@ describe("govern API v1 (C1) additive fields, repo query, 304, no-org, org_id, e
         cwd: noRemoteDir,
         log: () => {},
       });
+      await fetchPolicy({
+        config: makeConfig(srv.url, "ar_live_key"),
+        cachePath: join(tmpDir, "p4.json"),
+        cwd: httpsRepo,
+        repo: "acme/explicit-ignored",
+        log: () => {},
+      });
 
       expect(seenUrls).toEqual([
-        "/api/v1/policy?repo=acme%2Fapi-server",
-        "/api/v1/policy?repo=acme%2Fssh-service",
+        "/api/v1/policy",
+        "/api/v1/policy",
+        "/api/v1/policy",
         "/api/v1/policy",
       ]);
     } finally {

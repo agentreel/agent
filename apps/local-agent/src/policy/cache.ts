@@ -36,13 +36,28 @@ export interface PolicyAgeInfo {
   clockSkewed: boolean;
 }
 
+export type PolicyRejectionReason =
+  | "unsupported_regex"
+  | "invalid_policy"
+  | "no_org_ignored"
+  | "org_mismatch_ignored";
+
 export interface PolicyRejectionRecord {
   ts: number;
   error: string;
   rule_id?: string;
   condition_index?: number;
-  reason: "unsupported_regex" | "invalid_policy";
+  cached_org_id?: string;
+  incoming_org_id?: string | null;
+  reason: PolicyRejectionReason;
 }
+
+const POLICY_REJECTION_REASONS = new Set<string>([
+  "unsupported_regex",
+  "invalid_policy",
+  "no_org_ignored",
+  "org_mismatch_ignored",
+]);
 
 export function policyRejectionPath(cachePath: string = POLICY_PATH): string {
   return `${cachePath}.rejected.json`;
@@ -61,17 +76,25 @@ export function readPolicyRejection(
     if (
       typeof parsed.ts !== "number" ||
       typeof parsed.error !== "string" ||
-      (parsed.reason !== "unsupported_regex" && parsed.reason !== "invalid_policy")
+      typeof parsed.reason !== "string" ||
+      !POLICY_REJECTION_REASONS.has(parsed.reason)
     ) {
       return null;
     }
     return {
       ts: parsed.ts,
       error: parsed.error,
-      reason: parsed.reason,
+      reason: parsed.reason as PolicyRejectionReason,
       ...(typeof parsed.rule_id === "string" ? { rule_id: parsed.rule_id } : {}),
       ...(typeof parsed.condition_index === "number"
         ? { condition_index: parsed.condition_index }
+        : {}),
+      ...(typeof parsed.cached_org_id === "string"
+        ? { cached_org_id: parsed.cached_org_id }
+        : {}),
+      ...(typeof parsed.incoming_org_id === "string" ||
+      parsed.incoming_org_id === null
+        ? { incoming_org_id: parsed.incoming_org_id }
         : {}),
     };
   } catch {
@@ -116,6 +139,17 @@ export function clearPolicyRejection(cachePath: string = POLICY_PATH): void {
   } catch {
     // Never throw on rejection sidecar cleanup.
   }
+}
+
+export function clearCachedPolicy(cachePath: string = POLICY_PATH): void {
+  try {
+    if (existsSync(cachePath)) {
+      unlinkSync(cachePath);
+    }
+  } catch {
+    // Never throw on cache cleanup.
+  }
+  clearPolicyRejection(cachePath);
 }
 
 /**

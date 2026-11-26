@@ -1,18 +1,25 @@
 import pc from "picocolors";
 import { readConfig, writeConfig } from "../config.js";
+import { clearCachedPolicy, readPolicyRejection } from "../policy/cache.js";
 import { fetchPolicy } from "../policy/fetch.js";
 import { postIngest } from "../upload/client.js";
 
-export async function logoutCommand(): Promise<void> {
+export interface LogoutOpts {
+  cachePath?: string;
+}
+
+export async function logoutCommand(opts: LogoutOpts = {}): Promise<void> {
   const cfg = readConfig();
   cfg.apiKey = undefined;
   cfg.workspaceId = undefined;
   writeConfig(cfg);
+  clearCachedPolicy(opts.cachePath);
   console.log(pc.green("✓") + " Cleared local credentials.");
 }
 
 interface LinkOpts {
   api?: string;
+  cachePath?: string;
 }
 
 export async function linkCommand(rawKey: string | undefined, opts: LinkOpts): Promise<void> {
@@ -27,20 +34,32 @@ export async function linkCommand(rawKey: string | undefined, opts: LinkOpts): P
   }
 
   const cfg = readConfig();
-  cfg.apiKey = key;
-  if (opts.api) cfg.apiBaseUrl = opts.api;
+  const previousApiKey = cfg.apiKey;
+  const previousApiBaseUrl = cfg.apiBaseUrl;
+  const nextCfg = {
+    ...cfg,
+    apiKey: key,
+    ...(opts.api ? { apiBaseUrl: opts.api } : {}),
+  };
 
-  console.log(pc.dim(`  validating against ${cfg.apiBaseUrl}…`));
+  console.log(pc.dim(`  validating against ${nextCfg.apiBaseUrl}…`));
   try {
-    await postIngest(cfg, {});
+    await postIngest(nextCfg, {});
   } catch (err) {
     console.error(pc.red("✗ Validation failed: ") + (err as Error).message);
     process.exit(1);
   }
-  writeConfig(cfg);
-  const policyRes = await fetchPolicy({ config: cfg });
+  writeConfig(nextCfg);
+  const accountChanged =
+    previousApiKey !== key || previousApiBaseUrl !== nextCfg.apiBaseUrl;
+  const pendingOrgSwitch =
+    readPolicyRejection(opts.cachePath)?.reason === "org_mismatch_ignored";
+  if (accountChanged || pendingOrgSwitch) {
+    clearCachedPolicy(opts.cachePath);
+  }
+  const policyRes = await fetchPolicy({ config: nextCfg, cachePath: opts.cachePath });
   console.log(pc.green("✓") + " Linked.");
-  console.log(pc.dim("  api: ") + cfg.apiBaseUrl);
+  console.log(pc.dim("  api: ") + nextCfg.apiBaseUrl);
   console.log(pc.dim("  key: ") + key.slice(0, 12) + "…");
   if (policyRes.status === "updated" || policyRes.status === "not_modified") {
     console.log(

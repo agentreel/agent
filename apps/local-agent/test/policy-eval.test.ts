@@ -1247,76 +1247,82 @@ describe("C1 additive evaluation: no-org, scope.teams, and approval_defaults mer
     expect(res.rule_ids).toEqual([]);
   });
 
-  it("skips rules with non-empty scope.teams unless policy.current_user_teams matches a listed team", () => {
-    const makeTeamsPolicy = (currentUserTeams?: string[]): Policy => ({
+  it("treats scope.teams as display-only (always applies subject to other scope fields) and ignores unknown current_user_teams", () => {
+    const rawPayload = {
       version: 1,
       etag: "etag-teams",
       workspace_id: "ws_1",
       updated_at: "2026-11-26T00:00:00Z",
       mode: "enforce",
       offline: "last_known",
-      ...(currentUserTeams !== undefined
-        ? { current_user_teams: currentUserTeams }
-        : {}),
+      current_user_teams: ["other-team"],
       builtin: {},
       custom: [
         {
           id: "cust_team_scoped",
-          name: "Platform/SRE deploy block",
+          name: "Team x deploy block",
           enabled: true,
           version: 1,
-          message: "Blocked for platform/sre",
+          message: "Blocked for team x",
           when: [{ field: "command", op: "contains", value: "deploy-prod" }],
           action: "block",
           severity: "high",
-          scope: { teams: ["platform", "sre"] },
+          scope: { teams: ["x"] },
         },
         {
-          id: "cust_empty_teams",
-          name: "Empty teams scope applies to all",
+          id: "cust_team_and_repo",
+          name: "Team x prod-repo block",
           enabled: true,
           version: 1,
-          message: "Applies to everyone",
-          when: [{ field: "command", op: "contains", value: "audit-all" }],
-          action: "flag",
-          severity: "info",
-          scope: { teams: [] },
+          message: "Blocked for team x in prod repo",
+          when: [{ field: "command", op: "contains", value: "migrate-db" }],
+          action: "block",
+          severity: "high",
+          scope: { teams: ["x"], repos: ["acme/prod-*"] },
         },
       ],
       allow: { commands: [], paths: [], repos: [] },
-    });
+    };
 
-    // Without current_user_teams, team-scoped rule is skipped
-    const skippedMissing = evaluatePolicy(
+    const validated = validatePolicy(rawPayload);
+    expect(validated.ok).toBe(true);
+    if (!validated.ok) return;
+    // Unknown current_user_teams field is ignored and not stored on Policy
+    expect(
+      (validated.value as unknown as Record<string, unknown>).current_user_teams,
+    ).toBeUndefined();
+
+    // Rule with scope.teams ['x'] applies even though current_user_teams did not include 'x'
+    const applied = evaluatePolicy(
       { tool: "claude-code", toolName: "Bash", command: "deploy-prod now" },
-      makeTeamsPolicy(undefined),
+      validated.value,
     );
-    expect(skippedMissing.action).toBe("allow");
-    expect(skippedMissing.rule_ids).toEqual([]);
+    expect(applied.action).toBe("block");
+    expect(applied.rule_ids).toEqual(["cust_team_scoped"]);
 
-    // Non-matching current_user_teams also skips the rule
-    const skippedNonMatch = evaluatePolicy(
-      { tool: "claude-code", toolName: "Bash", command: "deploy-prod now" },
-      makeTeamsPolicy(["frontend", "design"]),
+    // Other scope fields (e.g. repos) still apply normally alongside scope.teams
+    const wrongRepo = evaluatePolicy(
+      {
+        tool: "claude-code",
+        toolName: "Bash",
+        command: "migrate-db",
+        repo: "acme/staging",
+      },
+      validated.value,
     );
-    expect(skippedNonMatch.action).toBe("allow");
-    expect(skippedNonMatch.rule_ids).toEqual([]);
+    expect(wrongRepo.action).toBe("allow");
 
-    // Matching team applies the rule
-    const matched = evaluatePolicy(
-      { tool: "claude-code", toolName: "Bash", command: "deploy-prod now" },
-      makeTeamsPolicy(["frontend", "sre"]),
+    const rightRepo = evaluatePolicy(
+      {
+        tool: "claude-code",
+        toolName: "Bash",
+        command: "migrate-db",
+        repo: "acme/prod-api",
+      },
+      validated.value,
     );
-    expect(matched.action).toBe("block");
-    expect(matched.rule_ids).toEqual(["cust_team_scoped"]);
-
-    // Empty scope.teams does not restrict the rule
-    const emptyTeams = evaluatePolicy(
-      { tool: "claude-code", toolName: "Bash", command: "audit-all" },
-      makeTeamsPolicy(undefined),
-    );
-    expect(emptyTeams.action).toBe("flag");
-    expect(emptyTeams.rule_ids).toEqual(["cust_empty_teams"]);
+    expect(rightRepo.action).toBe("block");
+    expect(rightRepo.rule_ids).toEqual(["cust_team_and_repo"]);
   });
 
   it("merges effective approval config as rule.approval over approval_defaults over (120, deny) for builtin and custom rules", () => {

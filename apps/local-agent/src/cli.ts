@@ -56,6 +56,7 @@ program
 
 program
   .command("link [api-key]")
+  .alias("auth")
   .description("authenticate the local agent with agentreel.dev")
   .option("--api <url>", "override the API base URL (default https://api.agentreel.dev)")
   .action(async (apiKey: string | undefined, opts: { api?: string }) => {

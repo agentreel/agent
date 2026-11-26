@@ -103,6 +103,21 @@ export function isNoOrgPolicy(policy: Policy | null | undefined): boolean {
   return policy !== null && policy !== undefined && policy.org_id === null;
 }
 
+export function getPolicyOrgId(policy: Policy | null | undefined): string | null {
+  if (!policy) return null;
+  if (policy.org_id === null) return null;
+  if (typeof policy.org_id === "string" && policy.org_id.trim().length > 0) {
+    return policy.org_id;
+  }
+  if (
+    typeof policy.workspace_id === "string" &&
+    policy.workspace_id.trim().length > 0
+  ) {
+    return policy.workspace_id;
+  }
+  return null;
+}
+
 /**
  * Returns the largest effective approval expires_s across enabled require_approval
  * rules in a policy, or null if the policy has no enabled require_approval rules.
@@ -231,7 +246,6 @@ export interface Policy {
   mode: PolicyMode;
   offline: PolicyOfflineMode;
   approval_defaults?: RuleApprovalConfig;
-  current_user_teams?: string[];
   builtin: Record<string, BuiltinRuleOverride>;
   custom: CustomRule[];
   allow: PolicyAllowLists;
@@ -626,17 +640,6 @@ export function validatePolicy(
     approvalDefaults = ad.value;
   }
 
-  let currentUserTeams: string[] | undefined;
-  if (input.current_user_teams !== undefined) {
-    if (!isStringArray(input.current_user_teams)) {
-      return {
-        ok: false,
-        error: "policy.current_user_teams must be a string array",
-      };
-    }
-    currentUserTeams = [...input.current_user_teams];
-  }
-
   if (!isPlainObject(input.builtin)) {
     return { ok: false, error: "policy.builtin must be an object" };
   }
@@ -751,9 +754,6 @@ export function validatePolicy(
       offline: input.offline as PolicyOfflineMode,
       ...(approvalDefaults !== undefined
         ? { approval_defaults: approvalDefaults }
-        : {}),
-      ...(currentUserTeams !== undefined
-        ? { current_user_teams: currentUserTeams }
         : {}),
       builtin,
       custom,

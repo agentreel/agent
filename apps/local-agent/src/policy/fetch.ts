@@ -1,4 +1,3 @@
-import { execFileSync } from "node:child_process";
 import { appendFileSync } from "node:fs";
 import { readConfig, type AgentConfig } from "../config.js";
 import { ensureAgentreelDir, LOG_PATH, POLICY_PATH } from "../paths.js";
@@ -11,6 +10,7 @@ import {
   writePolicyRejectionAtomic,
 } from "./cache.js";
 import {
+  getPolicyOrgId,
   repoSlugFromRemoteUrl,
   validatePolicy,
   type Policy,
@@ -19,21 +19,6 @@ import {
 export { POLICY_REFRESH_INTERVAL_MS, repoSlugFromRemoteUrl, shouldRefreshPolicy };
 
 export const POLICY_FETCH_TIMEOUT_MS = 10_000;
-
-export function detectOriginRepo(cwd: string = process.cwd()): string | undefined {
-  try {
-    const out = execFileSync("git", ["-C", cwd, "remote", "get-url", "origin"], {
-      encoding: "utf8",
-      timeout: 1500,
-      stdio: ["ignore", "pipe", "ignore"],
-      env: { ...process.env, GIT_TERMINAL_PROMPT: "0", GIT_OPTIONAL_LOCKS: "0" },
-    }).trim();
-    if (!out) return undefined;
-    return repoSlugFromRemoteUrl(out);
-  } catch {
-    return undefined;
-  }
-}
 
 export type FetchPolicyResult =
   | { status: "unlinked" }
@@ -91,14 +76,9 @@ export async function fetchPolicy(
     }
 
     const cached = readCachedPolicy(cachePath);
-    const repoSlug =
-      opts.repo !== undefined
-        ? opts.repo?.trim() || undefined
-        : detectOriginRepo(opts.cwd ?? process.cwd());
-    const basePolicyUrl = `${cfg.apiBaseUrl.replace(/\/$/, "")}/api/v1/policy`;
-    const url = repoSlug
-      ? `${basePolicyUrl}?repo=${encodeURIComponent(repoSlug)}`
-      : basePolicyUrl;
+    // Do not send ?repo= until the policy cache is per-repo; a single global
+    // cache cannot safely mix repo-scoped responses across working directories.
+    const url = `${cfg.apiBaseUrl.replace(/\/$/, "")}/api/v1/policy`;
     const headers: Record<string, string> = {
       accept: "application/json",
       authorization: `Bearer ${cfg.apiKey}`,
@@ -222,6 +202,63 @@ export async function fetchPolicy(
       }
 
       const policy = validated.value;
+      const cachedOrgId = getPolicyOrgId(cached?.policy);
+      const incomingOrgId = getPolicyOrgId(policy);
+
+      if (cachedOrgId !== null && incomingOrgId === null) {
+        const msg = `no-org response ignored; keeping cached org policy ${cachedOrgId}`;
+        log(msg);
+        try {
+          writePolicyRejectionAtomic(
+            {
+              ts: nowFn(),
+              error: msg,
+              reason: "no_org_ignored",
+              cached_org_id: cachedOrgId,
+              incoming_org_id: null,
+            },
+            cachePath,
+          );
+        } catch {
+          // Never fail fetch on sidecar write error.
+        }
+        return {
+          status: "kept_cache",
+          reason: "no_org_ignored",
+          httpStatus: 200,
+          keptCache: true,
+        };
+      }
+
+      if (
+        cachedOrgId !== null &&
+        incomingOrgId !== null &&
+        incomingOrgId !== cachedOrgId
+      ) {
+        const msg = `policy for org ${incomingOrgId} ignored; keeping cached org ${cachedOrgId}`;
+        log(msg);
+        try {
+          writePolicyRejectionAtomic(
+            {
+              ts: nowFn(),
+              error: msg,
+              reason: "org_mismatch_ignored",
+              cached_org_id: cachedOrgId,
+              incoming_org_id: incomingOrgId,
+            },
+            cachePath,
+          );
+        } catch {
+          // Never fail fetch on sidecar write error.
+        }
+        return {
+          status: "kept_cache",
+          reason: "org_mismatch_ignored",
+          httpStatus: 200,
+          keptCache: true,
+        };
+      }
+
       const etag = policy.etag;
       const fetchedAt = nowFn();
       writeCachedPolicyAtomic(

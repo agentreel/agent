@@ -30,7 +30,6 @@ export interface PolicyEvalInput {
   repo?: string;
   branch?: string;
   member?: string;
-  teams?: string[];
 }
 
 export interface PolicyRuleMatch {
@@ -240,7 +239,6 @@ function isExemptByAllowLists(input: PolicyEvalInput, policy: Policy): boolean {
 function matchesScope(
   scope: CustomRuleScope | undefined,
   input: PolicyEvalInput,
-  policyTeams?: string[],
 ): boolean {
   if (!scope) return true;
 
@@ -265,13 +263,7 @@ function matchesScope(
     }
   }
 
-  if (scope.teams && scope.teams.length > 0) {
-    const userTeams = input.teams ?? policyTeams;
-    if (!userTeams || userTeams.length === 0) return false;
-    if (!scope.teams.some((t) => userTeams.includes(t))) {
-      return false;
-    }
-  }
+  // scope.teams is display-only in the CLI; team filtering happens on the server.
 
   if (scope.tools && scope.tools.length > 0) {
     if (!scope.tools.includes(input.tool)) {
@@ -440,12 +432,11 @@ function matchesCustomRule(
   input: PolicyEvalInput,
   clock: EvalClock,
   state: RuleEvalState,
-  policyTeams?: string[],
 ): boolean {
   if (checkExpired(clock)) return false;
   if (!rule.enabled) return false;
   if (!rule.when || rule.when.length === 0) return false;
-  if (!matchesScope(rule.scope, input, policyTeams)) return false;
+  if (!matchesScope(rule.scope, input)) return false;
   for (const cond of rule.when) {
     if (!matchesCondition(cond, input, clock, state)) return false;
     if (clock.timedOut || state.compileFailed) return false;
@@ -710,15 +701,9 @@ export function evaluatePolicy(
       );
     }
     const rule = orderedCustom[i]!;
-    if (!matchesScope(rule.scope, input, policy.current_user_teams)) continue;
+    if (!matchesScope(rule.scope, input)) continue;
     const state: RuleEvalState = { compileFailed: false };
-    const matched = matchesCustomRule(
-      rule,
-      input,
-      clock,
-      state,
-      policy.current_user_teams,
-    );
+    const matched = matchesCustomRule(rule, input, clock, state);
     if (matched) {
       const effectiveApproval =
         rule.action === "require_approval"
