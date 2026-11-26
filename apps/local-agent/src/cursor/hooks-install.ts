@@ -1,6 +1,6 @@
 import { copyFileSync, existsSync, mkdirSync, readFileSync, writeFileSync } from "node:fs";
 import { dirname } from "node:path";
-import { CURSOR_HOOKS_PATH } from "../paths.js";
+import { cursorHooksPath } from "../paths.js";
 import {
   DEFAULT_HOOK_TIMEOUT_S,
   DEFAULT_PRE_EXEC_HOOK_TIMEOUT_S,
@@ -56,7 +56,7 @@ export interface InstallCursorHooksOptions {
  */
 export function installCursorHooks(
   prefix: string,
-  path = CURSOR_HOOKS_PATH,
+  path = cursorHooksPath(),
   opts: InstallCursorHooksOptions = {},
 ): { backup: string | null; installedEvents: string[]; path: string; preExecTimeoutS: number } {
   const preExecTimeoutS = opts.preExecTimeoutS ?? DEFAULT_PRE_EXEC_HOOK_TIMEOUT_S;
@@ -77,7 +77,7 @@ export function installCursorHooks(
   return { backup: b, installedEvents: [...CURSOR_HOOK_EVENTS], path, preExecTimeoutS };
 }
 
-export function uninstallCursorHooks(path = CURSOR_HOOKS_PATH): { backup: string | null; removed: number } {
+export function uninstallCursorHooks(path = cursorHooksPath()): { backup: string | null; removed: number } {
   if (!existsSync(path)) return { backup: null, removed: 0 };
   const b = backup(path);
   const file = read(path);
@@ -105,7 +105,7 @@ export interface CursorPreExecHooksCheck {
 }
 
 export function inspectCursorPreExecHooks(
-  path: string = CURSOR_HOOKS_PATH,
+  path: string = cursorHooksPath(),
 ): CursorPreExecHooksCheck {
   if (!existsSync(path)) {
     return {

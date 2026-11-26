@@ -1,6 +1,6 @@
 import { appendFileSync } from "node:fs";
 import type { AgentConfig } from "../config.js";
-import { ensureAgentreelDir, LOG_PATH } from "../paths.js";
+import { ensureAgentreelDir, logPath } from "../paths.js";
 import { scrubString } from "../redact/scrubber.js";
 import {
   DEFAULT_APPROVAL_EXPIRES_S,
@@ -19,7 +19,7 @@ function defaultApprovalLog(message: string): void {
   try {
     ensureAgentreelDir();
     appendFileSync(
-      LOG_PATH,
+      logPath(),
       `[${new Date().toISOString()}] policy approval: ${message}\n`,
     );
   } catch {

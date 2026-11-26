@@ -10,7 +10,7 @@ import {
 } from "./matcher.js";
 import { readGuardConfig } from "./config.js";
 import { runWithTimeout } from "../policy/regex.js";
-import { LOG_PATH, ensureAgentreelDir } from "../paths.js";
+import { logPath, ensureAgentreelDir } from "../paths.js";
 
 /**
  * Hard per-event budget for the built-in rule pass (and, separately, the
@@ -59,7 +59,7 @@ function defaultLog(message: string): void {
   try {
     ensureAgentreelDir();
     appendFileSync(
-      LOG_PATH,
+      logPath(),
       `[${new Date().toISOString()}] guard scan: ${message}\n`,
     );
   } catch {

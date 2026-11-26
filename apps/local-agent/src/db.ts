@@ -1,6 +1,6 @@
 import Database from "better-sqlite3";
 import type { Database as DB } from "better-sqlite3";
-import { DB_PATH, ensureAgentreelDir } from "./paths.js";
+import { dbPath, ensureAgentreelDir } from "./paths.js";
 import type { AgentEvent, Session, Tool } from "@agentreel/shared-types";
 
 let _db: DB | null = null;
@@ -8,7 +8,7 @@ let _db: DB | null = null;
 export function getDb(): DB {
   if (_db) return _db;
   ensureAgentreelDir();
-  const db = new Database(DB_PATH);
+  const db = new Database(dbPath());
   db.pragma("journal_mode = WAL");
   db.pragma("synchronous = NORMAL");
   migrate(db);

@@ -9,7 +9,7 @@ import {
 } from "../config.js";
 import { getSessionAttribution, insertEvent, upsertSession } from "../db.js";
 import { applyIgnoreRules } from "../hooks/ignore-payload.js";
-import { CURSOR_HOOKS_PATH, LOG_PATH, ensureAgentreelDir } from "../paths.js";
+import { cursorHooksPath, logPath, ensureAgentreelDir } from "../paths.js";
 import {
   enforcePreExec,
   repoSlugFromRemoteUrl,
@@ -40,7 +40,7 @@ function logError(err: unknown): void {
   try {
     ensureAgentreelDir();
     appendFileSync(
-      LOG_PATH,
+      logPath(),
       `[${new Date().toISOString()}] cursor hook error: ${err instanceof Error ? err.stack ?? err.message : String(err)}\n`,
     );
   } catch {
@@ -49,7 +49,7 @@ function logError(err: unknown): void {
 }
 
 /** True when ~/.cursor/hooks.json already points at `agentreel cursor-hook`. */
-export function nativeCursorHooksInstalled(path = CURSOR_HOOKS_PATH): boolean {
+export function nativeCursorHooksInstalled(path = cursorHooksPath()): boolean {
   try {
     return existsSync(path) && readFileSync(path, "utf8").includes(` ${CURSOR_HOOK_SUBCOMMAND} `);
   } catch {

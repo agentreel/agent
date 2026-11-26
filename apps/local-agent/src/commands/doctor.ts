@@ -9,10 +9,10 @@ import {
 import { inspectCursorPreExecHooks } from "../cursor/hooks-install.js";
 import { inspectClaudePreExecHook } from "../hooks/install.js";
 import {
-  CLAUDE_SETTINGS_PATH,
-  CURSOR_HOOKS_PATH,
-  GUARD_CONFIG_PATH,
-  POLICY_PATH,
+  claudeSettingsPath,
+  cursorHooksPath,
+  guardConfigPath,
+  policyPath,
 } from "../paths.js";
 import {
   getPolicyCacheAgeMs,
@@ -95,8 +95,8 @@ export function inspectDoctorState(opts: DoctorInspectOptions = {}): DoctorRepor
   const now = opts.now ?? Date.now();
   const cfg = opts.config ?? readConfig();
   const loaded = loadEffectivePolicy({
-    cachePath: opts.cachePath ?? POLICY_PATH,
-    guardConfigPath: opts.guardConfigPath ?? GUARD_CONFIG_PATH,
+    cachePath: opts.cachePath ?? policyPath(),
+    guardConfigPath: opts.guardConfigPath ?? guardConfigPath(),
   });
 
   const policy = loaded.policy;
@@ -118,7 +118,7 @@ export function inspectDoctorState(opts: DoctorInspectOptions = {}): DoctorRepor
       : false;
 
   const capturePaused = isCapturePaused(cfg);
-  const lastRejection = readPolicyRejection(opts.cachePath ?? POLICY_PATH);
+  const lastRejection = readPolicyRejection(opts.cachePath ?? policyPath());
   const noOrgPolicy =
     loaded.source === "server_cache" && isNoOrgPolicy(policy);
 
@@ -145,7 +145,7 @@ export function inspectDoctorState(opts: DoctorInspectOptions = {}): DoctorRepor
     maxPolicyApprovalExpiresS > cursorEffectiveTimeoutS - HOOK_DEADLINE_MARGIN_S;
 
   const claudeRaw = inspectClaudePreExecHook(
-    opts.claudeSettingsPath ?? CLAUDE_SETTINGS_PATH,
+    opts.claudeSettingsPath ?? claudeSettingsPath(),
   );
   const claudeTimeoutOk =
     claudeRaw.preToolUseInstalled &&
@@ -153,7 +153,7 @@ export function inspectDoctorState(opts: DoctorInspectOptions = {}): DoctorRepor
     claudeRaw.preToolUseTimeoutS >= expectedPreExecTimeoutS;
 
   const cursorRaw = inspectCursorPreExecHooks(
-    opts.cursorHooksPath ?? CURSOR_HOOKS_PATH,
+    opts.cursorHooksPath ?? cursorHooksPath(),
   );
   const cursorHooks = cursorRaw.hooks.map((h) => ({
     ...h,

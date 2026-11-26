@@ -1778,7 +1778,7 @@ describe("govern API v1 (C1) additive fields, repo query, 304, no-org, org_id, e
 
     try {
       const { linkCommand, logoutCommand } = await import("../src/commands/auth.js");
-      const { POLICY_PATH } = await import("../src/paths.js");
+      const { policyPath } = await import("../src/paths.js");
       const {
         policyRejectionPath,
         readCachedPolicy: readCachedFresh,
@@ -1788,8 +1788,8 @@ describe("govern API v1 (C1) additive fields, repo query, 304, no-org, org_id, e
 
       // 1. Initial link caches org_a
       await linkCommand("ar_live_org_a_key", { api: srv.url });
-      expect(readCachedFresh(POLICY_PATH)?.policy.org_id).toBe("org_a");
-      expect(readCachedFresh(POLICY_PATH)?.etag).toBe("etag-org-a");
+      expect(readCachedFresh(policyPath())?.policy.org_id).toBe("org_a");
+      expect(readCachedFresh(policyPath())?.etag).toBe("etag-org-a");
 
       // Seed an org_mismatch_ignored sidecar as if a refresh saw org_b
       writeRejectionFresh(
@@ -1800,23 +1800,23 @@ describe("govern API v1 (C1) additive fields, repo query, 304, no-org, org_id, e
           cached_org_id: "org_a",
           incoming_org_id: "org_b",
         },
-        POLICY_PATH,
+        policyPath(),
       );
-      expect(readRejectionFresh(POLICY_PATH)?.reason).toBe("org_mismatch_ignored");
+      expect(readRejectionFresh(policyPath())?.reason).toBe("org_mismatch_ignored");
 
       // 2. Failed link (401) must NOT wipe org_a cache or sidecar
       await expect(
         linkCommand("ar_live_bad_key", { api: srv.url }),
       ).rejects.toThrow("EXIT_CALLED");
-      expect(readCachedFresh(POLICY_PATH)?.policy.org_id).toBe("org_a");
-      expect(readRejectionFresh(POLICY_PATH)?.reason).toBe("org_mismatch_ignored");
+      expect(readCachedFresh(policyPath())?.policy.org_id).toBe("org_a");
+      expect(readRejectionFresh(policyPath())?.reason).toBe("org_mismatch_ignored");
 
       // 3. Successful link to org_b clears org_a cache + etag + sidecar before fetching fresh
       await linkCommand("ar_live_org_b_key", { api: srv.url });
       expect(seenPolicyIfNoneMatch).toEqual([undefined, undefined]);
-      expect(readCachedFresh(POLICY_PATH)?.policy.org_id).toBe("org_b");
-      expect(readCachedFresh(POLICY_PATH)?.etag).toBe("etag-org-b");
-      expect(readRejectionFresh(POLICY_PATH)).toBeNull();
+      expect(readCachedFresh(policyPath())?.policy.org_id).toBe("org_b");
+      expect(readCachedFresh(policyPath())?.etag).toBe("etag-org-b");
+      expect(readRejectionFresh(policyPath())).toBeNull();
 
       // 4. Logout clears cached policy and any sidecar
       writeRejectionFresh(
@@ -1825,11 +1825,11 @@ describe("govern API v1 (C1) additive fields, repo query, 304, no-org, org_id, e
           error: "some notice",
           reason: "no_org_ignored",
         },
-        POLICY_PATH,
+        policyPath(),
       );
       await logoutCommand();
-      expect(existsSync(POLICY_PATH)).toBe(false);
-      expect(existsSync(policyRejectionPath(POLICY_PATH))).toBe(false);
+      expect(existsSync(policyPath())).toBe(false);
+      expect(existsSync(policyRejectionPath(policyPath()))).toBe(false);
     } finally {
       logSpy.mockRestore();
       errSpy.mockRestore();
@@ -1900,16 +1900,16 @@ describe("govern API v1 (C1) additive fields, repo query, 304, no-org, org_id, e
 
     try {
       const { linkCommand } = await import("../src/commands/auth.js");
-      const { POLICY_PATH } = await import("../src/paths.js");
+      const { policyPath } = await import("../src/paths.js");
       const { readCachedPolicy: readCachedFresh } = await import("../src/policy/cache.js");
 
       await linkCommand("ar_live_org_a_key", { api: srv.url });
-      expect(readCachedFresh(POLICY_PATH)?.policy.org_id).toBe("org_a");
+      expect(readCachedFresh(policyPath())?.policy.org_id).toBe("org_a");
 
       for (const mode of ["500", "invalid", "drop"] as const) {
         policyMode = mode;
         await linkCommand("ar_live_org_b_key", { api: srv.url });
-        const cached = readCachedFresh(POLICY_PATH);
+        const cached = readCachedFresh(policyPath());
         expect(cached?.policy.org_id, `mode ${mode}`).toBe("org_a");
         expect(cached?.etag, `mode ${mode}`).toBe("etag-org-a");
       }
@@ -1917,8 +1917,8 @@ describe("govern API v1 (C1) additive fields, repo query, 304, no-org, org_id, e
       // A later successful explicit auth still switches orgs.
       policyMode = "ok";
       await linkCommand("ar_live_org_b_key", { api: srv.url });
-      expect(readCachedFresh(POLICY_PATH)?.policy.org_id).toBe("org_b");
-      expect(readCachedFresh(POLICY_PATH)?.etag).toBe("etag-org-b");
+      expect(readCachedFresh(policyPath())?.policy.org_id).toBe("org_b");
+      expect(readCachedFresh(policyPath())?.etag).toBe("etag-org-b");
     } finally {
       logSpy.mockRestore();
       errSpy.mockRestore();
@@ -2055,7 +2055,7 @@ describe("govern API v1 (C1) additive fields, repo query, 304, no-org, org_id, e
     const errSpy = vi.spyOn(console, "error").mockImplementation(() => {});
     try {
       const { linkCommand } = await import("../src/commands/auth.js");
-      const { POLICY_PATH } = await import("../src/paths.js");
+      const { policyPath } = await import("../src/paths.js");
       const {
         readCachedPolicy: readCachedFresh,
         readPolicyRejection: readRejectionFresh,
@@ -2067,7 +2067,7 @@ describe("govern API v1 (C1) additive fields, repo query, 304, no-org, org_id, e
 
       writeCachedFresh(
         { policy: orgAPolicy, etag: orgAPolicy.etag, fetched_at: t0 },
-        POLICY_PATH,
+        policyPath(),
       );
       writeRejectionFresh(
         {
@@ -2077,15 +2077,15 @@ describe("govern API v1 (C1) additive fields, repo query, 304, no-org, org_id, e
           cached_org_id: "org_a",
           incoming_org_id: "org_b",
         },
-        POLICY_PATH,
+        policyPath(),
       );
 
       await linkCommand("ar_live_org_b_key", { api: authSrv.url });
-      expect(readCachedFresh(POLICY_PATH)?.policy.org_id).toBe("org_b");
-      expect(readRejectionFresh(POLICY_PATH)).toBeNull();
+      expect(readCachedFresh(policyPath())?.policy.org_id).toBe("org_b");
+      expect(readRejectionFresh(policyPath())).toBeNull();
       const afterAuth = formatDoctorFresh(
         inspectDoctorFresh({
-          cachePath: POLICY_PATH,
+          cachePath: policyPath(),
           guardConfigPath: join(authHome, "guard.json"),
           claudeSettingsPath: join(authHome, "missing-claude.json"),
           cursorHooksPath: join(authHome, "missing-cursor.json"),

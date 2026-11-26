@@ -10,7 +10,7 @@ import {
 } from "node:fs";
 import { dirname } from "node:path";
 import type { GuardConfig } from "../guard/types.js";
-import { GUARD_CONFIG_PATH, POLICY_PATH } from "../paths.js";
+import { guardConfigPath as defaultGuardConfigPath, policyPath } from "../paths.js";
 import {
   isValidSeverity,
   validateCachedPolicyFile,
@@ -59,12 +59,12 @@ const POLICY_REJECTION_REASONS = new Set<string>([
   "org_mismatch_ignored",
 ]);
 
-export function policyRejectionPath(cachePath: string = POLICY_PATH): string {
+export function policyRejectionPath(cachePath: string = policyPath()): string {
   return `${cachePath}.rejected.json`;
 }
 
 export function readPolicyRejection(
-  cachePath: string = POLICY_PATH,
+  cachePath: string = policyPath(),
 ): PolicyRejectionRecord | null {
   try {
     const p = policyRejectionPath(cachePath);
@@ -104,7 +104,7 @@ export function readPolicyRejection(
 
 export function writePolicyRejectionAtomic(
   record: PolicyRejectionRecord,
-  cachePath: string = POLICY_PATH,
+  cachePath: string = policyPath(),
 ): void {
   const target = policyRejectionPath(cachePath);
   const dir = dirname(target);
@@ -130,7 +130,7 @@ export function writePolicyRejectionAtomic(
   }
 }
 
-export function clearPolicyRejection(cachePath: string = POLICY_PATH): void {
+export function clearPolicyRejection(cachePath: string = policyPath()): void {
   try {
     const target = policyRejectionPath(cachePath);
     if (existsSync(target)) {
@@ -147,7 +147,7 @@ export function clearPolicyRejection(cachePath: string = POLICY_PATH): void {
  * no_org_ignored in place until explicit auth or logout.
  */
 export function clearTransientPolicyRejection(
-  cachePath: string = POLICY_PATH,
+  cachePath: string = policyPath(),
 ): void {
   const existing = readPolicyRejection(cachePath);
   if (
@@ -160,7 +160,7 @@ export function clearTransientPolicyRejection(
   clearPolicyRejection(cachePath);
 }
 
-export function clearCachedPolicy(cachePath: string = POLICY_PATH): void {
+export function clearCachedPolicy(cachePath: string = policyPath()): void {
   try {
     if (existsSync(cachePath)) {
       unlinkSync(cachePath);
@@ -176,7 +176,7 @@ export function clearCachedPolicy(cachePath: string = POLICY_PATH): void {
  * Corrupt, invalid, or unreadable cache files are treated as no cache and never throw.
  */
 export function readCachedPolicy(
-  cachePath: string = POLICY_PATH,
+  cachePath: string = policyPath(),
 ): CachedPolicyFile | null {
   try {
     if (!existsSync(cachePath)) return null;
@@ -194,7 +194,7 @@ export function readCachedPolicy(
  */
 export function writeCachedPolicyAtomic(
   entry: CachedPolicyFile,
-  cachePath: string = POLICY_PATH,
+  cachePath: string = policyPath(),
 ): void {
   const dir = dirname(cachePath);
   mkdirSync(dir, { recursive: true });
@@ -300,8 +300,8 @@ export interface LoadPolicyOptions {
 export function loadEffectivePolicy(
   opts: LoadPolicyOptions = {},
 ): LoadedPolicy {
-  const cachePath = opts.cachePath ?? POLICY_PATH;
-  const guardConfigPath = opts.guardConfigPath ?? GUARD_CONFIG_PATH;
+  const cachePath = opts.cachePath ?? policyPath();
+  const guardConfigPath = opts.guardConfigPath ?? defaultGuardConfigPath();
 
   const cached = readCachedPolicy(cachePath);
   if (cached) {

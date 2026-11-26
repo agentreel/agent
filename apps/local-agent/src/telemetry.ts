@@ -3,11 +3,11 @@ import Database from "better-sqlite3";
 import { existsSync, mkdirSync, readFileSync, writeFileSync } from "node:fs";
 import { platform } from "node:os";
 import { join } from "node:path";
-import { AGENTREEL_DIR, DB_PATH } from "./paths.js";
+import { agentreelDir, dbPath } from "./paths.js";
 
 export const CLI_EVENTS_URL = "https://agentreel.dev/api/cli/events";
 
-const TELEMETRY_PATH = join(AGENTREEL_DIR, "telemetry.json");
+const telemetryPath = (): string => join(agentreelDir(), "telemetry.json");
 const HEARTBEAT_INTERVAL_MS = 24 * 60 * 60 * 1000;
 const POST_TIMEOUT_MS = 800;
 
@@ -47,8 +47,8 @@ let inFlightTelemetry: Promise<void> | null = null;
 /** Distinct replay sessions in the local SQLite buffer (read-only; never throws). */
 export function countLocalRecordedSessions(): number {
   try {
-    if (!existsSync(DB_PATH)) return 0;
-    const db = new Database(DB_PATH, {
+    if (!existsSync(dbPath())) return 0;
+    const db = new Database(dbPath(), {
       readonly: true,
       fileMustExist: true,
       timeout: 0,
@@ -94,7 +94,7 @@ export function shouldSkipTelemetryForArgv(argv: string[]): boolean {
 
 function readState(): TelemetryState | null {
   try {
-    const raw = readFileSync(TELEMETRY_PATH, "utf8");
+    const raw = readFileSync(telemetryPath(), "utf8");
     const parsed = JSON.parse(raw) as Partial<TelemetryState>;
     if (typeof parsed.anon_id !== "string" || !parsed.anon_id) return null;
     return {
@@ -110,8 +110,8 @@ function readState(): TelemetryState | null {
 }
 
 function writeState(state: TelemetryState): void {
-  mkdirSync(AGENTREEL_DIR, { recursive: true });
-  writeFileSync(TELEMETRY_PATH, JSON.stringify(state, null, 2) + "\n", { mode: 0o600 });
+  mkdirSync(agentreelDir(), { recursive: true });
+  writeFileSync(telemetryPath(), JSON.stringify(state, null, 2) + "\n", { mode: 0o600 });
 }
 
 /** Persist anon_id and notice_shown without clobbering delivery markers from disk. */

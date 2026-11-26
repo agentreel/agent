@@ -3,8 +3,8 @@ import { mkdtempSync, rmSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 
-// paths.ts reads homedir() at import time, so point HOME at a temp dir
-// before loading anything that touches the database.
+// Give this file its own HOME before anything opens the database (getDb
+// opens ~/.agentreel/sessions.db once, on first use).
 const home = mkdtempSync(join(tmpdir(), "agentreel-test-"));
 process.env.HOME = home;
 

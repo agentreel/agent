@@ -8,7 +8,7 @@ import {
 } from "../config.js";
 import { insertEvent } from "../db.js";
 import { RULES } from "../guard/rules.js";
-import { ensureAgentreelDir, LOG_PATH } from "../paths.js";
+import { ensureAgentreelDir, logPath } from "../paths.js";
 import { scrubAny, scrubString } from "../redact/scrubber.js";
 import { isPolicyCacheStale, loadEffectivePolicy } from "./cache.js";
 import {
@@ -122,7 +122,7 @@ function defaultLog(message: string): void {
   try {
     ensureAgentreelDir();
     appendFileSync(
-      LOG_PATH,
+      logPath(),
       `[${new Date().toISOString()}] policy enforce: ${message}\n`,
     );
   } catch {

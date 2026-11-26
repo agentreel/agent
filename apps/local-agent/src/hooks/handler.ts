@@ -11,7 +11,7 @@ import {
 import { recomputeSessionCost } from "../cost/transcript.js";
 import { isCursorPayload, nativeCursorHooksInstalled, recordCursorHook } from "../cursor/hook-runner.js";
 import { getSessionAttribution, insertEvent, upsertSession } from "../db.js";
-import { LOG_PATH, ensureAgentreelDir } from "../paths.js";
+import { logPath, ensureAgentreelDir } from "../paths.js";
 import {
   enforcePreExec,
   repoSlugFromRemoteUrl,
@@ -43,7 +43,7 @@ function logError(err: unknown): void {
     const line = `[${new Date().toISOString()}] hook error: ${
       err instanceof Error ? err.stack ?? err.message : String(err)
     }\n`;
-    appendFileSync(LOG_PATH, line);
+    appendFileSync(logPath(), line);
   } catch {
     // swallow: never block Claude Code
   }

@@ -2,24 +2,29 @@ import { homedir } from "node:os";
 import { join } from "node:path";
 import { mkdirSync } from "node:fs";
 
-export const HOME = homedir();
-export const AGENTREEL_DIR = join(HOME, ".agentreel");
-export const DB_PATH = join(AGENTREEL_DIR, "sessions.db");
-export const CONFIG_PATH = join(AGENTREEL_DIR, "config.json");
-export const POLICY_PATH = join(AGENTREEL_DIR, "policy.json");
-export const GUARD_CONFIG_PATH = join(AGENTREEL_DIR, "guard-config.json");
-export const QUEUE_DIR = join(AGENTREEL_DIR, "queue");
-export const LOG_PATH = join(AGENTREEL_DIR, "agent.log");
-export const DAEMON_PID_PATH = join(AGENTREEL_DIR, "daemon.pid");
-export const DAEMON_LOG_PATH = join(AGENTREEL_DIR, "daemon.log");
+// Every path is computed on each call, never at import time. os.homedir()
+// reads the HOME environment variable, so a test or probe that sets HOME
+// after this module was imported still gets its own directory instead of the
+// real ~/.agentreel. Do not cache these in module-level constants.
+export const homeDir = (): string => homedir();
 
-export const CLAUDE_DIR = join(HOME, ".claude");
-export const CLAUDE_SETTINGS_PATH = join(CLAUDE_DIR, "settings.json");
+export const agentreelDir = (): string => join(homeDir(), ".agentreel");
+export const dbPath = (): string => join(agentreelDir(), "sessions.db");
+export const configPath = (): string => join(agentreelDir(), "config.json");
+export const policyPath = (): string => join(agentreelDir(), "policy.json");
+export const guardConfigPath = (): string => join(agentreelDir(), "guard-config.json");
+export const queueDir = (): string => join(agentreelDir(), "queue");
+export const logPath = (): string => join(agentreelDir(), "agent.log");
+export const daemonPidPath = (): string => join(agentreelDir(), "daemon.pid");
+export const daemonLogPath = (): string => join(agentreelDir(), "daemon.log");
 
-export const CURSOR_DIR = join(HOME, ".cursor");
-export const CURSOR_HOOKS_PATH = join(CURSOR_DIR, "hooks.json");
+export const claudeDir = (): string => join(homeDir(), ".claude");
+export const claudeSettingsPath = (): string => join(claudeDir(), "settings.json");
+
+export const cursorDir = (): string => join(homeDir(), ".cursor");
+export const cursorHooksPath = (): string => join(cursorDir(), "hooks.json");
 
 export function ensureAgentreelDir(): void {
-  mkdirSync(AGENTREEL_DIR, { recursive: true });
-  mkdirSync(QUEUE_DIR, { recursive: true });
+  mkdirSync(agentreelDir(), { recursive: true });
+  mkdirSync(queueDir(), { recursive: true });
 }

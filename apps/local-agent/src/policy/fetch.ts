@@ -1,6 +1,6 @@
 import { appendFileSync } from "node:fs";
 import { readConfig, type AgentConfig } from "../config.js";
-import { ensureAgentreelDir, LOG_PATH, POLICY_PATH } from "../paths.js";
+import { ensureAgentreelDir, logPath, policyPath } from "../paths.js";
 import {
   clearTransientPolicyRejection,
   POLICY_REFRESH_INTERVAL_MS,
@@ -47,7 +47,7 @@ function defaultLog(message: string): void {
   try {
     ensureAgentreelDir();
     appendFileSync(
-      LOG_PATH,
+      logPath(),
       `[${new Date().toISOString()}] policy: ${message}\n`,
     );
   } catch {
@@ -64,7 +64,7 @@ export async function fetchPolicy(
   opts: FetchPolicyOptions = {},
 ): Promise<FetchPolicyResult> {
   const log = opts.log ?? defaultLog;
-  const cachePath = opts.cachePath ?? POLICY_PATH;
+  const cachePath = opts.cachePath ?? policyPath();
   const nowFn = opts.now ?? Date.now;
   const timeoutMs = opts.timeoutMs ?? POLICY_FETCH_TIMEOUT_MS;
   const fetchImpl = opts.fetchImpl ?? globalThis.fetch;
