@@ -73,12 +73,13 @@ function addCodePoint(set: CharSet, code: number): { exactNonAscii: boolean } {
     addAsciiCode(set, code);
     return { exactNonAscii: true };
   }
-  const ch = String.fromCodePoint(code);
-  if (/\s/.test(ch)) {
-    set[NON_ASCII_SPACE] = 1;
-  } else {
-    set[NON_ASCII_NON_SPACE] = 1;
-  }
+  // Non-ASCII literals (decoded \x / \u / \u{...} escapes included) are
+  // modelled as the universal set so disjointness stays conservative under
+  // both /i and /iu. JS /iu case-folds U+212A (Kelvin) to "k" and U+017F
+  // (long s) to "s"; /i without /u does not, but the charset model cannot
+  // see the eventual compile flags. Shorthands such as \w and \s are
+  // unchanged.
+  set.fill(1);
   return { exactNonAscii: false };
 }
 
@@ -423,10 +424,12 @@ function parseCharClass(
     if (ch === "]" && !firstItem) {
       let set = pos;
       if (negated) {
-        set = complementExact(pos);
         if (!exactNonAscii) {
-          set[NON_ASCII_SPACE] = 1;
-          set[NON_ASCII_NON_SPACE] = 1;
+          // Complementing a non-exact (non-ASCII or approximate) class
+          // would shrink it unsafely; keep it universal.
+          set = universalCharSet();
+        } else {
+          set = complementExact(pos);
         }
       }
       return { end: i, set };
@@ -462,9 +465,10 @@ function parseCharClass(
         for (let code = prevSingleCode; code <= asciiEnd; code++) {
           addAsciiCode(pos, code);
         }
-        if (endCode >= 128) {
-          pos[NON_ASCII_SPACE] = 1;
-          pos[NON_ASCII_NON_SPACE] = 1;
+        if (endCode >= 128 || prevSingleCode >= 128) {
+          // A range that includes any non-ASCII code point is universal,
+          // matching addCodePoint's conservative model for literals.
+          pos.fill(1);
           exactNonAscii = false;
         }
       }

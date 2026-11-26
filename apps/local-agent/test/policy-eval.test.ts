@@ -250,6 +250,15 @@ describe("RE2-safe regex compiler, cache, and timeout guard", () => {
       "(:|DROP)\\w+\\s+\\w+",
       "curl[^|]*\\|\\s*(ba)?sh",
       "foo[\\x41-\\x5A]+@[\\x41-\\x5A]+",
+      // Non-ASCII literals are universal in the disjointness model, so a
+      // Kelvin / long-s leading literal or separator is never disjoint.
+      // "\\u{1F600}\\s+\\w+" was accepted before this rule.
+      "\\u212A\\w+\\s+\\w+\\u{1F600}?",
+      "\\u017F\\w+\\s+\\w+\\u{1F600}?",
+      "\\u212A\\w+\\s+\\w+",
+      "\\w+\\u212A\\w+",
+      "x\\u212A[a-z]+\\s+\\w+",
+      "\\u{1F600}\\s+\\w+",
       // Extra conservative boundary rejects
       "\\s+[a-z]*\\s+",
       "a+x?a+",
@@ -292,6 +301,25 @@ describe("RE2-safe regex compiler, cache, and timeout guard", () => {
         RegExp,
       );
     }
+  });
+
+  it("records that the Kelvin Unicode case-fold repro is quadratic under /iu", () => {
+    // compileSafeRegex now rejects this pattern. Time a raw /iu RegExp to
+    // show why: U+212A folds to "k", so the leading literal does not pin
+    // the two unbounded \\w+ quantifiers on a long run of "k".
+    const source = "\\u212A\\w+\\s+\\w+\\u{1F600}?";
+    expect(isRe2SafePattern(source)).toBe(false);
+    expect(compileSafeRegex(source)).toBeNull();
+    const re = new RegExp(source, "iu");
+    const input = "k".repeat(32_768);
+    const t0 = performance.now();
+    const matched = re.test(input);
+    const elapsed = performance.now() - t0;
+    expect(matched).toBe(false);
+    expect(
+      elapsed,
+      `expected Kelvin /iu repro to be slow on 32KB of k, got ${elapsed.toFixed(2)}ms`,
+    ).toBeGreaterThan(50);
   });
 
   it("decodes \\xHH, \\uHHHH, and \\u{H...} escapes and rejects forbidden, octal, or malformed escapes", () => {
