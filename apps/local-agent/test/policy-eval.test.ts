@@ -1190,3 +1190,178 @@ describe("validatePolicy regex safety and eval invalid_rule defense in depth", (
     expect(observeRes.reason).toBe(INVALID_RULE_REASON);
   });
 });
+
+describe("C1 additive evaluation: no-org, scope.teams, and approval_defaults merging", () => {
+  it("evaluates org_id null (no-org) policy as allow with no enforcement or builtin flags", () => {
+    const noOrg: Policy = {
+      version: 1,
+      etag: "etag-no-org",
+      org_id: null,
+      workspace_id: null,
+      updated_at: "2026-11-26T00:00:00Z",
+      mode: "observe",
+      offline: "last_known",
+      builtin: {},
+      custom: [],
+      allow: { commands: [], paths: [], repos: [] },
+    };
+
+    const res = evaluatePolicy(
+      { tool: "claude-code", toolName: "Bash", command: "rm -rf ~" },
+      noOrg,
+    );
+    expect(res.action).toBe("allow");
+    expect(res.matches).toEqual([]);
+    expect(res.rule_ids).toEqual([]);
+  });
+
+  it("skips rules with non-empty scope.teams unless policy.current_user_teams matches a listed team", () => {
+    const makeTeamsPolicy = (currentUserTeams?: string[]): Policy => ({
+      version: 1,
+      etag: "etag-teams",
+      workspace_id: "ws_1",
+      updated_at: "2026-11-26T00:00:00Z",
+      mode: "enforce",
+      offline: "last_known",
+      ...(currentUserTeams !== undefined
+        ? { current_user_teams: currentUserTeams }
+        : {}),
+      builtin: {},
+      custom: [
+        {
+          id: "cust_team_scoped",
+          name: "Platform/SRE deploy block",
+          enabled: true,
+          version: 1,
+          message: "Blocked for platform/sre",
+          when: [{ field: "command", op: "contains", value: "deploy-prod" }],
+          action: "block",
+          severity: "high",
+          scope: { teams: ["platform", "sre"] },
+        },
+        {
+          id: "cust_empty_teams",
+          name: "Empty teams scope applies to all",
+          enabled: true,
+          version: 1,
+          message: "Applies to everyone",
+          when: [{ field: "command", op: "contains", value: "audit-all" }],
+          action: "flag",
+          severity: "info",
+          scope: { teams: [] },
+        },
+      ],
+      allow: { commands: [], paths: [], repos: [] },
+    });
+
+    // Without current_user_teams, team-scoped rule is skipped
+    const skippedMissing = evaluatePolicy(
+      { tool: "claude-code", toolName: "Bash", command: "deploy-prod now" },
+      makeTeamsPolicy(undefined),
+    );
+    expect(skippedMissing.action).toBe("allow");
+    expect(skippedMissing.rule_ids).toEqual([]);
+
+    // Non-matching current_user_teams also skips the rule
+    const skippedNonMatch = evaluatePolicy(
+      { tool: "claude-code", toolName: "Bash", command: "deploy-prod now" },
+      makeTeamsPolicy(["frontend", "design"]),
+    );
+    expect(skippedNonMatch.action).toBe("allow");
+    expect(skippedNonMatch.rule_ids).toEqual([]);
+
+    // Matching team applies the rule
+    const matched = evaluatePolicy(
+      { tool: "claude-code", toolName: "Bash", command: "deploy-prod now" },
+      makeTeamsPolicy(["frontend", "sre"]),
+    );
+    expect(matched.action).toBe("block");
+    expect(matched.rule_ids).toEqual(["cust_team_scoped"]);
+
+    // Empty scope.teams does not restrict the rule
+    const emptyTeams = evaluatePolicy(
+      { tool: "claude-code", toolName: "Bash", command: "audit-all" },
+      makeTeamsPolicy(undefined),
+    );
+    expect(emptyTeams.action).toBe("flag");
+    expect(emptyTeams.rule_ids).toEqual(["cust_empty_teams"]);
+  });
+
+  it("merges effective approval config as rule.approval over approval_defaults over (120, deny) for builtin and custom rules", () => {
+    const policy: Policy = {
+      version: 1,
+      etag: "etag-approval-merge",
+      workspace_id: "ws_1",
+      updated_at: "2026-11-26T00:00:00Z",
+      mode: "enforce",
+      offline: "last_known",
+      approval_defaults: { expires_s: 90, offline_fallback: "allow" },
+      builtin: {
+        GIT001: { enabled: true, action: "require_approval" },
+        FS001: {
+          enabled: true,
+          action: "require_approval",
+          approval: { offline_fallback: "deny" },
+        },
+      },
+      custom: [
+        {
+          id: "cust_partial_approval",
+          name: "Partial custom approval",
+          enabled: true,
+          version: 1,
+          message: "Approve release",
+          when: [{ field: "command", op: "contains", value: "release-prod" }],
+          action: "require_approval",
+          severity: "high",
+          approval: { expires_s: 45 },
+        },
+      ],
+      allow: { commands: [], paths: [], repos: [] },
+    };
+
+    // Builtin without rule.approval inherits approval_defaults
+    const builtinInherited = evaluatePolicy(
+      { tool: "claude-code", toolName: "Bash", command: "git push --force origin main" },
+      policy,
+    );
+    expect(builtinInherited.action).toBe("require_approval");
+    expect(builtinInherited.matches[0]?.approval).toEqual({
+      expires_s: 90,
+      offline_fallback: "allow",
+    });
+
+    // Builtin with partial rule.approval merges over approval_defaults
+    const builtinOverride = evaluatePolicy(
+      { tool: "claude-code", toolName: "Bash", command: "rm -rf ~" },
+      policy,
+    );
+    expect(builtinOverride.action).toBe("require_approval");
+    expect(builtinOverride.matches[0]?.approval).toEqual({
+      expires_s: 90,
+      offline_fallback: "deny",
+    });
+
+    // Custom with partial rule.approval merges over approval_defaults
+    const customPartial = evaluatePolicy(
+      { tool: "claude-code", toolName: "Bash", command: "release-prod v1" },
+      policy,
+    );
+    expect(customPartial.action).toBe("require_approval");
+    expect(customPartial.matches[0]?.approval).toEqual({
+      expires_s: 45,
+      offline_fallback: "allow",
+    });
+
+    // Without approval_defaults, falls back to built-in (120, deny)
+    const noDefaultsPolicy: Policy = { ...policy, approval_defaults: undefined };
+    const builtinDefault = evaluatePolicy(
+      { tool: "claude-code", toolName: "Bash", command: "git push --force origin main" },
+      noDefaultsPolicy,
+    );
+    expect(builtinDefault.matches[0]?.approval).toEqual({
+      expires_s: 120,
+      offline_fallback: "deny",
+    });
+  });
+});

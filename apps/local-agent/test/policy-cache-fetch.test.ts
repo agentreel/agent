@@ -1,3 +1,4 @@
+import { execFileSync } from "node:child_process";
 import { createServer, type IncomingMessage, type ServerResponse } from "node:http";
 import {
   mkdirSync,
@@ -19,9 +20,15 @@ import {
   readPolicyRejection,
   shouldRefreshPolicy,
   writeCachedPolicyAtomic,
+  writePolicyRejectionAtomic,
 } from "../src/policy/cache.js";
-import { fetchPolicy } from "../src/policy/fetch.js";
-import { validatePolicy, type Policy } from "../src/policy/types.js";
+import { fetchPolicy, repoSlugFromRemoteUrl } from "../src/policy/fetch.js";
+import {
+  computeMaxPolicyApprovalExpiresS,
+  computePreExecTimeoutS,
+  validatePolicy,
+  type Policy,
+} from "../src/policy/types.js";
 import {
   buildPolicySummary,
   formatPolicySummary,
@@ -945,5 +952,418 @@ describe("unsupported regex rejection on policy fetch and doctor output", () => 
     } finally {
       await srv.close();
     }
+  });
+});
+
+describe("govern API v1 (C1) additive fields, repo query, 304, no-org, org_id, expires_s, and severity", () => {
+  let tmpDir: string;
+  let cachePath: string;
+  let guardConfigPath: string;
+
+  beforeEach(() => {
+    tmpDir = mkdtempSync(join(tmpdir(), "agentreel-c1-fetch-"));
+    cachePath = join(tmpDir, "policy.json");
+    guardConfigPath = join(tmpDir, "guard-config.json");
+  });
+
+  afterEach(() => {
+    rmSync(tmpDir, { recursive: true, force: true });
+  });
+
+  it("derives owner/name from https and ssh git remotes (stripping .git) and sends URL-encoded ?repo= on GET /api/v1/policy", async () => {
+    expect(repoSlugFromRemoteUrl("https://github.com/acme/webapp.git")).toBe("acme/webapp");
+    expect(repoSlugFromRemoteUrl("https://github.com/acme/webapp")).toBe("acme/webapp");
+    expect(repoSlugFromRemoteUrl("https://token@github.com/acme/webapp.git")).toBe("acme/webapp");
+    expect(repoSlugFromRemoteUrl("ssh://git@github.com/acme/webapp.git")).toBe("acme/webapp");
+    expect(repoSlugFromRemoteUrl("ssh://git@github.com:22/acme/webapp.git")).toBe("acme/webapp");
+    expect(repoSlugFromRemoteUrl("git@github.com:acme/webapp.git")).toBe("acme/webapp");
+    expect(repoSlugFromRemoteUrl("git@github.com:acme/webapp")).toBe("acme/webapp");
+    expect(repoSlugFromRemoteUrl("/local/bare/repo.git")).toBeUndefined();
+    expect(repoSlugFromRemoteUrl("file:///local/bare/repo.git")).toBeUndefined();
+
+    const httpsRepo = join(tmpDir, "https-repo");
+    const sshRepo = join(tmpDir, "ssh-repo");
+    const noRemoteDir = join(tmpDir, "no-remote");
+    mkdirSync(httpsRepo, { recursive: true });
+    mkdirSync(sshRepo, { recursive: true });
+    mkdirSync(noRemoteDir, { recursive: true });
+
+    execFileSync("git", ["init"], { cwd: httpsRepo, stdio: "ignore" });
+    execFileSync("git", ["remote", "add", "origin", "https://github.com/acme/api-server.git"], {
+      cwd: httpsRepo,
+      stdio: "ignore",
+    });
+
+    execFileSync("git", ["init"], { cwd: sshRepo, stdio: "ignore" });
+    execFileSync("git", ["remote", "add", "origin", "git@github.com:acme/ssh-service.git"], {
+      cwd: sshRepo,
+      stdio: "ignore",
+    });
+
+    const seenUrls: string[] = [];
+    const srv = await startMockServer((req, res) => {
+      seenUrls.push(req.url ?? "");
+      res.writeHead(200, { "content-type": "application/json" });
+      res.end(JSON.stringify(makePolicy({ etag: `etag-${seenUrls.length}` })));
+    });
+
+    try {
+      await fetchPolicy({
+        config: makeConfig(srv.url, "ar_live_key"),
+        cachePath: join(tmpDir, "p1.json"),
+        cwd: httpsRepo,
+        log: () => {},
+      });
+      await fetchPolicy({
+        config: makeConfig(srv.url, "ar_live_key"),
+        cachePath: join(tmpDir, "p2.json"),
+        cwd: sshRepo,
+        log: () => {},
+      });
+      await fetchPolicy({
+        config: makeConfig(srv.url, "ar_live_key"),
+        cachePath: join(tmpDir, "p3.json"),
+        cwd: noRemoteDir,
+        log: () => {},
+      });
+
+      expect(seenUrls).toEqual([
+        "/api/v1/policy?repo=acme%2Fapi-server",
+        "/api/v1/policy?repo=acme%2Fssh-service",
+        "/api/v1/policy",
+      ]);
+    } finally {
+      await srv.close();
+    }
+  });
+
+  it("on 304 keeps cached policy, updates fetched_at, clears rejected sidecar, and logs nothing", async () => {
+    const t0 = 1_764_500_000_000;
+    const t1 = t0 + 10 * 60_000;
+    const cachedPolicy = makePolicy({ etag: "etag-304-clean", mode: "enforce" });
+    writeCachedPolicyAtomic(
+      { policy: cachedPolicy, etag: cachedPolicy.etag, fetched_at: t0 },
+      cachePath,
+    );
+    writePolicyRejectionAtomic(
+      { ts: t0 + 1000, error: "prior bad fetch", reason: "invalid_policy" },
+      cachePath,
+    );
+    expect(readPolicyRejection(cachePath)).not.toBeNull();
+
+    let seenIfNoneMatch: string | undefined;
+    const srv = await startMockServer((req, res) => {
+      seenIfNoneMatch = req.headers["if-none-match"] as string | undefined;
+      res.writeHead(304);
+      res.end();
+    });
+
+    const logs: string[] = [];
+    try {
+      const res = await fetchPolicy({
+        config: makeConfig(srv.url, "ar_live_key"),
+        cachePath,
+        cwd: tmpDir,
+        now: () => t1,
+        log: (m) => logs.push(m),
+      });
+
+      expect(res.status).toBe("not_modified");
+      expect(seenIfNoneMatch).toBe("etag-304-clean");
+      expect(logs).toEqual([]);
+      expect(readPolicyRejection(cachePath)).toBeNull();
+      const updated = readCachedPolicy(cachePath);
+      expect(updated?.etag).toBe("etag-304-clean");
+      expect(updated?.fetched_at).toBe(t1);
+      expect(updated?.policy).toEqual(cachedPolicy);
+    } finally {
+      await srv.close();
+    }
+  });
+
+  it("accepts 200 with org_id null, mode observe, and empty builtin/custom/allow as no-org, caches it, and doctor says no org policy", async () => {
+    const t0 = 1_764_510_000_000;
+    const noOrgPayload = {
+      version: 1,
+      etag: "etag-no-org",
+      org_id: null,
+      workspace_id: null,
+      updated_at: "2026-11-26T00:00:00Z",
+      fetched_at: "2026-11-26T00:00:01Z",
+      mode: "observe",
+      offline: "last_known",
+      builtin: {},
+      custom: [],
+      allow: { commands: [], paths: [], repos: [] },
+      unknown_extra_field: { ignored: true },
+    };
+
+    const srv = await startMockServer((_req, res) => {
+      res.writeHead(200, { "content-type": "application/json" });
+      res.end(JSON.stringify(noOrgPayload));
+    });
+
+    try {
+      const fetched = await fetchPolicy({
+        config: makeConfig(srv.url, "ar_live_key"),
+        cachePath,
+        cwd: tmpDir,
+        now: () => t0,
+        log: () => {},
+      });
+
+      expect(fetched.status).toBe("updated");
+      const cached = readCachedPolicy(cachePath);
+      expect(cached).not.toBeNull();
+      expect(cached?.policy.org_id).toBeNull();
+      expect(cached?.policy.fetched_at).toBe("2026-11-26T00:00:01Z");
+      expect((cached?.policy as unknown as Record<string, unknown>).unknown_extra_field).toBeUndefined();
+
+      const report = inspectDoctorState({
+        cachePath,
+        guardConfigPath,
+        claudeSettingsPath: join(tmpDir, "missing-claude.json"),
+        cursorHooksPath: join(tmpDir, "missing-cursor.json"),
+        config: makeConfig(srv.url, "ar_live_key"),
+        now: t0 + 1000,
+      });
+      expect(report.noOrgPolicy).toBe(true);
+      expect(report.enforcementActive).toBe(false);
+      const output = formatDoctorReport(report);
+      expect(output).toContain("no org policy");
+
+      const summary = buildPolicySummary(
+        loadEffectivePolicy({ cachePath, guardConfigPath }),
+        t0 + 1000,
+      );
+      expect(summary.source).toContain("no org policy");
+
+      // Also accepts org_id: null when workspace_id is omitted
+      const omittedWs = validatePolicy({
+        version: 1,
+        etag: "etag-no-org-2",
+        org_id: null,
+        updated_at: "2026-11-26T00:00:00Z",
+        mode: "observe",
+        offline: "last_known",
+        builtin: {},
+        custom: [],
+        allow: { commands: [], paths: [], repos: [] },
+      });
+      expect(omittedWs.ok).toBe(true);
+
+      // Rejects org_id: null if mode is enforce or rules/allow are non-empty
+      expect(
+        validatePolicy({ ...noOrgPayload, mode: "enforce" }).ok,
+      ).toBe(false);
+      expect(
+        validatePolicy({
+          ...noOrgPayload,
+          builtin: { FS001: { enabled: true, action: "flag" } },
+        }).ok,
+      ).toBe(false);
+    } finally {
+      await srv.close();
+    }
+  });
+
+  it("accepts matching org_id and workspace_id, rejects mismatch with a clear doctor message, and ignores unknown top-level fields", async () => {
+    const t0 = 1_764_520_000_000;
+    const validMatching = validatePolicy({
+      ...makePolicy({ workspace_id: "org_123" }),
+      org_id: "org_123",
+      fetched_at: "2026-11-26T00:00:00Z",
+      extra_top_level_key: "ignored",
+    });
+    expect(validMatching.ok).toBe(true);
+    if (validMatching.ok) {
+      expect(validMatching.value.org_id).toBe("org_123");
+      expect(validMatching.value.workspace_id).toBe("org_123");
+      expect(validMatching.value.fetched_at).toBe("2026-11-26T00:00:00Z");
+    }
+
+    const mismatchPayload = {
+      ...makePolicy({ workspace_id: "ws_alpha" }),
+      org_id: "org_beta",
+    };
+    const srv = await startMockServer((_req, res) => {
+      res.writeHead(200, { "content-type": "application/json" });
+      res.end(JSON.stringify(mismatchPayload));
+    });
+
+    try {
+      const res = await fetchPolicy({
+        config: makeConfig(srv.url, "ar_live_key"),
+        cachePath,
+        cwd: tmpDir,
+        now: () => t0,
+        log: () => {},
+      });
+      expect(res.status).toBe("invalid_policy");
+      if (res.status === "invalid_policy") {
+        expect(res.error).toContain("org_beta");
+        expect(res.error).toContain("ws_alpha");
+      }
+
+      const report = inspectDoctorState({
+        cachePath,
+        guardConfigPath,
+        claudeSettingsPath: join(tmpDir, "missing-claude.json"),
+        cursorHooksPath: join(tmpDir, "missing-cursor.json"),
+        config: makeConfig(srv.url, "ar_live_key"),
+        now: t0 + 1000,
+      });
+      const output = formatDoctorReport(report);
+      expect(output).toContain("org_beta");
+      expect(output).toContain("ws_alpha");
+      expect(output).toContain("does not match");
+    } finally {
+      await srv.close();
+    }
+  });
+
+  it("enforces expires_s integer bounds 10..3600 naming the rule, supports approval_defaults, and enforces severity rules", () => {
+    // Boundary accepts: 10 and 3600 on approval_defaults, builtin, and custom
+    const okBounds = validatePolicy({
+      ...makePolicy(),
+      approval_defaults: { expires_s: 120, offline_fallback: "deny" },
+      builtin: {
+        GIT001: {
+          enabled: true,
+          action: "require_approval",
+          approval: { expires_s: 10 },
+        },
+        FS001: {
+          enabled: true,
+          action: "block",
+          // severity omitted on builtin is valid
+        },
+      },
+      custom: [
+        {
+          id: "cust_max_exp",
+          name: "Max expiry",
+          enabled: true,
+          version: 1,
+          message: "Max",
+          when: [{ field: "command", op: "contains", value: "deploy" }],
+          action: "require_approval",
+          severity: "info",
+          approval: { expires_s: 3600, offline_fallback: "allow" },
+        },
+      ],
+    });
+    expect(okBounds.ok).toBe(true);
+    if (okBounds.ok) {
+      expect(okBounds.value.approval_defaults).toEqual({
+        expires_s: 120,
+        offline_fallback: "deny",
+      });
+      expect(computeMaxPolicyApprovalExpiresS(okBounds.value)).toBe(3600);
+      expect(computePreExecTimeoutS(okBounds.value)).toBe(3610);
+    }
+
+    // approval_defaults flows into computeMaxPolicyApprovalExpiresS / computePreExecTimeoutS
+    const defaultsOnly = makePolicy({
+      approval_defaults: { expires_s: 240, offline_fallback: "deny" },
+      builtin: {
+        GIT001: { enabled: true, action: "require_approval" },
+      },
+      custom: [],
+    });
+    expect(computeMaxPolicyApprovalExpiresS(defaultsOnly)).toBe(240);
+    expect(computePreExecTimeoutS(defaultsOnly)).toBe(250);
+
+    // Out-of-range and non-integer expires_s rejected, naming the rule
+    for (const badExp of [9, 3601, 10.5, 0, -1]) {
+      const badCustom = validatePolicy({
+        ...makePolicy(),
+        custom: [
+          {
+            id: "cust_bad_exp",
+            name: "Bad expiry",
+            enabled: true,
+            version: 1,
+            message: "Bad",
+            when: [{ field: "command", op: "contains", value: "deploy" }],
+            action: "require_approval",
+            severity: "high",
+            approval: { expires_s: badExp },
+          },
+        ],
+      });
+      expect(badCustom.ok, `expected reject custom expires_s=${badExp}`).toBe(false);
+      if (!badCustom.ok) {
+        expect(badCustom.error).toContain("cust_bad_exp");
+      }
+
+      const badBuiltin = validatePolicy({
+        ...makePolicy(),
+        builtin: {
+          GIT001: {
+            enabled: true,
+            action: "require_approval",
+            approval: { expires_s: badExp },
+          },
+        },
+      });
+      expect(badBuiltin.ok, `expected reject builtin expires_s=${badExp}`).toBe(false);
+      if (!badBuiltin.ok) {
+        expect(badBuiltin.error).toContain("GIT001");
+      }
+
+      const badDefaults = validatePolicy({
+        ...makePolicy(),
+        approval_defaults: { expires_s: badExp },
+      });
+      expect(badDefaults.ok, `expected reject approval_defaults expires_s=${badExp}`).toBe(
+        false,
+      );
+      if (!badDefaults.ok) {
+        expect(badDefaults.error).toContain("approval_defaults");
+      }
+    }
+
+    // Severity stays info|warn|high|critical: required on custom, optional on builtin
+    const missingCustomSeverity = validatePolicy({
+      ...makePolicy(),
+      custom: [
+        {
+          id: "cust_no_sev",
+          name: "Missing severity",
+          enabled: true,
+          version: 1,
+          message: "Missing",
+          when: [{ field: "command", op: "contains", value: "foo" }],
+          action: "flag",
+        },
+      ],
+    });
+    expect(missingCustomSeverity.ok).toBe(false);
+
+    const invalidCustomSeverity = validatePolicy({
+      ...makePolicy(),
+      custom: [
+        {
+          id: "cust_bad_sev",
+          name: "Bad severity",
+          enabled: true,
+          version: 1,
+          message: "Bad",
+          when: [{ field: "command", op: "contains", value: "foo" }],
+          action: "flag",
+          severity: "medium",
+        },
+      ],
+    });
+    expect(invalidCustomSeverity.ok).toBe(false);
+
+    const invalidBuiltinSeverity = validatePolicy({
+      ...makePolicy(),
+      builtin: {
+        FS001: { enabled: true, action: "flag", severity: "medium" },
+      },
+    });
+    expect(invalidBuiltinSeverity.ok).toBe(false);
   });
 });
