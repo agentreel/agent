@@ -10,8 +10,11 @@ import { ensureAgentreelDir } from "../paths.js";
 import { loadEffectivePolicy } from "../policy/cache.js";
 import { fetchPolicy } from "../policy/fetch.js";
 import { computePreExecTimeoutS } from "../policy/types.js";
+import { chooseHookPrefix, PACKAGE_NAME } from "./hook-prefix.js";
 
-const PACKAGE_NAME = "@agentreel/agent";
+declare const __AGENTREEL_VERSION__: string;
+const CLI_VERSION: string =
+  typeof __AGENTREEL_VERSION__ === "string" ? __AGENTREEL_VERSION__ : "dev";
 
 interface ResolvedBinary {
   absolutePath: string;
@@ -28,16 +31,6 @@ function resolveAgentBinary(): ResolvedBinary {
   const real = realpathSync(here);
   const isEphemeral = real.includes(`${sep}_npx${sep}`) || real.includes("/_npx/");
   return { absolutePath: real, isEphemeral };
-}
-
-function chooseHookPrefix(bin: ResolvedBinary): { prefix: string; mode: "absolute" | "npx" } {
-  if (process.env.AGENTREEL_HOOK_COMMAND) {
-    return { prefix: process.env.AGENTREEL_HOOK_COMMAND, mode: "absolute" };
-  }
-  if (bin.isEphemeral) {
-    return { prefix: `npx -y ${PACKAGE_NAME}`, mode: "npx" };
-  }
-  return { prefix: quotePath(bin.absolutePath), mode: "absolute" };
 }
 
 export interface InitOptions {
@@ -72,7 +65,12 @@ export async function initCommand(opts: InitOptions = {}): Promise<void> {
   const preExecTimeoutS = computePreExecTimeoutS(loadedPolicy.policy);
 
   const binary = resolveAgentBinary();
-  const { prefix, mode } = chooseHookPrefix(binary);
+  const { prefix, mode } = chooseHookPrefix({
+    hookCommandOverride: process.env.AGENTREEL_HOOK_COMMAND,
+    isEphemeral: binary.isEphemeral,
+    quotedAbsolutePath: quotePath(binary.absolutePath),
+    version: CLI_VERSION,
+  });
   const result =
     opts.claude === false
       ? null
