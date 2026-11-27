@@ -933,8 +933,8 @@ describe("remote approval flow", () => {
 });
 
 describe("fail-open on thrown errors and offline modes", () => {
-  it("fails open to allow and logs a local line when policy evaluation throws", async () => {
-    const policy = makeEnforcePolicy();
+  it("fails open to allow and logs a local line when policy evaluation throws under an observe policy", async () => {
+    const policy = makeEnforcePolicy({ mode: "observe" });
     cache.writeCachedPolicyAtomic(
       { policy, etag: policy.etag, fetched_at: Date.now() },
       cachePath,

@@ -11,7 +11,11 @@ import { getSessionAttribution, insertEvent, upsertSession } from "../db.js";
 import { applyIgnoreRules } from "../hooks/ignore-payload.js";
 import { cursorHooksPath, logPath, ensureAgentreelDir } from "../paths.js";
 import {
+  enforcementExpected,
   enforcePreExec,
+  failClosedOutcome,
+  INTERNAL_ERROR_REASON,
+  MALFORMED_INPUT_REASON,
   repoSlugFromRemoteUrl,
   type PreExecDeps,
   type PreExecOutcome,
@@ -24,6 +28,7 @@ import { readStdin } from "../util/stdin.js";
 import {
   CURSOR_HOOK_SUBCOMMAND,
   canonicalHookName,
+  coerceCommand,
   cursorCwd,
   cursorHookResponse,
   cursorSessionId,
@@ -119,14 +124,15 @@ export function extractCursorPreExecRequest(
   const toolUseId = input.tool_use_id ?? input.generation_id;
 
   if (hook === "beforeShellExecution") {
+    const command = coerceCommand(input.command);
     return {
       sessionId,
       tool: "cursor",
       toolName: "Shell",
       toolUseId,
       cwd,
-      command: input.command,
-      toolInput: { command: input.command ?? "", cwd },
+      command,
+      toolInput: { command: command ?? "", cwd },
       repo,
       branch,
       member,
@@ -165,7 +171,7 @@ export function extractCursorPreExecRequest(
       toolName: `MCP:${rawName}`,
       toolUseId,
       cwd,
-      command: typeof ti?.command === "string" ? ti.command : undefined,
+      command: coerceCommand(ti?.command),
       file_path: filePath,
       url:
         input.mcp_server_url ??
@@ -190,12 +196,7 @@ export function extractCursorPreExecRequest(
     ti?.filePath,
     ti?.file,
   ].find((v): v is string => typeof v === "string" && v.length > 0);
-  const command =
-    typeof input.command === "string"
-      ? input.command
-      : typeof ti?.command === "string"
-        ? ti.command
-        : undefined;
+  const command = coerceCommand(input.command ?? ti?.command);
   const url =
     input.mcp_server_url ??
     input.url ??
@@ -223,6 +224,30 @@ export function extractCursorPreExecRequest(
     member,
     ts,
   };
+}
+
+/**
+ * The deny for a pre-exec hook whose input we couldn't use, when an enforcing
+ * org policy is in effect. Undefined otherwise (fail open, as before).
+ */
+export function cursorFailClosedDecision(
+  hook: string | undefined,
+  reason: string,
+  what: string,
+  deps: PreExecDeps = {},
+): CursorPermissionDecision | undefined {
+  if (!isCursorPreExecHook(hook)) return undefined;
+  const { expected, policy } = enforcementExpected(deps);
+  if (!expected) return undefined;
+  let cfg;
+  try {
+    cfg = deps.config ?? readConfig();
+  } catch {
+    cfg = {} as NonNullable<PreExecDeps["config"]>;
+  }
+  logError(new Error(`${hook} failing closed (${reason}): ${what}`));
+  const message = failClosedOutcome(reason, what, policy, cfg).message!;
+  return { permission: "deny", user_message: message, agent_message: message };
 }
 
 export interface HandleCursorHookResult {
@@ -269,7 +294,9 @@ export async function handleCursorHookInput(
       }
     } catch (err) {
       logError(err);
-      decision = { permission: "allow" };
+      decision = cursorFailClosedDecision(hook, INTERNAL_ERROR_REASON, "the policy check failed", deps) ?? {
+        permission: "allow",
+      };
     }
   }
 
@@ -300,8 +327,26 @@ export async function runCursorHook(
   try {
     const raw = await readInput().catch(() => "");
     const cfg = readConfig();
+    let parsed: unknown;
+    let parseError = false;
     if (raw.trim()) {
-      const input = JSON.parse(raw) as CursorHookInput;
+      try {
+        parsed = JSON.parse(raw);
+      } catch {
+        parseError = true;
+      }
+    }
+    if (!parsed || typeof parsed !== "object" || Array.isArray(parsed)) {
+      // Cursor itself blocks on invalid hook output, and we used to answer
+      // allow here. Fail closed when an enforcing org policy is in effect.
+      const what = parseError
+        ? "the hook input is not valid JSON"
+        : raw.trim()
+          ? "the hook input is not a JSON object"
+          : "the hook input is empty";
+      decision = cursorFailClosedDecision(hook, MALFORMED_INPUT_REASON, what, { config: cfg });
+    } else {
+      const input = parsed as CursorHookInput;
       hook = canonicalHookName(input.hook_event_name) ?? hook;
       const installedTimeoutS = getInstalledPreExecTimeoutS(cfg, "cursor");
       const hookDeadlineMs = computeHookDeadlineMs(installedTimeoutS, hookStartMs);
@@ -314,9 +359,10 @@ export async function runCursorHook(
     }
   } catch (err) {
     logError(err);
-    decision = undefined;
+    decision = cursorFailClosedDecision(hook, INTERNAL_ERROR_REASON, "the hook failed");
   } finally {
-    // Always answer, failing open to allow on pre-exec hooks if anything errored.
+    // Always answer. On an error, pre-exec hooks fail closed under an
+    // enforcing org policy and open otherwise.
     writeOutput(cursorHookResponse(hook, decision) + "\n");
   }
 }
