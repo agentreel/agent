@@ -7,7 +7,7 @@ import {
   isCapturePaused,
   readConfig,
 } from "../config.js";
-import { getSessionAttribution, insertEvent, upsertSession } from "../db.js";
+import { insertEvent, upsertSession } from "../db.js";
 import { applyIgnoreRules } from "../hooks/ignore-payload.js";
 import { cursorHooksPath, logPath, ensureAgentreelDir } from "../paths.js";
 import {
@@ -19,7 +19,11 @@ import {
 } from "../policy/enforce.js";
 import { computeHookDeadlineMs } from "../policy/types.js";
 import { scrubAny } from "../redact/scrubber.js";
-import { ensureSessionAttribution, recordSessionEndGit } from "../session-attribution.js";
+import {
+  ensureSessionAttribution,
+  preExecAttribution,
+  recordSessionEndGit,
+} from "../session-attribution.js";
 import { readStdin } from "../util/stdin.js";
 import {
   CURSOR_HOOK_SUBCOMMAND,
@@ -239,23 +243,17 @@ export async function handleCursorHookInput(
   const hook = canonicalHookName(input.hook_event_name) ?? canonicalHookName(eventArg);
   const ts = deps.now ? deps.now() : Date.now();
   const capturePaused = isCapturePaused(deps.config ?? readConfig());
-  const sessionId = capturePaused
-    ? cursorSessionId(input)
-    : (recordCursorHook(eventArg, input, ts) ?? cursorSessionId(input));
+  const sessionId = cursorSessionId(input);
 
   let decision: CursorPermissionDecision | undefined;
   let outcome: PreExecOutcome | undefined;
 
+  // Policy check first: no DB write may run before the decision.
   if (hook && isCursorPreExecHook(hook)) {
     try {
-      let attribution: Attribution | null = null;
-      if (!capturePaused) {
-        try {
-          attribution = getSessionAttribution<Attribution>(sessionId);
-        } catch {
-          attribution = null;
-        }
-      }
+      const attribution: Attribution | null = capturePaused
+        ? null
+        : preExecAttribution(sessionId, cursorCwd(input));
       const req = extractCursorPreExecRequest(hook, input, sessionId, ts, attribution);
       outcome = await enforcePreExec(req, deps);
       if (!outcome.permitted && outcome.message) {
@@ -270,6 +268,17 @@ export async function handleCursorHookInput(
     } catch (err) {
       logError(err);
       decision = { permission: "allow" };
+    }
+  }
+
+  // Record after the policy decision, and never let a DB error change it.
+  // A corrupt or unusable sessions.db used to throw here before
+  // enforcePreExec ran, which let blocked commands through.
+  if (!capturePaused) {
+    try {
+      recordCursorHook(eventArg, input, ts);
+    } catch (err) {
+      logError(err);
     }
   }
 
