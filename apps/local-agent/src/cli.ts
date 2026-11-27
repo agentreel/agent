@@ -23,6 +23,7 @@ import { configCommand } from "./commands/config.js";
 import { scanCommand } from "./commands/scan.js";
 import { policyCommand } from "./commands/policy.js";
 import { doctorCommand } from "./commands/doctor.js";
+import { managedInstallCommand } from "./commands/managed.js";
 
 const program = new Command();
 
@@ -165,6 +166,24 @@ program
   .description("check policy enforcement state, etag age, and pre-exec hook timeouts")
   .action(() => {
     doctorCommand();
+  });
+
+const managed = program
+  .command("managed")
+  .description("enterprise managed policy: system-wide Claude Code managed settings and Cursor hooks");
+
+managed
+  .command("install")
+  .description("write /etc/claude-code/managed-settings.json and /etc/cursor/hooks.json (needs sudo; no network calls)")
+  .option("--dry-run", "print the diff and write nothing")
+  .option("--root <dir>", "write under this directory instead of / (staging, images, tests)")
+  .option("--hook-command <path>", "absolute path to a root-owned agentreel binary (default: this binary)")
+  .option("--platform <name>", "linux or darwin (default: this machine)")
+  .option("--no-claude", "skip the Claude Code managed settings file")
+  .option("--no-cursor", "skip the Cursor enterprise hooks file")
+  .action((opts: { dryRun?: boolean; root?: string; hookCommand?: string; platform?: string; claude?: boolean; cursor?: boolean }) => {
+    const code = managedInstallCommand(opts);
+    if (code !== 0) process.exitCode = code;
   });
 
 program.exitOverride();

@@ -1,0 +1,108 @@
+# Enterprise managed policy (Claude Code and Cursor)
+
+`agentreel init` installs AgentReel's hooks in each developer's **user** settings (`~/.claude/settings.json` and `~/.cursor/hooks.json`). Those files belong to the user, so an agent running as that user can edit them, delete them, or start a session with hooks turned off.
+
+A managed policy moves the hooks into **system** files that only root can write, and that Claude Code and Cursor rank above every user and project setting:
+
+| Tool | Linux and WSL | macOS | Windows |
+| --- | --- | --- | --- |
+| Claude Code | `/etc/claude-code/managed-settings.json` | `/Library/Application Support/ClaudeCode/managed-settings.json` | `C:\Program Files\ClaudeCode\managed-settings.json` |
+| Cursor | `/etc/cursor/hooks.json` | `/Library/Application Support/Cursor/hooks.json` | `C:\ProgramData\Cursor\hooks.json` |
+
+`agentreel managed install` writes the Linux and macOS files. On Windows, deploy the [templates](#templates) with your MDM.
+
+## What the policy sets
+
+### Claude Code (`managed-settings.json`)
+
+| Key | Value | Effect |
+| --- | --- | --- |
+| `allowManagedHooksOnly` | `true` | Only managed hooks run. User, project and local hooks, and hooks from plugins that managed settings don't force-enable, are ignored, so an agent cannot add, change or switch off hooks through its own settings. This key is read only from a managed source. |
+| `hooks` | the 9 AgentReel events | The same events, commands and timeouts `agentreel init` installs: `SessionStart`, `SessionEnd`, `UserPromptSubmit`, `PreToolUse`, `PostToolUse`, `Notification`, `Stop`, `SubagentStop`, `PreCompact`. Under `allowManagedHooksOnly` the user-level copies stop running, so the managed file carries all of them. |
+| `PreToolUse` hook `onFailure` | `"block"` | If the AgentReel binary is missing, crashes or times out, the tool call is blocked instead of allowed. Needs Claude Code v2.1.295 or later. Timeout 130s (120s approval wait plus 10s). |
+| `permissions.disableBypassPermissionsMode` | `"disable"` | No `bypassPermissions` mode (`--dangerously-skip-permissions`). |
+| `sandbox.enabled` | `true` | Bash commands run in the OS sandbox (Seatbelt on macOS, bubblewrap on Linux and WSL2). |
+| `sandbox.failIfUnavailable` | `true` | Claude Code refuses to start if the sandbox can't run, instead of quietly running unsandboxed. |
+| `sandbox.allowUnsandboxedCommands` | `false` | Claude can't retry a failed command outside the sandbox (`dangerouslyDisableSandbox` is ignored). |
+
+The installer **merges** into an existing file: it keeps every key your organization already set (for example `model`, `sandbox.excludedCommands`, other hooks), forces the keys above, and replaces only AgentReel's own hook groups (marked `"__agentreel": "agentreel:v1"`).
+
+The sandbox needs its dependencies on Linux (`bubblewrap` and `socat`). With `failIfUnavailable`, Claude Code exits at startup on machines without them and on native Windows. Install them first, or remove `failIfUnavailable` from the file for those machines. Add `sandbox.excludedCommands` for approved tools that must run without isolation, and `sandbox.credentials` entries for `~/.aws`, `~/.ssh` and secret environment variables.
+
+### Cursor (`hooks.json`)
+
+All 14 events `agentreel init` installs, with the same commands and timeouts. The four pre-exec hooks (`preToolUse`, `beforeShellExecution`, `beforeMCPExecution`, `beforeReadFile`) set `"failClosed": true`, so a crash, timeout or missing binary blocks the action instead of letting it through. Enterprise hooks rank above team, project and user hooks.
+
+Cursor runs every hooks file, not just the highest one, so remove AgentReel's entries from `~/.cursor/hooks.json` after installing the managed file, or each event is captured twice. `agentreel uninstall` does that (it also stops the uploader; start it again with `agentreel daemon --detach`).
+
+## Install
+
+**Run these from a normal terminal, not from inside a Claude Code or Cursor agent session.** AgentReel's self-protection guard rules (shipping in a separate change) block agents from writing hook files, the policy cache, `/etc/claude-code/managed-settings.json` and `/etc/cursor/hooks.json`, and the installer refuses to write when it detects an agent session (`CLAUDECODE`, `CLAUDE_CODE_CHILD_SESSION` or `CURSOR_AGENT` set). The installer is your own CLI run by you, not a hook, so the guard does not get in its way.
+
+1. Install AgentReel as root, so the hook binary is root-owned and an agent running as the user can't replace it:
+
+   ```bash
+   sudo npm install -g @agentreel/agent
+   ```
+
+   Don't point managed hooks at an `npx` cache; the installer refuses that.
+
+2. Preview the change. Nothing is written:
+
+   ```bash
+   sudo agentreel managed install --dry-run
+   ```
+
+   It prints a unified diff for each file.
+
+3. Write the files:
+
+   ```bash
+   sudo agentreel managed install
+   ```
+
+   The installer:
+   - needs root to write the system paths, and says so if it isn't root;
+   - backs up any file it changes to `<file>.agentreel-backup-<timestamp>`;
+   - writes atomically (temporary file, then rename), mode `0644`;
+   - leaves a file alone, with no backup, when it already matches, so re-running is safe;
+   - refuses to touch a file that isn't valid JSON;
+   - makes **no network calls** and sends no telemetry.
+
+4. Check it took effect. In a new Claude Code session, run `/status`: `Setting sources` should list `Enterprise managed settings (file)`. In Cursor, open the Hooks tab in Customize, or the Hooks output channel.
+
+### Options
+
+| Option | Effect |
+| --- | --- |
+| `--dry-run` | Print the diff and write nothing. Works without root. |
+| `--hook-command <path>` | Absolute path to a root-owned `agentreel` binary. Default: the binary you ran. The installer warns if it isn't owned by root or doesn't exist. |
+| `--root <dir>` | Write under `<dir>` instead of `/`, for example to stage files into an OS image or for MDM packaging. Works without root. |
+| `--platform linux\|darwin` | Choose the path layout. Default: this machine. |
+| `--no-claude`, `--no-cursor` | Skip one of the two files. |
+
+## Templates
+
+Ready-made files, generated by the same code as the installer, with the hook binary at `/usr/local/bin/agentreel`:
+
+- [`managed/managed-settings.json`](managed/managed-settings.json): Claude Code
+- [`managed/cursor-hooks.json`](managed/cursor-hooks.json): Cursor
+
+Deploy them with your MDM or image tooling, and change the binary path if yours differs. A test keeps them in step with the installer. On macOS you can deliver the Claude Code keys as a configuration profile for the `com.anthropic.claudecode` preferences domain instead of the file.
+
+## Limits
+
+- The hooks still see only what the tools report, and rule matching is string based. The OS sandbox is the real boundary for Bash commands; it does not cover Claude's Edit and Write tools, and Cursor has no equivalent setting here.
+- On WSL, `/etc/claude-code` is user-writable. Use the Windows policy (`wslInheritsWindowsSettings`) there.
+- Cursor Enterprise dashboard hooks can't set `failClosed`; use the file for the pre-exec hooks.
+- `sudo` usually clears the environment, so the agent-session check is a second line of defence behind the guard rules and the sudo password prompt, not the main one.
+
+## Remove
+
+Restore the newest `*.agentreel-backup-*` next to each file, or delete the file if the installer created it:
+
+```bash
+sudo rm /etc/claude-code/managed-settings.json /etc/cursor/hooks.json
+```
+
+Then run `agentreel init` as your own user to go back to user-level hooks.
