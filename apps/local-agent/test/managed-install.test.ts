@@ -106,8 +106,7 @@ describe("managed pack builders", () => {
       const managedClaude = buildClaudeManagedHooks({ hookCommand: HOOK });
       expect(Object.keys(managedClaude).sort()).toEqual(Object.keys(userClaude).sort());
       for (const [event, groups] of Object.entries(managedClaude)) {
-        const { onFailure: _drop, ...entry } = groups[0]!.hooks[0]!;
-        expect(entry).toEqual(userClaude[event][0].hooks[0]);
+        expect(groups[0]!.hooks[0]!).toEqual(userClaude[event][0].hooks[0]);
         expect(groups[0]!.matcher).toBe(userClaude[event][0].matcher);
         expect(groups[0]!.__agentreel).toBe(userClaude[event][0].__agentreel);
       }
@@ -115,8 +114,7 @@ describe("managed pack builders", () => {
       const managedCursor = buildCursorManagedHooks({ hookCommand: HOOK });
       expect(Object.keys(managedCursor).sort()).toEqual(Object.keys(userCursor).sort());
       for (const [event, defs] of Object.entries(managedCursor)) {
-        const { failClosed: _drop, ...def } = defs[0]!;
-        expect(def).toEqual(userCursor[event][0]);
+        expect(defs[0]!).toEqual(userCursor[event][0]);
       }
     } finally {
       rmSync(home, { recursive: true, force: true });

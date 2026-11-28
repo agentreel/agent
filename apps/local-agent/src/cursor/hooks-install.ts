@@ -47,7 +47,100 @@ export function cursorHookTimeoutForEvent(
 
 export interface InstallCursorHooksOptions {
   preExecTimeoutS?: number;
+  /** System (enterprise) hooks file to check first; injectable for tests. */
+  systemHooksPath?: string;
 }
+
+/**
+ * Cursor's enterprise hooks file, written by `agentreel managed install` (or
+ * MDM). Hooks there run for every user and rank above user hooks.
+ */
+export function systemCursorHooksPath(platform: NodeJS.Platform = process.platform): string {
+  if (platform === "darwin") return "/Library/Application Support/Cursor/hooks.json";
+  if (platform === "win32") return "C:\\ProgramData\\Cursor\\hooks.json";
+  return "/etc/cursor/hooks.json";
+}
+
+export type SystemCursorHooksState = "absent" | "owned" | "not_owned" | "unreadable";
+
+/**
+ * Ownership of the system Cursor hooks file. Never throws.
+ *
+ * Fail-safe: if the file exists but cannot be read or parsed, the state is
+ * `unreadable`, which is treated as managed. That way a permission error or
+ * a truncated file cannot cause `agentreel init` to write a second copy of
+ * the hooks under the user.
+ */
+export function inspectSystemCursorHooks(path: string = systemCursorHooksPath()): SystemCursorHooksState {
+  try {
+    if (!existsSync(path)) return "absent";
+  } catch {
+    return "unreadable";
+  }
+  try {
+    const file = read(path);
+    const owned = Object.values(file.hooks ?? {}).some(
+      (defs) => Array.isArray(defs) && defs.some(isOurs),
+    );
+    return owned ? "owned" : "not_owned";
+  } catch {
+    return "unreadable";
+  }
+}
+
+/** True when the system hooks file already carries AgentReel entries, or cannot be read. */
+export function systemCursorHooksOwnedByAgentreel(path: string = systemCursorHooksPath()): boolean {
+  const state = inspectSystemCursorHooks(path);
+  return state === "owned" || state === "unreadable";
+}
+
+/**
+ * Remove this user's AgentReel entries from a per-user hooks file, leaving
+ * everyone else's hooks, unknown keys, and the rest of the file intact.
+ * Writes a backup first. No-ops (no backup, no write) when there is nothing
+ * of ours to remove, or the file is missing or unreadable. Never throws.
+ */
+export function removeUserAgentreelCursorHooks(
+  path: string = cursorHooksPath(),
+): { backup: string | null; removed: number } {
+  try {
+    if (!existsSync(path)) return { backup: null, removed: 0 };
+    const file = read(path);
+    let removed = 0;
+    for (const ev of Object.keys(file.hooks ?? {})) {
+      const before = file.hooks![ev]!;
+      const kept = before.filter((d) => !isOurs(d));
+      removed += before.length - kept.length;
+      if (kept.length === 0) delete file.hooks![ev];
+      else file.hooks![ev] = kept;
+    }
+    if (removed === 0) return { backup: null, removed: 0 };
+    const b = backup(path);
+    writeFileSync(path, JSON.stringify(file, null, 2) + "\n", "utf8");
+    return { backup: b, removed };
+  } catch {
+    return { backup: null, removed: 0 };
+  }
+}
+
+export type InstallCursorHooksResult =
+  | { skipped: false; backup: string | null; installedEvents: string[]; path: string; preExecTimeoutS: number }
+  /**
+   * The managed pack owns the Cursor hooks (or the system file is
+   * unreadable, which we treat as managed). Per-user hooks are not
+   * written. Stale AgentReel entries in the user file, if any, are
+   * removed after a backup; other tools' hooks are left intact.
+   */
+  | {
+      skipped: true;
+      managedPath: string;
+      managedState: SystemCursorHooksState;
+      installedEvents: [];
+      path: string;
+      preExecTimeoutS: number;
+      backup: string | null;
+      removed: number;
+    };
 
 /**
  * Add `<prefix> cursor-hook <event>` to ~/.cursor/hooks.json for every hook.
@@ -58,8 +151,23 @@ export function installCursorHooks(
   prefix: string,
   path = cursorHooksPath(),
   opts: InstallCursorHooksOptions = {},
-): { backup: string | null; installedEvents: string[]; path: string; preExecTimeoutS: number } {
+): InstallCursorHooksResult {
   const preExecTimeoutS = opts.preExecTimeoutS ?? DEFAULT_PRE_EXEC_HOOK_TIMEOUT_S;
+  const managedPath = opts.systemHooksPath ?? systemCursorHooksPath();
+  const managedState = inspectSystemCursorHooks(managedPath);
+  if (managedState === "owned" || managedState === "unreadable") {
+    const cleaned = removeUserAgentreelCursorHooks(path);
+    return {
+      skipped: true,
+      managedPath,
+      managedState,
+      installedEvents: [],
+      path,
+      preExecTimeoutS,
+      backup: cleaned.backup,
+      removed: cleaned.removed,
+    };
+  }
   mkdirSync(dirname(path), { recursive: true });
   const b = backup(path);
   const file = read(path);
@@ -70,11 +178,14 @@ export function installCursorHooks(
     kept.push({
       command: `${prefix} ${CURSOR_HOOK_SUBCOMMAND} ${ev}`,
       timeout: cursorHookTimeoutForEvent(ev, preExecTimeoutS),
+      // Pre-exec hooks only: a crash, timeout or missing binary denies the
+      // action instead of allowing it (Cursor defaults to fail-open).
+      ...(isCursorPreExecHook(ev) ? { failClosed: true } : {}),
     });
     file.hooks[ev] = kept;
   }
   writeFileSync(path, JSON.stringify(file, null, 2) + "\n", "utf8");
-  return { backup: b, installedEvents: [...CURSOR_HOOK_EVENTS], path, preExecTimeoutS };
+  return { skipped: false, backup: b, installedEvents: [...CURSOR_HOOK_EVENTS], path, preExecTimeoutS };
 }
 
 export function uninstallCursorHooks(path = cursorHooksPath()): { backup: string | null; removed: number } {
@@ -97,6 +208,8 @@ export interface CursorPreExecHookEntryStatus {
   event: string;
   installed: boolean;
   timeoutS: number | null;
+  /** True when our entry has failClosed: true. */
+  failClosed: boolean;
 }
 
 export interface CursorPreExecHooksCheck {
@@ -114,6 +227,7 @@ export function inspectCursorPreExecHooks(
         event,
         installed: false,
         timeoutS: null,
+        failClosed: false,
       })),
     };
   }
@@ -128,6 +242,7 @@ export function inspectCursorPreExecHooks(
           entry && typeof entry.timeout === "number" && Number.isFinite(entry.timeout)
             ? entry.timeout
             : null,
+        failClosed: entry?.failClosed === true,
       };
     });
     return { fileExists: true, hooks };
@@ -138,6 +253,7 @@ export function inspectCursorPreExecHooks(
         event,
         installed: false,
         timeoutS: null,
+        failClosed: false,
       })),
     };
   }
