@@ -35,6 +35,10 @@ import {
 } from "../session-attribution.js";
 import { readStdin } from "../util/stdin.js";
 import { applyIgnoreRules } from "./ignore-payload.js";
+import {
+  enforceHookEnvNodeOptions,
+  RUNTIME_SELF005_MESSAGE,
+} from "../policy/node-options-runtime.js";
 
 const HOOK_EVENT_TO_TYPE: Record<string, EventType> = {
   SessionStart: "session_start",
@@ -294,6 +298,10 @@ export async function runHook(
   const hookStartMs = opts.hookStartMs ?? Date.now();
   const readInput = opts.readStdin ?? readStdin;
   const writeOutput = opts.writeStdout ?? ((s: string) => process.stdout.write(s));
+  if (enforceHookEnvNodeOptions()) {
+    writeOutput(formatClaudePreToolUseDeny(RUNTIME_SELF005_MESSAGE) + "\n");
+    return;
+  }
   let wrote = false;
   const write = (line: string) => {
     wrote = true;
