@@ -45,7 +45,13 @@ Claude Code needs no cleanup: `allowManagedHooksOnly` already ignores user-level
 
 ## Install
 
-**Run these from a normal terminal, not from inside a Claude Code or Cursor agent session.** AgentReel's self-protection guard rules (shipping in a separate change) block agents from writing hook files, the policy cache, `/etc/claude-code/managed-settings.json` and `/etc/cursor/hooks.json`, and the installer refuses to write when it detects an agent session (`CLAUDECODE`, `CLAUDE_CODE_CHILD_SESSION` or `CURSOR_AGENT` set). The installer is your own CLI run by you, not a hook, so the guard does not get in its way.
+**Run these from a normal terminal, not from inside a Claude Code or Cursor agent session.** AgentReel's self-protection guard rules (shipping in a separate change) block agents from writing hook files, the policy cache, `/etc/claude-code/managed-settings.json` and `/etc/cursor/hooks.json`. The installer is your own CLI run by you, not a hook, so the guard does not get in its way. On a real run (not `--dry-run`) the installer also refuses when it can tell an agent is driving it, with three checks that run in this order:
+
+1. **Environment markers.** `CLAUDECODE`, `CLAUDE_CODE_CHILD_SESSION` or `CURSOR_AGENT` is set.
+2. **Process ancestry.** `sudo` clears those variables, so the installer also walks its parent processes (Linux: `/proc/<pid>/stat`, `cmdline` and `environ`; macOS: `ps -o ppid=,comm=`) and refuses if an ancestor is a Claude Code or Cursor process, or if an ancestor's own environment, which `sudo` does not clear, carries one of those markers. That includes the process that started `sudo`. `--yes` does not override this check. If the parent chain cannot be read, this check passes and the next one decides. Note that a person who runs it from Cursor's integrated terminal has Cursor as an ancestor and is refused too: use a separate terminal.
+3. **A terminal.** If stdin is not a TTY, the installer refuses unless you pass `--yes`. Agents usually run commands without a terminal; people at a prompt do. Use `--yes` for provisioning scripts run by a person or by your MDM.
+
+`--dry-run` is always allowed and skips all of these. These checks stop an agent that does not know about them, not a determined local attacker with root; the sudo password prompt and the guard rules are still the main defences.
 
 1. Install AgentReel as root, so the hook binary is root-owned and an agent running as the user can't replace it:
 
@@ -90,6 +96,7 @@ Claude Code needs no cleanup: `allowManagedHooksOnly` already ignores user-level
 | --- | --- |
 | `--dry-run` | Print the diff and write nothing. Works without root. |
 | `--hook-command <path>` | Absolute path to a root-owned `agentreel` binary. Default: the binary you ran, which is refused on a real run if it or a parent directory is writable by a non-root user. An explicit path gets the same check as a warning only. The installer also warns if the file is missing. |
+| `--yes` | Allow a real run when stdin is not a terminal (scripts, MDM, CI image builds). It never overrides the environment or process-ancestry checks. |
 | `--allow-user-writable-hook` | On a real run with the default hook binary, accept a user-writable path and print a loud warning. |
 | `--root <dir>` | Write under `<dir>` instead of `/`, for example to stage files into an OS image or for MDM packaging. Works without root. |
 | `--user-home <dir>` | Home whose `~/.cursor/hooks.json` loses AgentReel's entries, used as given. Default: the sudo user's home (or `HOME` without sudo), placed under `--root` when one is set. |
@@ -110,7 +117,7 @@ Deploy them with your MDM or image tooling, and change the binary path if yours 
 - The hooks still see only what the tools report, and rule matching is string based. The OS sandbox is the real boundary for Bash commands; it does not cover Claude's Edit and Write tools, and Cursor has no equivalent setting here.
 - On WSL, `/etc/claude-code` is user-writable. Use the Windows policy (`wslInheritsWindowsSettings`) there.
 - Cursor Enterprise dashboard hooks can't set `failClosed`; use the file for the pre-exec hooks.
-- `sudo` usually clears the environment, so the agent-session check is a second line of defence behind the guard rules and the sudo password prompt, not the main one.
+- `sudo` usually clears the environment, so the environment check alone is easy to get around. The process-ancestry and terminal checks close that gap for agents that do not know about them, and they are still a second line of defence behind the guard rules and the sudo password prompt, not the main one. Ancestry is best effort: it is not read on platforms other than Linux and macOS, and on Linux a parent's environment is readable only by root or the same user. When it cannot be read, the terminal check is the fallback, and an agent that passes `--yes` with no agent ancestor visible is not stopped by these checks.
 
 ## Remove
 
