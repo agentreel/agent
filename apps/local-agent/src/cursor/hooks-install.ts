@@ -4,6 +4,7 @@ import {
   readFileSync,
 } from "node:fs";
 import * as fs from "node:fs";
+import { randomBytes } from "node:crypto";
 import { dirname } from "node:path";
 import { cursorHooksPath } from "../paths.js";
 import {
@@ -51,12 +52,25 @@ export const _userHooksWriteForTests: {
 
 const OPEN_REFUSAL_CODES = new Set(["ELOOP", "EMLINK"]);
 
+let backupSeq = 0;
+
+/** Unique backup path: timestamp, pid, a monotonic counter and a short random suffix. */
+function nextBackupPath(path: string): string {
+  backupSeq += 1;
+  const ts = new Date().toISOString().replace(/[:.]/g, "-");
+  const rand = randomBytes(6).toString("hex");
+  return `${path}.agentreel-backup-${ts}-${process.pid}-${backupSeq}-${rand}`;
+}
+
 /**
- * Copy the existing per-user hooks file to a timestamped backup, reading it
+ * Copy the existing per-user hooks file to a unique backup, reading it
  * through an O_NOFOLLOW fd so a symlink is never followed. Returns the backup
  * path, or null when the file is missing, is a symlink or not a regular
- * file, or the copy failed. Never overwrites an existing backup. Callers
- * that know the file exists must treat null as "do not write".
+ * file, or the copy failed for a real reason (EACCES, ENOSPC and the like).
+ * Never overwrites an existing backup: the name is unique, the write uses
+ * flag "wx", and a same-millisecond EEXIST is retried with a new suffix.
+ * Callers that know the file exists must treat null as "do not write" and
+ * must report the failure, not count it as a successful no-op.
  */
 function backup(path: string): string | null {
   const noFollow = _userHooksWriteForTests.noFollow;
@@ -70,9 +84,18 @@ function backup(path: string): string | null {
     const st = fs.fstatSync(fd);
     if (!st.isFile()) return null;
     const data = fs.readFileSync(fd);
-    const b = `${path}.agentreel-backup-${new Date().toISOString().replace(/[:.]/g, "-")}`;
-    fs.writeFileSync(b, data, { flag: "wx", mode: st.mode & 0o777 });
-    return b;
+    const mode = st.mode & 0o777;
+    for (let attempt = 0; attempt < 8; attempt++) {
+      const b = nextBackupPath(path);
+      try {
+        fs.writeFileSync(b, data, { flag: "wx", mode });
+        return b;
+      } catch (err) {
+        if ((err as NodeJS.ErrnoException).code === "EEXIST") continue;
+        return null;
+      }
+    }
+    return null;
   } catch {
     return null;
   } finally {
@@ -126,7 +149,12 @@ function writeUserHooksFile(path: string, content: string): UserHooksWrite {
     let b: string | null = null;
     if (existingMode !== null) {
       b = backup(path);
-      if (b === null) return fail("backup failed");
+      if (b === null) {
+        return {
+          ok: false,
+          warning: `${path} could not be backed up, so it was left untouched.`,
+        };
+      }
     }
 
     _userHooksWriteForTests.beforeOpen?.(path);
