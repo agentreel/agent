@@ -89,6 +89,46 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 - `better-sqlite3` stays on `^12.11.1`. That is what pulls in the deprecated `prebuild-install@7.1.3` install helper. `better-sqlite3@13` and `node:sqlite` both require Node 22+, and this package still supports Node 20 (engines and CI). The deprecation is not a vulnerability. A Node 22+ migration can drop the native addon later.
 
+## 0.2.5
+
+### Action required
+After you upgrade, re-run `agentreel init`. If you use a managed install, run `agentreel managed install` again or redeploy the managed templates. That updates the hook commands AgentReel installs for Claude Code and Cursor, and the security fixes in this release only take effect after it. `agentreel doctor` warns you if your hooks still need updating.
+
+### Stronger hook protection
+- The hooks AgentReel installs for Claude Code and Cursor now start in a clean environment, so other software can't interfere with them. This covers macOS, Linux and Windows.
+- When AgentReel blocks an action, Claude Code and Cursor now get a clear "denied" result and show the reason.
+- Hooks fail closed. If a check can't run, the action is blocked instead of allowed.
+- AgentReel protects its own setup. Attempts to edit its hook or policy files, uninstall or pause it, sign it out, turn hooks off, or change protected settings are caught and blocked under an enforcing organization policy.
+
+### Policy enforcement
+- Organization policies are fetched and checked on your machine before an action runs. Remote approvals are supported.
+- A blocked action is no longer recorded as if it had run.
+- If an enforcing organization's cached policy is missing, damaged or edited, AgentReel locks down until a valid policy is back.
+- Local `policyMode: block` now blocks as expected.
+- Scanning has firmer time and size limits, so very large or unusual commands can't slow it down or get past it.
+- Better detection of disguised shell commands.
+- Long piped commands are checked faster.
+- If your device is signed in to a different organization, the warning stays until you sign in again or log out.
+
+### Monitoring
+- The AgentReel background service now watches agent sessions and alerts you if hooks seem to have stopped running.
+- A regular heartbeat reports hook health. You can also check it with `agentreel heartbeat`.
+
+### Reliability
+- Uploads retry on their own when the network drops.
+
+### Managed installs for teams
+- New `agentreel managed install` command, an enterprise policy pack and ready-made templates in `docs/managed/`. It runs on macOS, Linux and WSL.
+- Installs that an agent launches with elevated permissions are refused.
+
+### Housekeeping
+- Updated dependencies and refreshed the README.
+
+### Known limits
+- On Windows, Cursor hooks need PowerShell 7 (`pwsh`). With Windows PowerShell 5.1, a hook waits until it times out and then blocks the action. Cursor on Windows has not yet been tested end to end with a real Cursor install.
+- If you launch the agent with `npm exec`, `pnpm dlx` or `yarn dlx`, set `AGENTREEL_HOOK_COMMAND` to get the same clean start.
+- Settings that your shell startup files or your operating system's launch settings add back in are outside what the hook command controls.
+
 ## [0.2.4] - 2026-11-21
 
 ### Fixed
