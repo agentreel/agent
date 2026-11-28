@@ -43,31 +43,195 @@ interface Word {
   dynamic: boolean;
 }
 
+interface Statement {
+  words: Word[];
+  /** Operator that follows this statement: "|", "||", "|&", "&&", "&", ";", "\n", "(", ")", or "". */
+  after: string;
+  hereString: Word | null;
+  hereDoc: { body: string; quoted: boolean } | null;
+  /** A heredoc was opened but its body was not in the command text. */
+  hereDocMissing: boolean;
+  /** Filled after heredoc bodies are read; not used outside the splitter. */
+  boxes?: { body: string | null; quoted: boolean }[];
+}
+
 /**
  * Split a command into statements of words with shell quoting removed.
- * Separators are unquoted whitespace and `; | & ( ) < >` and newlines (which
- * also end a statement, except whitespace). An unterminated quote, `$` before
- * a name, `{` or `(`, `$'...'` and backticks mark the word dynamic.
+ * Multi-character operators (`||`, `&&`, `|&`, `<<`, `<<<`) are kept together.
+ * `<<< word` and `<<[ - ]delim` plus an inline body are attached to the
+ * statement they belong to. An unterminated quote, `$` before a name, `{` or
+ * `(`, `$'...'` and backticks mark the word dynamic.
  */
-function splitStatements(cmd: string): Word[][] {
-  const statements: Word[][] = [];
+function splitStatements(cmd: string): Statement[] {
+  const statements: Statement[] = [];
   let words: Word[] = [];
+  let hereString: Word | null = null;
+  let hereDoc: { body: string; quoted: boolean } | null = null;
+  let hereDocMissing = false;
+  type HereBox = { body: string | null; quoted: boolean };
+  type PendingHere = { box: HereBox; delim: string; stripTabs: boolean };
+  let pendingHere: PendingHere[] = [];
+  let stmtHereBoxes: HereBox[] = [];
   let cur = "";
   let started = false;
   let dynamic = false;
-  const endWord = () => {
-    if (started) words.push({ text: cur, dynamic });
+
+  const endWord = (): Word | null => {
+    if (!started) return null;
+    const w = { text: cur, dynamic };
+    words.push(w);
     cur = "";
     started = false;
     dynamic = false;
+    return w;
   };
-  const endStatement = () => {
+
+  const endStatement = (after: string) => {
     endWord();
-    if (words.length) statements.push(words);
+    if (words.length || hereString || hereDoc || hereDocMissing || stmtHereBoxes.length) {
+      statements.push({ words, after, hereString, hereDoc, hereDocMissing, boxes: stmtHereBoxes });
+    }
     words = [];
+    hereString = null;
+    hereDoc = null;
+    hereDocMissing = false;
+    stmtHereBoxes = [];
   };
+
   let i = 0;
   const n = cmd.length;
+
+  const skipSpaces = () => {
+    while (i < n && (cmd[i] === " " || cmd[i] === "\t")) i++;
+  };
+
+  const readWord = (): Word => {
+    skipSpaces();
+    cur = "";
+    started = false;
+    dynamic = false;
+    while (i < n) {
+      const c = cmd[i]!;
+      if (c === " " || c === "\t" || c === "\n" || c === ";" || c === "|" || c === "&" || c === "(" || c === ")" || c === "<" || c === ">") {
+        break;
+      }
+      started = true;
+      if (c === "\\") {
+        if (i + 1 < n) {
+          if (cmd[i + 1] !== "\n") cur += cmd[i + 1];
+          i += 2;
+        } else {
+          i++;
+        }
+        continue;
+      }
+      if (c === "'") {
+        const end = cmd.indexOf("'", i + 1);
+        if (end < 0) {
+          dynamic = true;
+          cur += cmd.slice(i + 1);
+          i = n;
+        } else {
+          cur += cmd.slice(i + 1, end);
+          i = end + 1;
+        }
+        continue;
+      }
+      if (c === '"') {
+        let j = i + 1;
+        let closed = false;
+        while (j < n) {
+          const d = cmd[j]!;
+          if (d === "\\" && j + 1 < n && "$`\"\\\n".includes(cmd[j + 1]!)) {
+            if (cmd[j + 1] !== "\n") cur += cmd[j + 1];
+            j += 2;
+            continue;
+          }
+          if (d === '"') {
+            closed = true;
+            break;
+          }
+          if (d === "`" || (d === "$" && j + 1 < n && /[A-Za-z_{(0-9@*#?$!-]/.test(cmd[j + 1]!))) dynamic = true;
+          cur += d;
+          j++;
+        }
+        if (!closed) dynamic = true;
+        i = closed ? j + 1 : n;
+        continue;
+      }
+      if (c === "`") {
+        dynamic = true;
+        cur += c;
+        i++;
+        continue;
+      }
+      if (c === "$" && i + 1 < n && /[A-Za-z_{('0-9@*#?$!-]/.test(cmd[i + 1]!)) {
+        dynamic = true;
+        cur += c;
+        i++;
+        continue;
+      }
+      cur += c;
+      i++;
+    }
+    const w = started ? { text: cur, dynamic } : { text: "", dynamic: true };
+    cur = "";
+    started = false;
+    dynamic = false;
+    return w;
+  };
+
+  const fillHeredocs = () => {
+    if (!pendingHere.length) return;
+    for (const h of pendingHere) {
+      const start = i;
+      let body: string | null = null;
+      while (i < n) {
+        const nl = cmd.indexOf("\n", i);
+        const lineEnd = nl < 0 ? n : nl;
+        const line = cmd.slice(i, lineEnd);
+        const cmp = h.stripTabs ? line.replace(/^\t+/, "") : line;
+        if (cmp === h.delim) {
+          body = cmd.slice(start, i);
+          i = nl < 0 ? n : nl + 1;
+          break;
+        }
+        if (nl < 0) {
+          i = n;
+          break;
+        }
+        i = nl + 1;
+      }
+      h.box.body = body;
+    }
+    pendingHere = [];
+  };
+
+  const readDelim = (): { delim: string; quoted: boolean } => {
+    skipSpaces();
+    if (i >= n || cmd[i] === "\n") return { delim: "", quoted: true };
+    const q = cmd[i];
+    if (q === "'" || q === '"') {
+      const end = cmd.indexOf(q, i + 1);
+      if (end < 0) {
+        const d = cmd.slice(i + 1);
+        i = n;
+        return { delim: d, quoted: true };
+      }
+      const d = cmd.slice(i + 1, end);
+      i = end + 1;
+      return { delim: d, quoted: true };
+    }
+    if (q === "\\") {
+      // <<\EOF : the rest of the word is the delimiter, quoted.
+      i++;
+      const w = readWord();
+      return { delim: w.text, quoted: true };
+    }
+    const w = readWord();
+    return { delim: w.text, quoted: false };
+  };
+
   while (i < n) {
     const c = cmd[i]!;
     if (c === " " || c === "\t") {
@@ -75,9 +239,56 @@ function splitStatements(cmd: string): Word[][] {
       i++;
       continue;
     }
-    if (c === "\n" || c === ";" || c === "|" || c === "&" || c === "(" || c === ")" || c === "<" || c === ">") {
-      endStatement();
+    if (c === "<") {
+      endWord();
+      if (cmd.startsWith("<<<", i)) {
+        i += 3;
+        hereString = readWord();
+        continue;
+      }
+      if (cmd.startsWith("<<", i)) {
+        i += 2;
+        const stripTabs = cmd[i] === "-" ? (i++, true) : false;
+        const { delim, quoted } = readDelim();
+        if (!delim) {
+          hereDocMissing = true;
+          continue;
+        }
+        const box = { body: null as string | null, quoted };
+        stmtHereBoxes.push(box);
+        pendingHere.push({ box, delim, stripTabs });
+        continue;
+      }
+      // Plain < redirect: skip the target word, stay in the statement.
       i++;
+      if (cmd[i] === "&") i++;
+      readWord();
+      continue;
+    }
+    if (c === ">") {
+      endWord();
+      i++;
+      if (cmd[i] === ">") i++;
+      if (cmd[i] === "&") i++;
+      readWord();
+      continue;
+    }
+    if (c === "\n" || c === ";" || c === "|" || c === "&" || c === "(" || c === ")") {
+      let op = c;
+      let next = i + 1;
+      if (c === "|" && cmd[i + 1] === "|") {
+        op = "||";
+        next = i + 2;
+      } else if (c === "|" && cmd[i + 1] === "&") {
+        op = "|&";
+        next = i + 2;
+      } else if (c === "&" && cmd[i + 1] === "&") {
+        op = "&&";
+        next = i + 2;
+      }
+      endStatement(op);
+      i = next;
+      if (c === "\n") fillHeredocs();
       continue;
     }
     started = true;
@@ -107,7 +318,7 @@ function splitStatements(cmd: string): Word[][] {
       let closed = false;
       while (j < n) {
         const d = cmd[j]!;
-        if (d === "\\" && j + 1 < n && '$`"\\\n'.includes(cmd[j + 1]!)) {
+        if (d === "\\" && j + 1 < n && "$`\"\\\n".includes(cmd[j + 1]!)) {
           if (cmd[j + 1] !== "\n") cur += cmd[j + 1];
           j += 2;
           continue;
@@ -139,9 +350,18 @@ function splitStatements(cmd: string): Word[][] {
     cur += c;
     i++;
   }
-  endStatement();
+  endStatement("");
+  if (pendingHere.length) fillHeredocs();
+  for (const st of statements) {
+    const b = st.boxes?.[0];
+    if (!b) continue;
+    if (b.body === null) st.hereDocMissing = true;
+    else st.hereDoc = { body: b.body, quoted: b.quoted };
+    delete st.boxes;
+  }
   return statements;
 }
+
 
 /**
  * Split a NODE_OPTIONS value the way Node does: whitespace separated, with
@@ -215,6 +435,7 @@ export function isAllowedNodeOptionsValue(value: string): boolean {
   return true;
 }
 
+
 const ASSIGN_WORD = /^NODE_OPTIONS(\+?)=/;
 const ANY_ASSIGN = /^[A-Za-z_][A-Za-z0-9_]*\+?=/;
 const EMBEDDED_ASSIGN = /(^|[^A-Za-z0-9_])NODE_OPTIONS\+?=/;
@@ -225,6 +446,9 @@ const WRAPPERS = new Set(["sudo", "doas", "env", "command", "exec", "nohup", "ni
 
 /** Programs whose string argument is run as shell code. */
 const SHELLS = new Set(["sh", "bash", "zsh", "dash", "ksh", "eval", "su"]);
+
+/** Shells that will run stdin as a script when there is no -c. */
+const STDIN_SHELLS = new Set(["sh", "bash", "zsh", "dash"]);
 
 /**
  * Programs whose arguments are never run or assigned, so `echo NODE_OPTIONS=x`
@@ -269,26 +493,205 @@ function badArgument(w: Word, prev: string, setter: boolean, shell: boolean, dep
   return false;
 }
 
+interface ProgramView {
+  program: string | null;
+  setter: boolean;
+  textOnly: boolean;
+  /** True when the program is sh/bash/zsh/dash and has no -c. */
+  bareStdinShell: boolean;
+  args: Word[];
+}
+
+function viewOf(stmt: Statement): ProgramView {
+  let program: string | null = null;
+  let setter = false;
+  let textOnly = false;
+  const args: Word[] = [];
+  let hasC = false;
+  for (let k = 0; k < stmt.words.length; k++) {
+    const w = stmt.words[k]!;
+    if (program === null) {
+      if (ASSIGN_WORD.test(w.text) || ANY_ASSIGN.test(w.text)) continue;
+      const base = w.text.slice(w.text.lastIndexOf("/") + 1);
+      if (WRAPPERS.has(base)) continue;
+      if (w.text.startsWith("-")) continue;
+      program = base;
+      const rest = stmt.words.slice(k + 1);
+      const hasV = rest.some((x) => x.text === "-v");
+      setter = SETTER_COMMANDS.has(base) && (base !== "printf" || hasV);
+      textOnly = TEXT_ONLY.has(base) && !setter;
+      hasC = rest.some((x) => x.text === "-c" || /^-[a-zA-Z]*c[a-zA-Z]*$/.test(x.text));
+      continue;
+    }
+    args.push(w);
+  }
+  const bareStdinShell = program !== null && STDIN_SHELLS.has(program) && !hasC;
+  return { program, setter, textOnly, bareStdinShell, args };
+}
+
+const PRINTF_ESC: Record<string, string> = {
+  a: "\x07",
+  b: "\b",
+  e: "\x1b",
+  f: "\f",
+  n: "\n",
+  r: "\r",
+  t: "\t",
+  v: "\v",
+  "\\": "\\",
+  "'": "'",
+  '"': '"',
+};
+
+/** Expand printf / echo -e backslash escapes. Returns null if the text cannot be expanded. */
+function expandBackslashEscapes(s: string): string | null {
+  let out = "";
+  for (let i = 0; i < s.length; i++) {
+    if (s[i] !== "\\") {
+      out += s[i];
+      continue;
+    }
+    const n = s[i + 1];
+    if (n === undefined) return null;
+    if (n in PRINTF_ESC) {
+      out += PRINTF_ESC[n];
+      i++;
+      continue;
+    }
+    if (n === "x") {
+      const hex = s.slice(i + 2, i + 4);
+      if (!/^[0-9A-Fa-f]{2}$/.test(hex)) return null;
+      out += String.fromCharCode(parseInt(hex, 16));
+      i += 3;
+      continue;
+    }
+    if (n === "0" || n === "1" || n === "2" || n === "3" || n === "4" || n === "5" || n === "6" || n === "7") {
+      let oct = n;
+      let j = i + 2;
+      while (oct.length < 3 && j < s.length && /[0-7]/.test(s[j]!)) {
+        oct += s[j]!;
+        j++;
+      }
+      out += String.fromCharCode(parseInt(oct, 8));
+      i = j - 1;
+      continue;
+    }
+    // Unknown escape: fail closed.
+    return null;
+  }
+  return out;
+}
+
+/**
+ * Rebuild the text a TEXT_ONLY command would write to a pipe. Returns null
+ * when that text cannot be known (printf %s, a dynamic word, a missing
+ * heredoc, an unquoted heredoc with expansions).
+ */
+function textOnlyOutput(stmt: Statement): string | null {
+  if (stmt.hereDocMissing) return null;
+  if (stmt.hereString) {
+    if (stmt.hereString.dynamic) return null;
+    return stmt.hereString.text;
+  }
+  if (stmt.hereDoc) {
+    if (!stmt.hereDoc.quoted && /[$`]/.test(stmt.hereDoc.body)) return null;
+    return stmt.hereDoc.body;
+  }
+  const v = viewOf(stmt);
+  if (v.program === "printf") {
+    const args = v.args.filter((a) => a.text !== "--" && !(/^-[A-Za-z]+$/.test(a.text) && a.text !== "--"));
+    // Drop leading flags (-v is a setter and not textOnly).
+    const starts = args.findIndex((a) => !a.text.startsWith("-") || a.text === "--" || a.text === "-");
+    const rest = starts < 0 ? [] : args[starts]!.text === "--" ? args.slice(starts + 1) : args.slice(starts);
+    if (!rest.length) return "";
+    if (rest.some((a) => a.dynamic)) return null;
+    const format = rest[0]!.text;
+    // A conversion other than %% needs an argument we may not be able to place
+    // exactly (flags, widths). Fail closed.
+    if (/%(?:[^%]|$)/.test(format.replace(/%%/g, ""))) return null;
+    return expandBackslashEscapes(format.replace(/%%/g, "%"));
+  }
+  // echo and the other TEXT_ONLY programs: join non-flag arguments.
+  const ev = v.program === "echo" && v.args.some((a) => /^-[A-Za-z]*e[A-Za-z]*$/.test(a.text));
+  const parts: string[] = [];
+  let flagsDone = v.program === "echo";
+  for (const a of v.args) {
+    if (!flagsDone && /^-[A-Za-z]+$/.test(a.text)) continue;
+    flagsDone = true;
+    if (a.dynamic) return null;
+    parts.push(a.text);
+  }
+  const joined = parts.join(" ");
+  if (ev) return expandBackslashEscapes(joined);
+  return joined;
+}
+
+/** Scan text as a nested command, or deny if it cannot be parsed. */
+function nestedDisallowed(text: string | null, depth: number): boolean {
+  if (text === null) return true;
+  return hasDisallowedNodeOptions(text, depth + 1);
+}
+
+/**
+ * When a TEXT_ONLY command (printf, echo, cat, ...) pipes into a bare
+ * sh/bash/zsh/dash with no -c, its argument or heredoc text is the script.
+ */
+function pipedTextIsDisallowed(stmts: Statement[], index: number, depth: number): boolean {
+  const stmt = stmts[index]!;
+  const next = stmts[index + 1];
+  if (!next) return false;
+  if (stmt.after !== "|" && stmt.after !== "|&") return false;
+  if (!viewOf(stmt).textOnly) return false;
+  if (!viewOf(next).bareStdinShell) return false;
+  return nestedDisallowed(textOnlyOutput(stmt), depth);
+}
+
+/**
+ * A here-string (`sh <<< '...'`) or an inline heredoc (`bash <<EOF ... EOF`)
+ * on a shell is the script it will run, when the body is in the command text.
+ */
+function shellHereInputIsDisallowed(stmt: Statement, depth: number): boolean {
+  const v = viewOf(stmt);
+  const isShell = v.program !== null && STDIN_SHELLS.has(v.program);
+  if (!isShell) return false;
+  if (stmt.hereDocMissing) return true;
+  if (stmt.hereString) {
+    if (stmt.hereString.dynamic) return true;
+    return nestedDisallowed(stmt.hereString.text, depth);
+  }
+  if (stmt.hereDoc) {
+    if (!stmt.hereDoc.quoted && /[$`]/.test(stmt.hereDoc.body)) return true;
+    return nestedDisallowed(stmt.hereDoc.body, depth);
+  }
+  return false;
+}
+
 /**
  * True when `cmd` sets NODE_OPTIONS to anything outside the allow list, or
  * in a way that cannot be checked. Every statement is checked (after ; && ||
  * & | and newlines), including a lone assignment with no program, export and
- * the other setters, and the inner command of sh/bash/zsh/dash -c and eval,
- * up to a fixed depth. Never throws.
+ * the other setters, the inner command of sh/bash/zsh/dash -c and eval, a
+ * TEXT_ONLY command piped into a bare sh/bash/zsh/dash with no -c, and a
+ * here-string or inline heredoc on those shells, up to a fixed depth. Never
+ * throws.
  */
 export function hasDisallowedNodeOptions(cmd: string, depth = 0): boolean {
   if (!cmd.includes("NODE_OPTIONS")) return false;
   if (depth > MAX_DEPTH) return true;
-  let statements: Word[][];
+  let statements: Statement[];
   try {
     statements = splitStatements(cmd);
   } catch {
     return true;
   }
-  for (const words of statements) {
+  for (let s = 0; s < statements.length; s++) {
+    const stmt = statements[s]!;
+    if (pipedTextIsDisallowed(statements, s, depth)) return true;
+    if (shellHereInputIsDisallowed(stmt, depth)) return true;
     let program: string | null = null;
     let setter = false;
     let textOnly = false;
+    const words = stmt.words;
     for (let k = 0; k < words.length; k++) {
       const w = words[k]!;
       const prev = k > 0 ? words[k - 1]!.text : "";
