@@ -286,3 +286,43 @@ describe("TEXT_ONLY piped into a bare shell, here-strings and heredocs", () => {
     expect(rule("source /tmp/evil.sh")).toBeNull();
   });
 });
+
+describe("pipelines into a bare stdin shell (round 7)", () => {
+  const bad = "NODE_OPTIONS=--require=x agentreel doctor";
+  const allowed = "NODE_OPTIONS=--max-old-space-size=4096 agentreel doctor";
+
+  it("denies printf | cat | sh", () => {
+    expect(rule(`printf '${bad}' | cat | sh`)).toBe("SELF005");
+  });
+  it("denies printf | tee /dev/null | sh", () => {
+    expect(rule(`printf '${bad}' | tee /dev/null | sh`)).toBe("SELF005");
+  });
+  it("denies printf | grep . | sh", () => {
+    expect(rule(`printf '${bad}' | grep . | sh`)).toBe("SELF005");
+  });
+  it("denies printf | ksh", () => {
+    expect(rule(`printf '${bad}' | ksh`)).toBe("SELF005");
+  });
+  it("denies printf | mksh", () => {
+    expect(rule(`printf '${bad}' | mksh`)).toBe("SELF005");
+  });
+  it("denies printf | ash", () => {
+    expect(rule(`printf '${bad}' | ash`)).toBe("SELF005");
+  });
+  it("denies printf | busybox sh", () => {
+    expect(rule(`printf '${bad}' | busybox sh`)).toBe("SELF005");
+  });
+  it("denies printf | busybox ash", () => {
+    expect(rule(`printf 'NODE_OPTIONS=--import=/tmp/evil.mjs agentreel doctor' | busybox ash`)).toBe("SELF005");
+  });
+
+  it("still allows a direct echo | sh of an allowed value", () => {
+    expect(rule(`echo '${allowed}' | sh`)).toBeNull();
+  });
+  it("still allows export of an allowed value", () => {
+    expect(rule("export NODE_OPTIONS=--max-old-space-size=4096")).toBeNull();
+  });
+  it("still does not treat a cat heredoc (not piped to a shell) as executed", () => {
+    expect(rule("cat <<'EOF'\nNODE_OPTIONS=--require=/tmp/evil.js\nEOF")).toBeNull();
+  });
+});
