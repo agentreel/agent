@@ -18,6 +18,7 @@ import { MAX_BATCH_BYTES } from "../upload/queue.js";
 import { IngestError } from "../upload/client.js";
 import { isCapturePaused, readConfig } from "../config.js";
 import { TranscriptWatcher, getWatcherTotals } from "../watcher/transcript.js";
+import { HeartbeatScheduler } from "../heartbeat/heartbeat.js";
 import {
   fetchPolicy,
   POLICY_REFRESH_INTERVAL_MS,
@@ -73,6 +74,20 @@ export function runTranscriptScan(
   }
 }
 
+/**
+ * One heartbeat step for the daemon loop. Never throws and never waits longer
+ * than the heartbeat timeout, so a slow or dead server cannot stall uploads.
+ */
+export async function runHeartbeatTick(
+  scheduler: HeartbeatScheduler,
+): Promise<void> {
+  try {
+    await scheduler.tick();
+  } catch {
+    // tick() already contains its own failures; this is a last backstop.
+  }
+}
+
 export interface DaemonOpts {
   detach?: boolean;
 }
@@ -119,13 +134,17 @@ export async function daemonCommand(opts: DaemonOpts = {}): Promise<void> {
   console.log(pc.dim("  Ctrl-C to stop"));
 
   const maybeRefreshPolicy = createPolicyRefresher();
+  const heartbeat = new HeartbeatScheduler({
+    log: (line) => console.log(pc.dim(`  [${ts()}]`) + pc.yellow(" · ") + line),
+  });
   const transcriptWatcher = new TranscriptWatcher({
     isPaused: () => isCapturePaused(),
     hooksExpected: () => readConfig().hooksInstalled === true,
   });
 
   // Loop until killed. Each iteration:
-  //   0. scan transcripts for tool calls the hooks never saw (hook gaps)
+  //   0. scan transcripts for tool calls the hooks never saw (hook gaps),
+  //      then send the heartbeat when it is due (carries any new gaps)
   //   1. refresh cached org policy every 5 minutes (quiet on failure)
   //   2. honor backoff (next_attempt_at) before uploading
   //   3. drain the queue in batches as long as moreAvailable
@@ -134,6 +153,7 @@ export async function daemonCommand(opts: DaemonOpts = {}): Promise<void> {
     if (stopping) return;
 
     runTranscriptScan(transcriptWatcher);
+    await runHeartbeatTick(heartbeat);
 
     const policyRes = await maybeRefreshPolicy();
     if (policyRes?.status === "updated") {

@@ -7,6 +7,11 @@ import {
   type AgentConfig,
 } from "../config.js";
 import {
+  describeHeartbeatReason,
+  heartbeatDecision,
+  type HeartbeatReason,
+} from "../heartbeat/heartbeat.js";
+import {
   inspectCursorPreExecHooks,
   inspectSystemCursorHooks,
   systemCursorHooksPath,
@@ -30,6 +35,7 @@ import {
 import {
   computeMaxPolicyApprovalExpiresS,
   computePreExecTimeoutS,
+  getPolicyOrgId,
   HOOK_DEADLINE_MARGIN_S,
   isNoOrgPolicy,
 } from "../policy/types.js";
@@ -54,6 +60,7 @@ export interface DoctorInspectOptions {
   systemCursorHooksPath?: string;
   config?: AgentConfig;
   now?: number;
+  env?: NodeJS.ProcessEnv;
 }
 
 export interface DoctorReport {
@@ -75,6 +82,7 @@ export interface DoctorReport {
   expectedPreExecTimeoutS: number;
   maxPolicyApprovalExpiresS: number | null;
   needsReinit: boolean;
+  heartbeat: { enabled: boolean; reason: HeartbeatReason; text: string };
   claude: {
     fileExists: boolean;
     preToolUseInstalled: boolean;
@@ -191,7 +199,13 @@ export function inspectDoctorState(opts: DoctorInspectOptions = {}): DoctorRepor
     maxPolicyApprovalExpiresS !== null &&
     maxPolicyApprovalExpiresS > cursorEffectiveTimeoutS - HOOK_DEADLINE_MARGIN_S;
 
+  const orgLinked =
+    (typeof cfg.orgSlug === "string" && cfg.orgSlug.length > 0) ||
+    (loaded.source === "server_cache" && getPolicyOrgId(policy) !== null);
+  const hb = heartbeatDecision(cfg, opts.env ?? process.env, orgLinked);
+
   return {
+    heartbeat: { enabled: hb.enabled, reason: hb.reason, text: describeHeartbeatReason(hb) },
     policyLoaded: policy !== null,
     noOrgPolicy,
     policySource: loaded.source,
@@ -315,6 +329,11 @@ export function formatDoctorReport(report: DoctorReport): string {
       lines.push(`    - ${h.event.padEnd(21)} ${status}`);
     }
   }
+
+  lines.push(
+    `  heartbeat:      ${report.heartbeat.enabled ? pc.green(report.heartbeat.text) : pc.yellow(report.heartbeat.text)}`,
+    pc.dim("                  sends counts, states and gaps only; never command text. Hook-gap detection: Claude Code only."),
+  );
 
   if (report.lockdownReason) {
     lines.push(
