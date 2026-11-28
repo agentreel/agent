@@ -164,11 +164,26 @@ describe("policy validation", () => {
           CLOUD001: {
             enabled: true,
             action: "require_approval",
-            approval: { offline_fallback: "flag" },
+            approval: { offline_fallback: 1 },
           },
         },
       }).ok,
     ).toBe(false);
+    // An unknown offline_fallback string reads as the strictest value, "deny".
+    const unknownFallback = validatePolicy({
+      ...makePolicy(),
+      builtin: {
+        CLOUD001: {
+          enabled: true,
+          action: "require_approval",
+          approval: { offline_fallback: "flag" },
+        },
+      },
+    });
+    expect(unknownFallback.ok).toBe(true);
+    expect(
+      unknownFallback.ok && unknownFallback.value.builtin.CLOUD001?.approval?.offline_fallback,
+    ).toBe("deny");
     expect(
       validatePolicy({
         ...makePolicy(),
@@ -189,17 +204,17 @@ describe("policy validation", () => {
     ).toBe(false);
   });
 
-  it("rejects wrong version, invalid mode, invalid offline, or missing allowlists", () => {
+  it("rejects wrong version, non-string mode or offline, or missing allowlists", () => {
     expect(validatePolicy({ ...makePolicy(), version: 2 }).ok).toBe(false);
-    expect(validatePolicy({ ...makePolicy(), mode: "block" }).ok).toBe(false);
-    expect(validatePolicy({ ...makePolicy(), offline: "deny" }).ok).toBe(false);
+    expect(validatePolicy({ ...makePolicy(), mode: 1 }).ok).toBe(false);
+    expect(validatePolicy({ ...makePolicy(), offline: null }).ok).toBe(false);
     expect(validatePolicy({ ...makePolicy(), allow: { commands: [] } }).ok).toBe(
       false,
     );
     expect(
       validatePolicy({
         ...makePolicy(),
-        builtin: { CLOUD001: { enabled: true, action: "drop" } },
+        builtin: { CLOUD001: { enabled: true, action: 7 } },
       }).ok,
     ).toBe(false);
     expect(
@@ -1401,7 +1416,11 @@ describe("govern API v1 (C1) additive fields, repo query, 304, no-org, org_id, e
         },
       ],
     });
-    expect(invalidCustomSeverity.ok).toBe(false);
+    // Unknown severity strings read as the strictest value, "critical".
+    expect(invalidCustomSeverity.ok).toBe(true);
+    expect(invalidCustomSeverity.ok && invalidCustomSeverity.value.custom[0]?.severity).toBe(
+      "critical",
+    );
 
     const invalidBuiltinSeverity = validatePolicy({
       ...makePolicy(),
@@ -1409,7 +1428,10 @@ describe("govern API v1 (C1) additive fields, repo query, 304, no-org, org_id, e
         FS001: { enabled: true, action: "flag", severity: "medium" },
       },
     });
-    expect(invalidBuiltinSeverity.ok).toBe(false);
+    expect(invalidBuiltinSeverity.ok).toBe(true);
+    expect(
+      invalidBuiltinSeverity.ok && invalidBuiltinSeverity.value.builtin.FS001?.severity,
+    ).toBe("critical");
   });
 
   it("repro: personal repo cwd fetch returning no-org 200 does not overwrite cached org_acme policy and sudo stays blocked", async () => {
