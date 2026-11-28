@@ -294,20 +294,34 @@ describe("linear built-in rules: 32KB padded inputs are fast", () => {
       custom: [],
       allow: { commands: [], paths: [], repos: [] },
     };
+    // This test is about results, not speed: a 50ms wall-clock budget on a
+    // shared CI runner measures the runner (it flaked on Node 22 at 7c42f1f).
+    // The evaluator gets a generous deadline here, so the only way to see
+    // eval_timeout is a super-linear blow-up (the old cubic regexes took
+    // seconds at 4KB). How much work the evaluator does per input is pinned
+    // deterministically in guard-eval-pipe-perf.test.ts, and the production
+    // 50ms deadline is pinned there too.
+    const GENEROUS_DEADLINE_MS = 30_000;
     for (const [label, { cmd }] of Object.entries(PADDED)) {
       const t0 = performance.now();
-      const res = evaluatePolicy({ tool: "claude-code", toolName: "Bash", command: cmd }, policy, RULES);
+      const res = evaluatePolicy(
+        { tool: "claude-code", toolName: "Bash", command: cmd },
+        policy,
+        RULES,
+        { deadlineMs: GENEROUS_DEADLINE_MS },
+      );
       const ms = performance.now() - t0;
       expect(res.timed_out, label).toBeUndefined();
       expect(res.reason, label).not.toBe(EVAL_TIMEOUT_REASON);
       expect(res.unevaluated_enforcing, label).toBeUndefined();
-      expect(ms, label).toBeLessThan(80);
+      expect(ms, label).toBeLessThan(5_000);
     }
     // And a real match on a padded command is still found.
     const hit = evaluatePolicy(
       { tool: "claude-code", toolName: "Bash", command: "git push -f" + " ".repeat(N) },
       policy,
       RULES,
+      { deadlineMs: GENEROUS_DEADLINE_MS },
     );
     expect(hit.action).toBe("block");
     expect(hit.rule_ids).toContain("GIT001");
