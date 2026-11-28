@@ -7,9 +7,9 @@
  * internal development guidance.
  * 
  * TRUE NEGATIVES COMPUTATION:
- * Each of the 26 test cases is evaluated against all 30 rules = 780 total rule evaluations.
+ * Each of the 26 test cases is evaluated against all 31 rules = 806 total rule evaluations.
  * True Negatives (TN) = Total evaluations - True Positives - False Positives - False Negatives
- * TN = 780 - 16 - 1 - 1 = 762
+ * TN = 806 - 16 - 1 - 1 = 788
  * 
  * The 12 test fixtures in guard.test.ts for SECRET003 are NOT in this precision corpus
  * (they test the rule in isolation, not end-to-end precision). This corpus contains only

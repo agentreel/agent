@@ -69,6 +69,8 @@ export interface DoctorReport {
   stale: boolean;
   capturePaused: boolean;
   enforcementActive: boolean;
+  /** Set when the org enforces but its cached policy is missing, invalid or edited. */
+  lockdownReason: string | null;
   lastRejection: PolicyRejectionRecord | null;
   expectedPreExecTimeoutS: number;
   maxPolicyApprovalExpiresS: number | null;
@@ -140,11 +142,12 @@ export function inspectDoctorState(opts: DoctorInspectOptions = {}): DoctorRepor
     loaded.source === "server_cache" && isNoOrgPolicy(policy);
 
   const enforcementActive =
-    loaded.source === "server_cache" &&
+    loaded.source === "enforced_lockdown" ||
+    (loaded.source === "server_cache" &&
     policy !== null &&
     !noOrgPolicy &&
     policy.mode === "enforce" &&
-    !(policy.offline === "fail_open" && stale);
+    !(policy.offline === "fail_open" && stale));
 
   const expectedPreExecTimeoutS = computePreExecTimeoutS(policy);
   const maxPolicyApprovalExpiresS = computeMaxPolicyApprovalExpiresS(policy);
@@ -201,6 +204,7 @@ export function inspectDoctorState(opts: DoctorInspectOptions = {}): DoctorRepor
     stale,
     capturePaused,
     enforcementActive,
+    lockdownReason: loaded.lockdownReason ?? null,
     lastRejection,
     expectedPreExecTimeoutS,
     maxPolicyApprovalExpiresS,
@@ -312,6 +316,11 @@ export function formatDoctorReport(report: DoctorReport): string {
     }
   }
 
+  if (report.lockdownReason) {
+    lines.push(
+      `  ${pc.red("!")} lockdown: this org enforces its policy, but the cached policy is ${report.lockdownReason.replace("policy_", "")}. Every built-in rule blocks until \`npx @agentreel/agent auth\` fetches it again.`,
+    );
+  }
   if (report.lastRejection) {
     const hasCachedServerPolicy =
       report.policySource === "server_cache" && !report.noOrgPolicy;

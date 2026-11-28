@@ -294,6 +294,22 @@ const CONDITION_OPS = new Set<string>([
 const POLICY_TOOLS = new Set<string>(["claude-code", "cursor"]);
 const APPROVAL_OFFLINE_FALLBACKS = new Set<string>(["deny", "allow"]);
 
+/**
+ * Unknown enum strings (a newer server, or a value this agent predates) are
+ * read as the strictest known value instead of rejecting the whole policy.
+ * Rejecting it used to leave no policy at all, which meant allow. Non-string
+ * values are still invalid.
+ */
+export const STRICTEST_MODE: PolicyMode = "enforce";
+export const STRICTEST_OFFLINE: PolicyOfflineMode = "last_known";
+export const STRICTEST_ACTION: PolicyAction = "block";
+export const STRICTEST_SEVERITY: Severity = "critical";
+export const STRICTEST_APPROVAL_FALLBACK: ApprovalOfflineFallback = "deny";
+
+function knownOrStrictest<T extends string>(v: string, known: Set<string>, strictest: T): T {
+  return (known.has(v) ? v : strictest) as T;
+}
+
 function validateRuleApproval(
   input: unknown,
   path: string,
@@ -321,16 +337,17 @@ function validateRuleApproval(
     out.expires_s = input.expires_s;
   }
   if (input.offline_fallback !== undefined) {
-    if (
-      typeof input.offline_fallback !== "string" ||
-      !APPROVAL_OFFLINE_FALLBACKS.has(input.offline_fallback)
-    ) {
+    if (typeof input.offline_fallback !== "string") {
       return {
         ok: false,
         error: `${path}.offline_fallback must be "deny" or "allow"`,
       };
     }
-    out.offline_fallback = input.offline_fallback as ApprovalOfflineFallback;
+    out.offline_fallback = knownOrStrictest(
+      input.offline_fallback,
+      APPROVAL_OFFLINE_FALLBACKS,
+      STRICTEST_APPROVAL_FALLBACK,
+    );
   }
   return { ok: true, value: out };
 }
@@ -492,10 +509,10 @@ function validateCustomRule(
     if (!cond.ok) return cond;
     when.push(cond.value);
   }
-  if (typeof input.action !== "string" || !POLICY_ACTIONS.has(input.action)) {
+  if (typeof input.action !== "string") {
     return { ok: false, error: `${path}.action is invalid` };
   }
-  if (!isValidSeverity(input.severity)) {
+  if (typeof input.severity !== "string") {
     return { ok: false, error: `${path}.severity is invalid` };
   }
   let scope: CustomRuleScope | undefined;
@@ -519,8 +536,8 @@ function validateCustomRule(
       version: input.version,
       message: input.message,
       when,
-      action: input.action as PolicyAction,
-      severity: input.severity,
+      action: knownOrStrictest(input.action, POLICY_ACTIONS, STRICTEST_ACTION),
+      severity: knownOrStrictest(input.severity, SEVERITIES, STRICTEST_SEVERITY),
       ...(scope !== undefined ? { scope } : {}),
       ...(approval !== undefined ? { approval } : {}),
     },
@@ -620,15 +637,17 @@ export function validatePolicy(
     }
     fetchedAt = input.fetched_at as string | number;
   }
-  if (typeof input.mode !== "string" || !POLICY_MODES.has(input.mode)) {
+  if (typeof input.mode !== "string") {
     return { ok: false, error: 'policy.mode must be "observe" or "enforce"' };
   }
-  if (typeof input.offline !== "string" || !OFFLINE_MODES.has(input.offline)) {
+  const mode = knownOrStrictest(input.mode, POLICY_MODES, STRICTEST_MODE);
+  if (typeof input.offline !== "string") {
     return {
       ok: false,
       error: 'policy.offline must be "last_known" or "fail_open"',
     };
   }
+  const offline = knownOrStrictest(input.offline, OFFLINE_MODES, STRICTEST_OFFLINE);
 
   let approvalDefaults: RuleApprovalConfig | undefined;
   if (input.approval_defaults !== undefined) {
@@ -657,10 +676,7 @@ export function validatePolicy(
         error: `policy.builtin.${ruleId}.enabled must be a boolean`,
       };
     }
-    if (
-      typeof rawOverride.action !== "string" ||
-      !POLICY_ACTIONS.has(rawOverride.action)
-    ) {
+    if (typeof rawOverride.action !== "string") {
       return {
         ok: false,
         error: `policy.builtin.${ruleId}.action is invalid`,
@@ -668,7 +684,7 @@ export function validatePolicy(
     }
     if (
       rawOverride.severity !== undefined &&
-      !isValidSeverity(rawOverride.severity)
+      typeof rawOverride.severity !== "string"
     ) {
       return {
         ok: false,
@@ -687,9 +703,15 @@ export function validatePolicy(
     }
     builtin[ruleId] = {
       enabled: rawOverride.enabled,
-      action: rawOverride.action as PolicyAction,
+      action: knownOrStrictest(rawOverride.action, POLICY_ACTIONS, STRICTEST_ACTION),
       ...(rawOverride.severity !== undefined
-        ? { severity: rawOverride.severity }
+        ? {
+            severity: knownOrStrictest(
+              rawOverride.severity,
+              SEVERITIES,
+              STRICTEST_SEVERITY,
+            ),
+          }
         : {}),
       ...(approval !== undefined ? { approval } : {}),
     };
@@ -725,7 +747,7 @@ export function validatePolicy(
       input.allow.paths.length === 0 &&
       input.allow.repos.length === 0;
     if (
-      input.mode !== "observe" ||
+      mode !== "observe" ||
       Object.keys(builtin).length > 0 ||
       custom.length > 0 ||
       !isEmptyAllow
@@ -750,8 +772,8 @@ export function validatePolicy(
       ...(input.org_slug !== undefined ? { org_slug: input.org_slug } : {}),
       updated_at: input.updated_at as string | number,
       ...(fetchedAt !== undefined ? { fetched_at: fetchedAt } : {}),
-      mode: input.mode as PolicyMode,
-      offline: input.offline as PolicyOfflineMode,
+      mode,
+      offline,
       ...(approvalDefaults !== undefined
         ? { approval_defaults: approvalDefaults }
         : {}),

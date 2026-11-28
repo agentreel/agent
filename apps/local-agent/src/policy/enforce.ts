@@ -10,6 +10,7 @@ import { insertEvent } from "../db.js";
 import { RULES } from "../guard/rules.js";
 import { ensureAgentreelDir, logPath } from "../paths.js";
 import { scrubAny, scrubString } from "../redact/scrubber.js";
+import { readSqlFileReferences } from "./sql-file-refs.js";
 import { isPolicyCacheStale, loadEffectivePolicy } from "./cache.js";
 import { matchSelfProtect } from "./self-protect.js";
 import {
@@ -183,6 +184,59 @@ export function formatInvalidRuleBlockMessage(
   return `Blocked by ${org} policy: rule ${ruleId} has an unsupported regex and could not be evaluated. Ask an admin or see ${url}`;
 }
 
+export const INTERNAL_ERROR_REASON = "internal_error";
+export const MALFORMED_INPUT_REASON = "malformed_input";
+
+export function formatFailClosedMessage(
+  what: string,
+  policy: Policy | null,
+  config: AgentConfig,
+): string {
+  const org = policy?.org_name?.trim() || config.orgName?.trim() || "your org";
+  const slug = policy?.org_slug?.trim() || config.orgSlug?.trim();
+  const url = slug ? `agentreel.dev/org/${slug}` : "agentreel.dev";
+  return `Blocked by ${org} policy: ${what}, and this org enforces its policy, so the action is blocked. Ask an admin or see ${url}`;
+}
+
+/**
+ * True when an org policy in enforce mode is in effect. Hook entry points use
+ * it to fail closed on input they can't read, and enforcePreExec uses it to
+ * fail closed on its own internal errors. Never throws.
+ */
+export function enforcementExpected(
+  deps: Pick<PreExecDeps, "cachePath" | "guardConfigPath"> = {},
+): { expected: boolean; policy: Policy | null } {
+  try {
+    const loaded = loadEffectivePolicy({
+      cachePath: deps.cachePath,
+      guardConfigPath: deps.guardConfigPath,
+    });
+    const policy = loaded.policy;
+    const expected = !!policy && !isNoOrgPolicy(policy) && policy.mode === "enforce";
+    return { expected, policy };
+  } catch {
+    return { expected: false, policy: null };
+  }
+}
+
+/** The deny outcome for a fail-closed path (internal error, malformed input). */
+export function failClosedOutcome(
+  reason: string,
+  what: string,
+  policy: Policy | null,
+  config: AgentConfig,
+): PreExecOutcome {
+  return {
+    permitted: false,
+    action: "block",
+    enforced: true,
+    downgraded: false,
+    reason,
+    message: formatFailClosedMessage(what, policy, config),
+    error: true,
+  };
+}
+
 export function formatWaitingMessage(
   ruleName: string,
   expiresS: number,
@@ -339,7 +393,8 @@ function formatApprovalDenyMessage(
 /**
  * Evaluates cached policy for a pre-execution tool call, handles offline modes,
  * optionally runs the remote approval flow only for require_approval, records
- * non-allow policy_decision events locally, and always fails open on errors.
+ * non-allow policy_decision events locally. An internal error fails closed
+ * when an enforcing org policy is loaded, and open otherwise.
  */
 export async function enforcePreExec(
   req: PreExecRequest,
@@ -350,12 +405,18 @@ export async function enforcePreExec(
   const recordDecision = deps.recordDecision ?? insertEvent;
   const onWaiting = deps.onWaiting ?? defaultOnWaiting;
   const evaluateFn = deps.evaluateFn ?? evaluatePolicy;
+  // Set once an enforcing org policy is loaded: from then on an internal
+  // error fails closed instead of open.
+  let enforcingPolicy: Policy | null = null;
 
   try {
     const loaded = loadEffectivePolicy({
       cachePath: deps.cachePath,
       guardConfigPath: deps.guardConfigPath,
     });
+    if (loaded.policy && !isNoOrgPolicy(loaded.policy) && loaded.policy.mode === "enforce") {
+      enforcingPolicy = loaded.policy;
+    }
 
     if (!loaded.policy || isNoOrgPolicy(loaded.policy)) {
       return {
@@ -423,6 +484,8 @@ export async function enforcePreExec(
       branch: req.branch,
       member: req.member,
     };
+    const referencedSql = readSqlFileReferences(req.command, req.cwd);
+    if (referencedSql !== undefined) evalInput.referencedSqlContent = referencedSql;
 
     const evalResult = evaluateFn(evalInput, loaded.policy, RULES, {
       deadlineMs: deps.evalDeadlineMs ?? POLICY_EVAL_DEADLINE_MS,
@@ -773,11 +836,23 @@ export async function enforcePreExec(
       downgraded: false,
     };
   } catch (err) {
-    log(
-      `unexpected error during pre-exec enforcement; failing open: ${
-        err instanceof Error ? err.stack ?? err.message : String(err)
-      }`,
-    );
+    const detail = err instanceof Error ? err.stack ?? err.message : String(err);
+    if (enforcingPolicy) {
+      log(`unexpected error during pre-exec enforcement under an enforcing policy; failing closed: ${detail}`);
+      let cfg: AgentConfig;
+      try {
+        cfg = deps.config ?? readConfig();
+      } catch {
+        cfg = {} as AgentConfig;
+      }
+      return failClosedOutcome(
+        INTERNAL_ERROR_REASON,
+        "the policy check failed",
+        enforcingPolicy,
+        cfg,
+      );
+    }
+    log(`unexpected error during pre-exec enforcement; failing open: ${detail}`);
     return {
       permitted: true,
       action: "allow",

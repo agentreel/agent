@@ -27,6 +27,8 @@ function formatSourceLabel(source: PolicySource): string {
       return "local fallback";
     case "none":
       return "none";
+    case "enforced_lockdown":
+      return "lockdown (org enforces, cached policy missing, invalid or edited)";
   }
 }
 
