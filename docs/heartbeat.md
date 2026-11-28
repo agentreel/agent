@@ -34,4 +34,19 @@ The transcript watcher reads Claude Code transcripts (`~/.claude/projects/**/*.j
 
 ## Server
 
-`POST /api/v1/agent/heartbeat` (contract in agentreel/web, PR #65, route PR #67; migration `agent_heartbeats`, numbered 0024 at merge). Beats every 60 s by default, the server can ask for 30 to 900 s. Failures retry with exponential backoff and jitter. A `401` pauses until `agentreel link` changes the key.
+`POST /api/v1/agent/heartbeat` (contract in agentreel/web, PR #65, route PR #67; migration `agent_heartbeats`, numbered 0024 at merge). Beats every 60 s by default, the server can ask for 30 to 900 s.
+
+## When the server says no
+
+| Response | What the daemon does |
+| --- | --- |
+| `404` | The server does not have the heartbeat route yet. The daemon logs nothing and checks again after a random 6 to 24 hours. The next check time is stored in the local db, so restarting the daemon does not retry early. After 14 `404`s in a row it stops checking until the agent is upgraded or relinked with a new key. A successful beat clears all of this. |
+| `401` | The API key was refused. The daemon stops and says so once. A fingerprint of the refused key (a SHA-256 prefix, never the key) is stored, so a restart stays stopped. It starts again when `agentreel link` changes the key. |
+| `408`, `429`, `5xx`, network error, timeout | Retried with exponential backoff and jitter, capped at 15 minutes, honouring `Retry-After`. |
+| `409`, `413`, `422`, other `4xx` | Keeps the normal interval and says so once. After `413` or `422` the next beat leaves the gaps out. |
+
+`AGENTREEL_HEARTBEAT=0` always wins: nothing is sent, whatever the config, the org default or a pending recheck.
+
+No two attempts are ever closer than 10 seconds, whatever the timers do: the last attempt time is stored, a daemon that crash-loops waits it out, and a clock that moved backwards is clamped. A stored `404` recheck time more than 24 hours away (the clock moved back) is pulled in to 24 hours.
+
+`agentreel status` shows the last error, for example `http 404 (heartbeat not available on the server yet)`.

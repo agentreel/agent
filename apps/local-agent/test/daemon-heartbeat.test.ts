@@ -12,6 +12,12 @@ import {
   HEARTBEAT_BACKOFF_MAX_MS,
   HEARTBEAT_CATCHUP_MS,
   HEARTBEAT_LIVE_INTERVALS,
+  HEARTBEAT_MIN_SEND_GAP_MS,
+  HEARTBEAT_404_MAX_CHECKS,
+  HEARTBEAT_404_MAX_MS,
+  HEARTBEAT_404_MIN_MS,
+  META_HB_404_NEXT_AT,
+  META_HB_REJECTED_KEY,
   HEARTBEAT_MISSING_AFTER_S,
   HeartbeatError,
   HeartbeatScheduler,
@@ -271,9 +277,10 @@ describe("HeartbeatScheduler", () => {
     const { s } = sched(async () => okRes(1));
     await s.tick();
     expect(s.nextDueAt).toBe(T0 + 30_000);
+    clock += HEARTBEAT_MIN_SEND_GAP_MS; // a second scheduler (a restart) waits out the send floor
     const { s: s2 } = sched(async () => okRes(10 ** 9));
     await s2.tick();
-    expect(s2.nextDueAt).toBe(T0 + 900_000);
+    expect(s2.nextDueAt).toBe(clock + 900_000);
   });
 
   it("acknowledges gaps only after a 200, so a failed beat loses nothing", async () => {
@@ -343,6 +350,7 @@ describe("HeartbeatScheduler", () => {
     const { s } = sched(async () => { throw new HeartbeatError("http-429", 429, 300_000); });
     const r = await s.tick();
     expect((r as { retryInMs: number }).retryInMs).toBe(300_000);
+    clock += HEARTBEAT_MIN_SEND_GAP_MS;
     const { s: s2 } = sched(async () => { throw new HeartbeatError("http-429", 429, 1); }, { random: () => 0 });
     const r2 = await s2.tick();
     expect((r2 as { retryInMs: number }).retryInMs).toBe(60_000);
@@ -489,5 +497,174 @@ describe("gaps reported through the scheduler are the watcher's gaps", () => {
     await s.tick();
     expect(sent).toEqual(ids);
     expect(listUnreportedGaps()).toEqual([]);
+  });
+});
+
+describe("404 means not available yet; 401 stops until relink; env wins; never a tight loop", () => {
+  const H = 60 * 60_000;
+  function sched(
+    send: (c: AgentConfig, b: HeartbeatBody) => Promise<HeartbeatResponseBody>,
+    extra: Partial<ConstructorParameters<typeof HeartbeatScheduler>[0]> = {},
+  ) {
+    const logs: string[] = [];
+    const s = new HeartbeatScheduler({ now: () => clock, random: () => 0, config: () => cfg(), enabled: () => true, send, log: (l) => logs.push(l), ...extra });
+    return { s, logs };
+  }
+  const notFound = async (): Promise<HeartbeatResponseBody> => {
+    throw new HeartbeatError("http-404", 404);
+  };
+
+  it("404: rechecks after a random 6 to 24 hours, quietly", async () => {
+    for (const [r, want] of [[0, 6 * H], [1, 24 * H], [0.5, 15 * H]] as const) {
+      closeDb();
+      home = mkdtempSync(join(tmpdir(), "ar-hb-"));
+      process.env.HOME = home;
+      const { s, logs } = sched(notFound, { random: () => r });
+      const res = await s.tick();
+      expect(res).toEqual({ kind: "failed", status: 404, retryInMs: want });
+      expect(s.nextDueAt).toBe(clock + want);
+      expect(Number(getMeta(META_HB_404_NEXT_AT))).toBe(clock + want);
+      expect(logs).toEqual([]);
+      clock += HEARTBEAT_MIN_SEND_GAP_MS;
+    }
+  });
+
+  it("404 jitter stays in bounds even with a hostile random()", async () => {
+    for (const r of [-5, 7, Number.NaN, Number.POSITIVE_INFINITY]) {
+      closeDb();
+      home = mkdtempSync(join(tmpdir(), "ar-hb-"));
+      process.env.HOME = home;
+      const { s } = sched(notFound, { random: () => r });
+      const res = (await s.tick()) as { retryInMs: number };
+      expect(res.retryInMs).toBeGreaterThanOrEqual(HEARTBEAT_404_MIN_MS);
+      expect(res.retryInMs).toBeLessThanOrEqual(HEARTBEAT_404_MAX_MS);
+    }
+  });
+
+  it("404 recheck time survives a daemon restart, so a restart does not loop", async () => {
+    const send = vi.fn(notFound);
+    const first = sched(send, { random: () => 0.25 }).s;
+    await first.tick();
+    const due = first.nextDueAt;
+    expect(send).toHaveBeenCalledTimes(1);
+    // Restart one hour later, then every hour: a fresh scheduler each time.
+    for (let i = 0; i < 10; i++) {
+      clock += H;
+      const restarted = sched(send).s;
+      expect(await restarted.tick()).toEqual({ kind: "skipped", reason: "not_available" });
+      expect(restarted.nextDueAt).toBe(due);
+    }
+    expect(send).toHaveBeenCalledTimes(1);
+    clock = due;
+    send.mockImplementationOnce(async () => okRes(60));
+    expect((await sched(send).s.tick()).kind).toBe("sent");
+    expect(getMeta(META_HB_404_NEXT_AT)).toBeNull();
+  });
+
+  it("a clock moved back cannot push the 404 recheck past 24 hours", async () => {
+    const { s } = sched(notFound, { random: () => 1 });
+    await s.tick();
+    clock -= 30 * 24 * H;
+    const r = sched(notFound).s;
+    expect(await r.tick()).toEqual({ kind: "skipped", reason: "not_available" });
+    expect(r.nextDueAt).toBe(clock + HEARTBEAT_404_MAX_MS);
+  });
+
+  it("404 retries are capped: after the cap it stops, across restarts, until a relink", async () => {
+    let key = "ar_live_a";
+    const send = vi.fn(notFound);
+    const mk = () => sched(send, { config: () => cfg({ apiKey: key }), random: () => 0 }).s;
+    let s = mk();
+    for (let i = 0; i < HEARTBEAT_404_MAX_CHECKS; i++) {
+      await s.tick();
+      clock = s.nextDueAt;
+    }
+    expect(send).toHaveBeenCalledTimes(HEARTBEAT_404_MAX_CHECKS);
+    for (let d = 0; d < 60; d++) {
+      clock += 24 * H;
+      s = mk();
+      expect(await s.tick()).toEqual({ kind: "skipped", reason: "not_available" });
+    }
+    expect(send).toHaveBeenCalledTimes(HEARTBEAT_404_MAX_CHECKS);
+    key = "ar_live_b";
+    send.mockImplementationOnce(async () => okRes(60));
+    expect((await mk().tick()).kind).toBe("sent");
+  });
+
+  it("401 stops until relink, and the stop survives a restart", async () => {
+    let key = "ar_live_old";
+    const send = vi.fn(async (): Promise<HeartbeatResponseBody> => {
+      throw new HeartbeatError("http-401", 401);
+    });
+    const mk = () => sched(send, { config: () => cfg({ apiKey: key }) }).s;
+    expect(await mk().tick()).toMatchObject({ kind: "failed", status: 401 });
+    expect(getMeta(META_HB_REJECTED_KEY)).toMatch(/^[0-9a-f]{16}$/);
+    expect(getMeta(META_HB_REJECTED_KEY)).not.toContain("ar_live");
+    for (let i = 0; i < 5; i++) {
+      clock += 24 * H;
+      expect(await mk().tick()).toEqual({ kind: "skipped", reason: "key_rejected" });
+    }
+    expect(send).toHaveBeenCalledTimes(1);
+    key = "ar_live_new";
+    send.mockImplementationOnce(async () => okRes(60));
+    expect((await mk().tick()).kind).toBe("sent");
+    expect(getMeta(META_HB_REJECTED_KEY)).toBeNull();
+  });
+
+  it("AGENTREEL_HEARTBEAT=0 always wins, even over an enabled() override and pending rechecks", async () => {
+    const prev = process.env.AGENTREEL_HEARTBEAT;
+    const send = vi.fn(async () => okRes(60));
+    try {
+      for (const v of ["0", "false", "no", "off"]) {
+        process.env.AGENTREEL_HEARTBEAT = v;
+        const { s } = sched(send, { enabled: () => true, config: () => cfg({ heartbeat: true }) });
+        expect(await s.tick()).toEqual({ kind: "skipped", reason: "disabled" });
+        clock += 24 * H;
+        expect(await s.tick()).toEqual({ kind: "skipped", reason: "disabled" });
+      }
+      expect(send).not.toHaveBeenCalled();
+    } finally {
+      if (prev === undefined) delete process.env.AGENTREEL_HEARTBEAT;
+      else process.env.AGENTREEL_HEARTBEAT = prev;
+    }
+  });
+
+  it("never runs a tight loop: ticks every 50 ms for an hour send at most once per floor", async () => {
+    const modes: Array<[string, () => Promise<HeartbeatResponseBody>, number]> = [
+      ["404", notFound, 1],
+      ["401", async () => { throw new HeartbeatError("http-401", 401); }, 1],
+      ["500 retry-after 0", async () => { throw new HeartbeatError("http-500", 500, 0); }, 3600_000 / 30_000 + 1],
+      ["network", async () => { throw new Error("boom"); }, 3600_000 / 30_000 + 1],
+      ["422", async () => { throw new HeartbeatError("http-422", 422); }, 3600_000 / 30_000 + 1],
+      ["200 interval 0", async () => okRes(0), 3600_000 / 30_000 + 1],
+    ];
+    for (const [label, impl, max] of modes) {
+      closeDb();
+      home = mkdtempSync(join(tmpdir(), "ar-hb-"));
+      process.env.HOME = home;
+      const start = clock;
+      const send = vi.fn(impl);
+      const { s } = sched(send, { random: () => 0 });
+      for (let t = 0; t < 3600_000; t += 50) {
+        clock = start + t;
+        await s.tick();
+      }
+      expect(send.mock.calls.length, label).toBeLessThanOrEqual(max);
+      expect(send.mock.calls.length, label).toBeGreaterThanOrEqual(1);
+      clock = start + 3600_000;
+    }
+  });
+
+  it("never runs a tight loop when every tick is a fresh scheduler or the clock jumps back", async () => {
+    const send = vi.fn(async (): Promise<HeartbeatResponseBody> => { throw new HeartbeatError("http-503", 503, 0); });
+    const start = clock;
+    for (let i = 0; i < 2000; i++) {
+      // A crash-looping daemon: new scheduler every 100 ms; the clock also
+      // jumps back a minute every 100 ticks.
+      clock = start + i * 100 - Math.floor(i / 100) * 60_000;
+      await sched(send).s.tick();
+    }
+    // 2000 ticks over at most 200 s of wall time: the 10 s floor allows ~21.
+    expect(send.mock.calls.length).toBeLessThanOrEqual(25);
   });
 });

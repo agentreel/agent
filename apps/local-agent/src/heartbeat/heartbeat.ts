@@ -12,6 +12,7 @@
  * prompts, tool input or hostname.
  */
 import { nanoid } from "nanoid";
+import { createHash } from "node:crypto";
 import { platform as osPlatform } from "node:os";
 import { isCapturePaused, readConfig, type AgentConfig } from "../config.js";
 import { countEvents, getMeta, setMeta } from "../db.js";
@@ -52,6 +53,31 @@ export const META_HB_LAST_ERROR_AT = "hb_last_error_at";
 export const META_HB_LAST_ERROR = "hb_last_error";
 export const META_HB_FAILURES = "hb_failures";
 export const META_HB_INTERVAL_S = "hb_interval_s";
+/** 404 handling: when to check again (ms epoch), how many 404s in a row, and for which agent version. */
+export const META_HB_404_NEXT_AT = "hb_404_next_at";
+export const META_HB_404_COUNT = "hb_404_count";
+export const META_HB_404_VERSION = "hb_404_version";
+/** SHA-256 prefix of the API key the server refused with 401. */
+export const META_HB_REJECTED_KEY = "hb_rejected_key";
+/** Last send attempt (ms epoch), so no restart or timer bug can send faster than the floor. */
+export const META_HB_LAST_ATTEMPT_AT = "hb_last_attempt_at";
+
+/**
+ * A 404 means the server does not have the heartbeat route yet. Check again
+ * after a random 6 to 24 hours, quietly.
+ */
+export const HEARTBEAT_404_MIN_MS = 6 * 60 * 60_000;
+export const HEARTBEAT_404_MAX_MS = 24 * 60 * 60_000;
+/**
+ * After this many 404s in a row the daemon stops checking until the agent
+ * version or the API key changes (an upgrade or a relink starts over).
+ */
+export const HEARTBEAT_404_MAX_CHECKS = 14;
+/**
+ * No two send attempts closer than this, whatever the timers, restarts or the
+ * clock do. Below the 15 s gap catch-up, far above a tight loop.
+ */
+export const HEARTBEAT_MIN_SEND_GAP_MS = 10_000;
 
 export interface HeartbeatBody {
   version: 1;
@@ -318,14 +344,17 @@ export interface SchedulerOptions {
 }
 
 export type TickResult =
-  | { kind: "skipped"; reason: "not_due" | "disabled" | "unlinked" | "key_rejected" }
+  | { kind: "skipped"; reason: "not_due" | "disabled" | "unlinked" | "key_rejected" | "not_available" }
   | { kind: "sent"; gapsAcknowledged: number }
   | { kind: "failed"; status: number; retryInMs: number };
 
 /**
  * Drives the beat from the daemon loop. `tick()` is cheap when nothing is due
  * and never throws. State that matters to `agentreel status` is kept in the
- * local db; scheduling state is in memory, so a restarted daemon beats at once.
+ * local db. Normal scheduling is in memory, so a restarted daemon beats at
+ * once, except: a 404 recheck time, a 401-rejected key, and the last attempt
+ * time are persisted, so a restart cannot loop on a 404 or a 401, and no two
+ * attempts are ever closer than HEARTBEAT_MIN_SEND_GAP_MS.
  */
 export class HeartbeatScheduler {
   private readonly o: Required<SchedulerOptions>;
@@ -358,6 +387,12 @@ export class HeartbeatScheduler {
   async tick(): Promise<TickResult> {
     const now = this.o.now();
     try {
+      // AGENTREEL_HEARTBEAT=0 always wins, over config, org default and any
+      // enabled() override.
+      if (!heartbeatEnabled()) {
+        this.nextAt = now + DISABLED_RECHECK_MS;
+        return { kind: "skipped", reason: "disabled" };
+      }
       if (now < this.nextAt) return { kind: "skipped", reason: "not_due" };
       const cfg = this.o.config();
       if (!this.o.enabled(cfg)) {
@@ -366,10 +401,28 @@ export class HeartbeatScheduler {
         return { kind: "skipped", reason: "disabled" };
       }
       if (!cfg.apiKey) return { kind: "skipped", reason: "unlinked" };
-      if (this.rejectedKey !== null) {
-        if (cfg.apiKey === this.rejectedKey) return { kind: "skipped", reason: "key_rejected" };
-        this.rejectedKey = null; // the user linked a new key
+      const keyHash = keyFingerprint(cfg.apiKey);
+      const persistedRejected = getMeta(META_HB_REJECTED_KEY);
+      if (this.rejectedKey !== null || persistedRejected !== null) {
+        if (cfg.apiKey === this.rejectedKey || keyHash === persistedRejected) {
+          return { kind: "skipped", reason: "key_rejected" };
+        }
+        // The user linked a new key.
+        this.rejectedKey = null;
+        setMeta(META_HB_REJECTED_KEY, null);
+        clear404State();
       }
+      const gate = this.notAvailableGate(now, keyHash);
+      if (gate) return gate;
+      // Floor between attempts. A clock that went backwards is clamped to now.
+      const lastAttempt = Number(getMeta(META_HB_LAST_ATTEMPT_AT) ?? "0") || 0;
+      if (lastAttempt > now) setMeta(META_HB_LAST_ATTEMPT_AT, String(now));
+      const since = now - Math.min(lastAttempt, now);
+      if (lastAttempt > 0 && since < HEARTBEAT_MIN_SEND_GAP_MS) {
+        this.nextAt = now + (HEARTBEAT_MIN_SEND_GAP_MS - since);
+        return { kind: "skipped", reason: "not_due" };
+      }
+      setMeta(META_HB_LAST_ATTEMPT_AT, String(now));
 
       const omitGaps = this.omitGapsNext;
       this.omitGapsNext = false;
@@ -378,7 +431,7 @@ export class HeartbeatScheduler {
       try {
         res = await this.o.send(cfg, body);
       } catch (err) {
-        return this.onFailure(err, now, cfg.apiKey, body.hook_gaps.length > 0);
+        return this.onFailure(err, now, cfg.apiKey, body.hook_gaps.length > 0, keyHash);
       }
       return this.onSuccess(res, body, now);
     } catch (err) {
@@ -389,8 +442,50 @@ export class HeartbeatScheduler {
     }
   }
 
+  /**
+   * While a 404 recheck is pending (persisted), or the 404 cap is reached for
+   * this agent version and key, skip quietly.
+   */
+  private notAvailableGate(now: number, keyHash: string): TickResult | null {
+    const version = getMeta(META_HB_404_VERSION);
+    if (version !== null && version !== `${VERSION}:${keyHash}`) {
+      // Upgraded or relinked since the 404s: start over.
+      clear404State();
+      return null;
+    }
+    const count = Number(getMeta(META_HB_404_COUNT) ?? "0") || 0;
+    if (count >= HEARTBEAT_404_MAX_CHECKS) {
+      this.nextAt = now + HEARTBEAT_404_MAX_MS;
+      return { kind: "skipped", reason: "not_available" };
+    }
+    const raw = Number(getMeta(META_HB_404_NEXT_AT) ?? "0");
+    if (!Number.isFinite(raw) || raw <= 0) return null;
+    // A stored time further out than the longest wait means the clock moved
+    // back: pull it in to now + the longest wait.
+    const nextAt = Math.min(raw, now + HEARTBEAT_404_MAX_MS);
+    if (nextAt !== raw) setMeta(META_HB_404_NEXT_AT, String(nextAt));
+    if (now < nextAt) {
+      this.nextAt = nextAt;
+      return { kind: "skipped", reason: "not_available" };
+    }
+    return null;
+  }
+
+  private onNotFound(now: number, keyHash: string): TickResult {
+    const count = (Number(getMeta(META_HB_404_COUNT) ?? "0") || 0) + 1;
+    const r = Math.min(1, Math.max(0, Number(this.o.random()) || 0));
+    const wait = Math.round(HEARTBEAT_404_MIN_MS + (HEARTBEAT_404_MAX_MS - HEARTBEAT_404_MIN_MS) * r);
+    setMeta(META_HB_404_COUNT, String(count));
+    setMeta(META_HB_404_NEXT_AT, String(now + wait));
+    setMeta(META_HB_404_VERSION, `${VERSION}:${keyHash}`);
+    this.nextAt = now + wait;
+    // Quiet: no log line. `agentreel status` shows the last error.
+    return { kind: "failed", status: 404, retryInMs: count >= HEARTBEAT_404_MAX_CHECKS ? Number.POSITIVE_INFINITY : wait };
+  }
+
   private onSuccess(res: HeartbeatResponseBody, body: HeartbeatBody, now: number): TickResult {
     this.failures = 0;
+    clear404State();
     this.intervalS = clampInterval(res.next_interval_s);
     markGapsReported(body.hook_gaps.map((g) => g.tool_use_id), now);
     setMeta(META_HB_LAST_OK_AT, String(now));
@@ -404,12 +499,17 @@ export class HeartbeatScheduler {
     return { kind: "sent", gapsAcknowledged: body.hook_gaps.length };
   }
 
-  private onFailure(err: unknown, now: number, apiKey: string, hadGaps: boolean): TickResult {
+  private onFailure(err: unknown, now: number, apiKey: string, hadGaps: boolean, keyHash: string): TickResult {
     const e = err instanceof HeartbeatError ? err : new HeartbeatError("error", 0);
-    recordError(e.status === 0 ? e.message : `http ${e.status}`, now);
+    recordError(
+      e.status === 0 ? e.message : e.status === 404 ? "http 404 (heartbeat not available on the server yet)" : `http ${e.status}`,
+      now,
+    );
 
+    if (e.status === 404) return this.onNotFound(now, keyHash);
     if (e.status === 401) {
       this.rejectedKey = apiKey;
+      setMeta(META_HB_REJECTED_KEY, keyHash);
       this.log401();
       return { kind: "failed", status: 401, retryInMs: Number.POSITIVE_INFINITY };
     }
@@ -444,6 +544,16 @@ export class HeartbeatScheduler {
     this.loggedStatuses.add(401);
     this.o.log("heartbeat: the server rejected the API key (401); paused until you run `agentreel link`");
   }
+}
+
+function keyFingerprint(apiKey: string): string {
+  return createHash("sha256").update(apiKey).digest("hex").slice(0, 16);
+}
+
+function clear404State(): void {
+  setMeta(META_HB_404_NEXT_AT, null);
+  setMeta(META_HB_404_COUNT, null);
+  setMeta(META_HB_404_VERSION, null);
 }
 
 function recordError(message: string, now: number): void {
