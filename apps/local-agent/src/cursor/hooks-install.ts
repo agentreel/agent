@@ -1,9 +1,7 @@
 import {
-  copyFileSync,
   existsSync,
   mkdirSync,
   readFileSync,
-  writeFileSync,
 } from "node:fs";
 import * as fs from "node:fs";
 import { dirname } from "node:path";
@@ -39,22 +37,137 @@ function read(path: string): CursorHooksFile {
 }
 
 /**
- * Spyable lstat used by the user-hooks safety check and by backup.
- * Tests use `vi.spyOn(_userHooksLstatForTests, "lstatSync")`.
+ * Test seams for the per-user hooks file. `lstatSync` is the lstat used by
+ * the safety check; `noFollow` is `O_NOFOLLOW` (undefined on Windows, where
+ * the write falls back to an lstat right before the open); `beforeOpen`
+ * runs after the checks and the backup and before the open, so a test can
+ * swap the file or directory for a symlink there (a TOCTOU).
  */
 export const _userHooksLstatForTests = { lstatSync: fs.lstatSync };
+export const _userHooksWriteForTests: {
+  noFollow: number | undefined;
+  beforeOpen: ((path: string) => void) | undefined;
+} = { noFollow: fs.constants.O_NOFOLLOW, beforeOpen: undefined };
 
+const OPEN_REFUSAL_CODES = new Set(["ELOOP", "EMLINK"]);
+
+/**
+ * Copy the existing per-user hooks file to a timestamped backup, reading it
+ * through an O_NOFOLLOW fd so a symlink is never followed. Returns the backup
+ * path, or null when the file is missing, is a symlink or not a regular
+ * file, or the copy failed. Never overwrites an existing backup. Callers
+ * that know the file exists must treat null as "do not write".
+ */
 function backup(path: string): string | null {
+  const noFollow = _userHooksWriteForTests.noFollow;
+  let fd: number | null = null;
   try {
-    const st = _userHooksLstatForTests.lstatSync(path);
-    // Never follow a symlink: copyFileSync would copy the target.
-    if (st.isSymbolicLink() || !st.isFile()) return null;
+    if (noFollow === undefined) {
+      const st = _userHooksLstatForTests.lstatSync(path);
+      if (st.isSymbolicLink() || !st.isFile()) return null;
+    }
+    fd = fs.openSync(path, fs.constants.O_RDONLY | (noFollow ?? 0) | (fs.constants.O_NONBLOCK ?? 0));
+    const st = fs.fstatSync(fd);
+    if (!st.isFile()) return null;
+    const data = fs.readFileSync(fd);
+    const b = `${path}.agentreel-backup-${new Date().toISOString().replace(/[:.]/g, "-")}`;
+    fs.writeFileSync(b, data, { flag: "wx", mode: st.mode & 0o777 });
+    return b;
   } catch {
     return null;
+  } finally {
+    if (fd !== null) {
+      try {
+        fs.closeSync(fd);
+      } catch {
+        // Ignore close failures.
+      }
+    }
   }
-  const b = `${path}.agentreel-backup-${new Date().toISOString().replace(/[:.]/g, "-")}`;
-  copyFileSync(path, b);
-  return b;
+}
+
+type UserHooksWrite = { ok: true; backup: string | null } | { ok: false; warning: string };
+
+/**
+ * The one way the per-user hooks file is written (install, cleanup and
+ * uninstall all use it):
+ *
+ *  1. refuse a symlinked directory, a symlink or non-regular file, or any
+ *     lstat error other than ENOENT;
+ *  2. back up the existing file through an O_NOFOLLOW fd, and abort the
+ *     write if the file exists and the backup could not be made;
+ *  3. re-lstat the parent directory right before the open and refuse a
+ *     symlink (a swap since step 1);
+ *  4. write through one fd opened with O_WRONLY|O_CREAT|O_TRUNC|O_NOFOLLOW,
+ *     keeping the existing mode (0600 for a new file). ELOOP is a refusal.
+ *     Without O_NOFOLLOW (Windows) the file is lstat-ed immediately before
+ *     the open instead.
+ *
+ * Never throws. A same-user swap in the few instructions between the last
+ * check and the open is closed for the file by O_NOFOLLOW; for the parent
+ * directory it narrows to the gap between its lstat and the open.
+ */
+function writeUserHooksFile(path: string, content: string): UserHooksWrite {
+  const fail = (why: string): UserHooksWrite => ({
+    ok: false,
+    warning: `${path} or its directory is a symlink or not a regular file, or could not be inspected (${why}), so it was left untouched.`,
+  });
+  let fd: number | null = null;
+  try {
+    const refused = refuseUnsafeUserHooksFile(path);
+    if (refused) return { ok: false, warning: refused };
+
+    let existingMode: number | null = null;
+    try {
+      existingMode = _userHooksLstatForTests.lstatSync(path).mode & 0o777;
+    } catch (err) {
+      if ((err as NodeJS.ErrnoException).code !== "ENOENT") return fail((err as NodeJS.ErrnoException).code ?? "lstat");
+    }
+    let b: string | null = null;
+    if (existingMode !== null) {
+      b = backup(path);
+      if (b === null) return fail("backup failed");
+    }
+
+    _userHooksWriteForTests.beforeOpen?.(path);
+
+    const parent = _userHooksLstatForTests.lstatSync(dirname(path));
+    if (parent.isSymbolicLink() || !parent.isDirectory()) return fail("directory changed");
+
+    const noFollow = _userHooksWriteForTests.noFollow;
+    if (noFollow === undefined) {
+      try {
+        const st = _userHooksLstatForTests.lstatSync(path);
+        if (st.isSymbolicLink() || !st.isFile()) return fail("not a regular file");
+      } catch (err) {
+        if ((err as NodeJS.ErrnoException).code !== "ENOENT") return fail((err as NodeJS.ErrnoException).code ?? "lstat");
+      }
+    }
+    const c = fs.constants;
+    try {
+      fd = fs.openSync(
+        path,
+        c.O_WRONLY | c.O_CREAT | c.O_TRUNC | (noFollow ?? 0) | (c.O_NONBLOCK ?? 0),
+        existingMode ?? 0o600,
+      );
+    } catch (err) {
+      const code = (err as NodeJS.ErrnoException).code ?? "open";
+      return fail(OPEN_REFUSAL_CODES.has(code) ? "symlink" : code);
+    }
+    if (!fs.fstatSync(fd).isFile()) return fail("not a regular file");
+    fs.writeFileSync(fd, content, "utf8");
+    return { ok: true, backup: b };
+  } catch (err) {
+    return fail((err as NodeJS.ErrnoException).code ?? "error");
+  } finally {
+    if (fd !== null) {
+      try {
+        fs.closeSync(fd);
+      } catch {
+        // Ignore close failures.
+      }
+    }
+  }
 }
 
 export function cursorHookTimeoutForEvent(
@@ -175,9 +288,9 @@ export function removeUserAgentreelCursorHooks(
       else file.hooks![ev] = kept;
     }
     if (removed === 0) return { backup: null, removed: 0 };
-    const b = backup(path);
-    writeFileSync(path, JSON.stringify(file, null, 2) + "\n", "utf8");
-    return { backup: b, removed };
+    const w = writeUserHooksFile(path, JSON.stringify(file, null, 2) + "\n");
+    if (!w.ok) return { backup: null, removed: 0, refused: w.warning };
+    return { backup: w.backup, removed };
   } catch {
     return { backup: null, removed: 0 };
   }
@@ -257,7 +370,6 @@ export function installCursorHooks(
     };
   }
   mkdirSync(dirname(path), { recursive: true });
-  const b = backup(path);
   const file = read(path);
   file.version ??= 1;
   file.hooks ??= {};
@@ -272,13 +384,19 @@ export function installCursorHooks(
     });
     file.hooks[ev] = kept;
   }
-  writeFileSync(path, JSON.stringify(file, null, 2) + "\n", "utf8");
-  return { skipped: false, backup: b, installedEvents: [...CURSOR_HOOK_EVENTS], path, preExecTimeoutS };
+  const w = writeUserHooksFile(path, JSON.stringify(file, null, 2) + "\n");
+  if (!w.ok) {
+    return { skipped: false, refused: true, warning: w.warning, backup: null, installedEvents: [], path, preExecTimeoutS };
+  }
+  return { skipped: false, backup: w.backup, installedEvents: [...CURSOR_HOOK_EVENTS], path, preExecTimeoutS };
 }
 
-export function uninstallCursorHooks(path = cursorHooksPath()): { backup: string | null; removed: number } {
+export function uninstallCursorHooks(
+  path = cursorHooksPath(),
+): { backup: string | null; removed: number; refused?: string } {
+  const refused = refuseUnsafeUserHooksFile(path);
+  if (refused) return { backup: null, removed: 0, refused };
   if (!existsSync(path)) return { backup: null, removed: 0 };
-  const b = backup(path);
   const file = read(path);
   let removed = 0;
   for (const ev of Object.keys(file.hooks ?? {})) {
@@ -288,8 +406,9 @@ export function uninstallCursorHooks(path = cursorHooksPath()): { backup: string
     if (kept.length === 0) delete file.hooks![ev];
     else file.hooks![ev] = kept;
   }
-  writeFileSync(path, JSON.stringify(file, null, 2) + "\n", "utf8");
-  return { backup: b, removed };
+  const w = writeUserHooksFile(path, JSON.stringify(file, null, 2) + "\n");
+  if (!w.ok) return { backup: null, removed: 0, refused: w.warning };
+  return { backup: w.backup, removed };
 }
 
 export interface CursorPreExecHookEntryStatus {

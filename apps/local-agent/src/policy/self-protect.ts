@@ -76,7 +76,7 @@ const WRAPPERS = new Set(["sudo", "doas", "command", "exec", "nohup", "time", "n
 
 const READ_TOOLS = /^(read|read_file|readfile|view|cat|beforereadfile|grep|glob|ls|list_dir|search)$/i;
 
-const ENV_NAMES = /^(HOME|CLAUDE_CONFIG_DIR|CLAUDECODE|CLAUDE_CODE_CHILD_SESSION|CURSOR_AGENT|AGENTREEL_[A-Z0-9_]*)$/;
+const ENV_NAMES = /^(HOME|CLAUDE_CONFIG_DIR|CLAUDECODE|CLAUDE_CODE_CHILD_SESSION|CURSOR_AGENT|NODE_OPTIONS|AGENTREEL_[A-Z0-9_]*)$/;
 
 /** NFKC, then drop quotes and backslash escapes (keeping the escaped char). */
 export function dequoteShell(s: string): string {
@@ -369,7 +369,10 @@ function checkCommand(command: string): SelfProtectMatch | null {
     const readOnly = READ_ONLY_PROGRAMS.has(prog) && !segmentHasOutputRedirect(seg);
     // `node .../@agentreel/agent/dist/cli.js doctor` runs the CLI; it does not
     // write to the package. Its script path is skipped for SELF001 only.
-    const cliIdx = nodeAgentreelScriptIndex(toks, pi);
+    // Not when a NODE_OPTIONS= prefix (bare or via env) is present: it can load
+    // code (--require, --import) into the CLI, so the script path is checked.
+    const nodeOptionsPrefix = pi > 0 && toks.slice(0, pi).some((t) => /^NODE_OPTIONS=/i.test(t));
+    const cliIdx = nodeOptionsPrefix ? -1 : nodeAgentreelScriptIndex(toks, pi);
 
     // SELF005: env tampering.
     if (prog === "unset" && args.some((a) => ENV_NAMES.test(a))) return m("SELF005");
