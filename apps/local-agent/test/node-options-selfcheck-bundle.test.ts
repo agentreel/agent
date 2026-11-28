@@ -154,7 +154,12 @@ function runHost(
   } else {
     r = spawnSync("/bin/sh", ["-c", command], { env, input, encoding: "utf8", timeout: 15_000 });
   }
-  return { status: r.status, stdout: r.stdout ?? "", stderr: r.stderr ?? "" };
+  return {
+    status: r.status,
+    stdout: r.stdout ?? "",
+    stderr: r.stderr ?? "",
+    detail: `${r.stderr ?? ""}\n${r.stdout ?? ""}\n${r.error ? String(r.error) : ""}\nsignal=${r.signal}`,
+  };
 }
 
 function hookPrefix(nodePath: string = process.execPath, cliPath: string = cli): string {
@@ -369,7 +374,7 @@ describe("built bundle: a preload that deletes NODE_OPTIONS", () => {
         expectScrubbed(command);
         const r = runHost(command, home, { nodeOptions, input: kind === "claude" ? PRE_TOOL_USE : CURSOR_SHELL });
         expect(existsSync(marker)).toBe(false);
-        expect(r.status, r.stderr).toBe(0);
+        expect(r.status, r.detail).toBe(0);
         if (kind === "claude") {
           const body = JSON.parse(r.stdout) as {
             hookSpecificOutput: { permissionDecision: string; permissionDecisionReason: string };
@@ -499,8 +504,8 @@ describe("built bundle: npm injects NODE_OPTIONS after env -u unless the command
     const mockDir = writeMockNpx(join(home, "mock-bin"));
     const command = installNpxClaude(home);
     const r = runHost(command, home, { path: npxPath(mockDir), input: PRE_TOOL_USE });
-    expect(existsSync(marker), r.stderr).toBe(false);
-    expect(r.status, r.stderr + r.stdout).toBe(0);
+    expect(existsSync(marker), r.detail).toBe(false);
+    expect(r.status, r.detail).toBe(0);
     expect(JSON.parse(r.stdout).hookSpecificOutput.permissionDecision).toBe("deny");
     expect(JSON.parse(r.stdout).hookSpecificOutput.permissionDecisionReason).not.toContain("SELF005");
   });
@@ -515,8 +520,8 @@ describe("built bundle: npm injects NODE_OPTIONS after env -u unless the command
       npmConfigNodeOptions: `--require=${deleteCjs}`,
       input: PRE_TOOL_USE,
     });
-    expect(existsSync(marker), r.stderr).toBe(false);
-    expect(r.status, r.stderr + r.stdout).toBe(0);
+    expect(existsSync(marker), r.detail).toBe(false);
+    expect(r.status, r.detail).toBe(0);
     expect(JSON.parse(r.stdout).hookSpecificOutput.permissionDecision).toBe("deny");
     expect(JSON.parse(r.stdout).hookSpecificOutput.permissionDecisionReason).not.toContain("SELF005");
   });
@@ -552,8 +557,8 @@ describe("built bundle: installed commands run through the host shell, including
     if (process.platform === "win32") expect(entry.shell).toBe("bash");
     expectScrubbed(entry.command);
     const r = runHost(entry.command, home, { nodeOptions: `--require=${deleteCjs}`, input: PRE_TOOL_USE });
-    expect(existsSync(marker), r.stderr).toBe(false);
-    expect(r.status, r.stderr + r.stdout).toBe(0);
+    expect(existsSync(marker), r.detail).toBe(false);
+    expect(r.status, r.detail).toBe(0);
     expect(JSON.parse(r.stdout).hookSpecificOutput.permissionDecision).toBe("deny");
   });
 
@@ -567,8 +572,8 @@ describe("built bundle: installed commands run through the host shell, including
     const command = file.hooks.beforeShellExecution![0]!.command;
     expectScrubbed(command);
     const r = runHost(command, home, { nodeOptions: `--require=${deleteCjs}`, input: CURSOR_SHELL });
-    expect(existsSync(marker), r.stderr).toBe(false);
-    expect(r.status, r.stderr + r.stdout).toBe(0);
+    expect(existsSync(marker), r.detail).toBe(false);
+    expect(r.status, r.detail).toBe(0);
     expect(JSON.parse(r.stdout).permission).toBe("deny");
   });
 });
