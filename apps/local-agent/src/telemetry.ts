@@ -89,7 +89,8 @@ export function isTelemetryEnabled(env: NodeJS.ProcessEnv = process.env): boolea
 
 export function shouldSkipTelemetryForArgv(argv: string[]): boolean {
   const subcommand = argv[2];
-  return subcommand === "hook" || subcommand === "cursor-hook";
+  // `managed` writes system policy as root and must never phone home.
+  return subcommand === "hook" || subcommand === "cursor-hook" || subcommand === "managed";
 }
 
 function readState(): TelemetryState | null {
