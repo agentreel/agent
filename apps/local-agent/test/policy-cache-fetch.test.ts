@@ -500,7 +500,7 @@ describe("policy fetch and cache", () => {
       guardConfigPath,
       JSON.stringify({
         enabled: true,
-        policyMode: "block",
+        policyMode: "warn",
         rules: {
           CLOUD001: { enabled: false },
           GIT001: { enabled: true, severity: "critical" },

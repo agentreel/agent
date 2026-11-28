@@ -507,6 +507,12 @@ All rules can be disabled or have their severity adjusted in `~/.agentreel/guard
 }
 ```
 
+`policyMode` controls what the local config does when no org policy is cached:
+
+- `"warn"` (default): findings are recorded and hooks never block.
+- `"block"`: hooks block. Every one of the 31 built-in rules runs at `block` unless `rules` disables it, and the allowlists still apply. An org policy fetched from the server always takes precedence over the local config.
+- `"off"`: the local config adds no policy.
+
 ---
 
 ## Disclaimer
