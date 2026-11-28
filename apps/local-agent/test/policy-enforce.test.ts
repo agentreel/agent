@@ -1,5 +1,5 @@
 import { createServer, type IncomingMessage, type ServerResponse } from "node:http";
-import { mkdirSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from "node:fs";
+import { mkdtempSync, readFileSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { afterAll, afterEach, beforeEach, describe, expect, it, vi } from "vitest";
@@ -536,7 +536,7 @@ describe("remote approval flow", () => {
 
     let postedBody: Record<string, unknown> | null = null;
     let seenAuth: string | undefined;
-    let pollUrls: string[] = [];
+    const pollUrls: string[] = [];
     let pollCount = 0;
 
     const srv = await startMockServer(async (req, res) => {
