@@ -337,7 +337,7 @@ export function readCachedPolicy(
     const parsed: unknown = JSON.parse(raw);
     const validated = validateCachedPolicyFile(parsed);
     if (!validated.ok) return null;
-    return verifyCachedPolicy(validated.value);
+    return verifyCachedPolicy(validated.value, cachePath);
   } catch {
     return null;
   }
@@ -359,15 +359,39 @@ function rawCachedPolicy(cachePath: string): unknown {
  * trusted) and its signature checked, so an edited cache fails. An enforcing
  * org policy with no signed body is rejected. Returns null on any failure.
  */
-function verifyCachedPolicy(entry: CachedPolicyFile): CachedPolicyFile | null {
+function verifyCachedPolicy(entry: CachedPolicyFile, cachePath: string): CachedPolicyFile | null {
+  const reject = (policy: Policy, raw: unknown): null => {
+    rememberEnforcingOrg(policy, raw, cachePath);
+    return null;
+  };
   if (entry.signed_body !== undefined) {
     const rebuilt = validatePolicy(entry.signed_body, { skipRegexValidation: true });
-    if (!rebuilt.ok) return null;
+    if (!rebuilt.ok) return reject(entry.policy, entry.signed_body);
     const trust = checkPolicyTrust(rebuilt.value, entry.signed_body);
-    if (!trust.ok) return null;
+    if (!trust.ok) return reject(rebuilt.value, entry.signed_body);
     return { ...entry, policy: rebuilt.value };
   }
-  return checkPolicyTrust(entry.policy, undefined).ok ? entry : null;
+  const trust = checkPolicyTrust(entry.policy, undefined);
+  if (!trust.ok) return reject(entry.policy, entry.policy);
+  return entry;
+}
+
+/**
+ * If `policy` is an enforcing org policy, write the enforced-org marker
+ * so a rejected fetch or a rejected cache locks down instead of failing
+ * open. Never throws.
+ */
+export function rememberEnforcingOrg(
+  policy: Policy,
+  rawPolicy: unknown,
+  cachePath: string,
+): void {
+  if (!isEnforcingOrgPolicy(policy)) return;
+  try {
+    writeEnforcementMarkerAtomic(policy, rawPolicy ?? policy, cachePath);
+  } catch {
+    // Marker write must not hide the rejection.
+  }
 }
 
 /**

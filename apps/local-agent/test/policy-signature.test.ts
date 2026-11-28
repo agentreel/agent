@@ -11,6 +11,7 @@ const sig = await import("../src/policy/signature.js");
 const pinned = await import("../src/policy/pinned-keys.js");
 const cache = await import("../src/policy/cache.js");
 const fetchMod = await import("../src/policy/fetch.js");
+const enforce = await import("../src/policy/enforce.js");
 
 // Published web contract test vector (agentreel/web PR #49). TEST KEY ONLY.
 const VECTOR = JSON.parse(
@@ -329,5 +330,53 @@ describe("explicit auth and enforcement with a signed policy", () => {
     f.signed_body.builtin.GIT001.enabled = false;
     writeFileSync(cachePath, JSON.stringify(f), "utf8");
     expect(cache.loadEffectivePolicy({ cachePath, guardConfigPath: deps.guardConfigPath }).source).not.toBe("server_cache");
+  });
+});
+
+describe("fail closed while no key is pinned", () => {
+  const run = (cachePath: string, command = "git push --force origin main") =>
+    enforce.enforcePreExec(
+      { sessionId: "s", tool: "claude-code", toolName: "Bash", command },
+      {
+        cachePath,
+        guardConfigPath: join(testHome, "none.json"),
+        config: {
+          apiBaseUrl: "http://127.0.0.1:1",
+          installedHookTimeouts: { claude: 130, cursor: 130 },
+          schemaVersion: 1,
+        } as never,
+        recordDecision: () => {},
+      },
+    );
+
+  it("fresh machine: a rejected signed enforcing policy writes the marker and denies", async () => {
+    pinned._setPinnedPolicyKeysForTests([]);
+    const cachePath = cachePathFor();
+    const res = await fetchWith(cachePath, respond(VECTOR.signed_policy));
+    expect(res.status).toBe("invalid_policy");
+    expect(cache.readCachedPolicy(cachePath)).toBeNull();
+    expect(cache.readEnforcementMarker(cachePath)).not.toBeNull();
+    const loaded = cache.loadEffectivePolicy({ cachePath, guardConfigPath: join(testHome, "none.json") });
+    expect(loaded.source).toBe("enforced_lockdown");
+    expect((await run(cachePath)).permitted).toBe(false);
+    expect((await run(cachePath, "ls -la")).permitted).toBe(true);
+  });
+
+  it("upgrade without a marker: an unsigned enforcing cache locks down and denies", async () => {
+    pinned._setPinnedPolicyKeysForTests([]);
+    const cachePath = cachePathFor();
+    const unsigned = unsignedBase();
+    writeFileSync(
+      cachePath,
+      JSON.stringify({ policy: unsigned, etag: unsigned.etag, fetched_at: Date.now() }),
+      "utf8",
+    );
+    expect(cache.readEnforcementMarker(cachePath)).toBeNull();
+    expect(cache.readCachedPolicy(cachePath)).toBeNull();
+    expect(cache.readEnforcementMarker(cachePath)).not.toBeNull();
+    const loaded = cache.loadEffectivePolicy({ cachePath, guardConfigPath: join(testHome, "none.json") });
+    expect(loaded.source).toBe("enforced_lockdown");
+    expect(loaded.lockdownReason).toBe("policy_invalid");
+    expect((await run(cachePath)).permitted).toBe(false);
   });
 });

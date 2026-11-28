@@ -6,6 +6,7 @@ import {
   POLICY_REFRESH_INTERVAL_MS,
   readCachedPolicy,
   shouldRefreshPolicy,
+  rememberEnforcingOrg,
   writeCachedPolicyAtomic,
   writePolicyRejectionAtomic,
 } from "./cache.js";
@@ -312,10 +313,11 @@ export async function fetchPolicy(
 
       const trustError = signedPolicyError(policy, body, res, cached);
       if (trustError) {
+        rememberEnforcingOrg(policy, body, cachePath);
         log(
           cached
             ? `rejected policy signature (${trustError}); keeping last verified cache`
-            : `rejected policy signature (${trustError}); the policy was not installed and org enforcement is off until a verified policy is cached`,
+            : `rejected policy signature (${trustError}); writing an enforcement marker so the org stays locked down until a verified policy is cached`,
         );
         try {
           writePolicyRejectionAtomic(
