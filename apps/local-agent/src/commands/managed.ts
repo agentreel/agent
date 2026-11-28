@@ -13,6 +13,7 @@ import {
   underRoot,
 } from "../managed/install.js";
 import type { ManagedPlatform } from "../managed/pack.js";
+import { agentSessionMarker, findAgentAncestor, readProcessAncestry, type AncestorProcess } from "../managed/agent-guard.js";
 import {
   hookPathRefusalMessage,
   hookPathWarningMessage,
@@ -29,6 +30,8 @@ export interface ManagedInstallCliOptions {
   /** Home directory whose ~/.cursor/hooks.json loses AgentReel's entries. Used as given, not placed under --root. */
   userHome?: string;
   allowUserWritableHook?: boolean;
+  /** Run without a terminal. Needed when stdin is not a TTY. Never overrides the agent checks. */
+  yes?: boolean;
   /** commander maps --no-claude / --no-cursor to claude:false / cursor:false */
   claude?: boolean;
   cursor?: boolean;
@@ -47,6 +50,10 @@ export interface ManagedInstallDeps {
   /** Test seam: ownership checks must not touch the real filesystem. */
   stat?: StatPath;
   realpath?: RealpathFn;
+  /** Test seam: the parent process chain, nearest parent first. May throw; that is treated as unknown. */
+  ancestry?: () => AncestorProcess[];
+  /** Test seam: whether stdin is a terminal (default: process.stdin.isTTY). */
+  isTTY?: boolean;
 }
 
 const SAFE_USER = /^[A-Za-z0-9_][A-Za-z0-9_.-]{0,63}$/;
@@ -103,13 +110,7 @@ export function resolveInvokingUserHome(
   return { home: opts.root === "/" ? home : underRoot(opts.root, home) };
 }
 
-/** Environment variables that mean we are running inside an agent's tool call. */
-export function agentSessionMarker(env: NodeJS.ProcessEnv): string | null {
-  if (env.CLAUDECODE === "1") return "CLAUDECODE";
-  if (env.CLAUDE_CODE_CHILD_SESSION === "1") return "CLAUDE_CODE_CHILD_SESSION";
-  if (env.CURSOR_AGENT) return "CURSOR_AGENT";
-  return null;
-}
+export { agentSessionMarker };
 
 export function defaultHookCommand(): string {
   const real = realpathSync(fileURLToPath(import.meta.url));
@@ -145,6 +146,26 @@ export function managedInstallCommand(opts: ManagedInstallCliOptions, deps: Mana
       if (marker) {
         throw new ManagedInstallError(
           `Refusing to write managed policy from inside an agent session (${marker} is set). Run this from a normal terminal. --dry-run is allowed.`,
+        );
+      }
+      // sudo clears the variables above, so also look at who started this process.
+      // If the ancestry cannot be read this check passes and the TTY check below decides.
+      let ancestors: AncestorProcess[] = [];
+      try {
+        ancestors = (deps.ancestry ?? (() => readProcessAncestry()))();
+      } catch {
+        error(pc.yellow("agentreel managed install: could not read the parent process chain, relying on the terminal check."));
+      }
+      const agentAncestor = findAgentAncestor(ancestors);
+      if (agentAncestor) {
+        throw new ManagedInstallError(
+          `Refusing to write managed policy: an agent is an ancestor of this command (${agentAncestor}). Run this from a normal terminal, not from inside a Claude Code or Cursor session. --dry-run is allowed.`,
+        );
+      }
+      const isTTY = deps.isTTY !== undefined ? deps.isTTY : process.stdin.isTTY === true;
+      if (!isTTY && opts.yes !== true) {
+        throw new ManagedInstallError(
+          "Refusing to write managed policy: stdin is not a terminal. Run this from an interactive terminal, or pass --yes if a person is running it from a script. --dry-run is allowed.",
         );
       }
       if (root === "/" && uid !== 0) {
