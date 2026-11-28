@@ -17,7 +17,6 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   - `agentreel uninstall`, `logout` and `pause` (including through `npx`), removing the `@agentreel/agent` package, and `agentreel managed ...` other than `--dry-run`. The `managed` match is on the command text, so it still holds when sudo has stripped `CLAUDECODE` or `CURSOR_AGENT`;
   - `disableAllHooks` and `claude --settings` / `--setting-sources`;
   - unsetting or overriding `HOME`, `CLAUDE_CONFIG_DIR`, `CLAUDECODE`, `CLAUDE_CODE_CHILD_SESSION`, `CURSOR_AGENT` or `AGENTREEL_*` (`unset`, `env -u`, `env -i`, `export HOME=`, `HOME=... claude`).
-  Matching NFKC-normalizes and strips quotes and escapes first, and is a single linear pass. With no org policy, or an `observe` policy, nothing changes.
 
 - `agentreel init` skips writing `~/.cursor/hooks.json` when the system Cursor hooks file (`/etc/cursor/hooks.json`, macOS `/Library/Application Support/Cursor/hooks.json`) already has AgentReel entries, or exists but cannot be read (fail-safe: treated as managed so a second copy is never written). It then removes only stale AgentReel entries from this user's `~/.cursor/hooks.json` after a backup, leaving other tools' hooks untouched, and prints that the managed pack owns them. `agentreel doctor` also reads the system file and reports the hooks as owned by the managed pack instead of telling the user to run `agentreel init`.
 

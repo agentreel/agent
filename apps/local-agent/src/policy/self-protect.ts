@@ -319,6 +319,45 @@ function segmentHasOutputRedirect(seg: string): boolean {
   return seg.includes(">");
 }
 
+/** `node` itself (node, nodejs, node.exe, any path-qualified form). */
+function isNodeProgram(prog: string): boolean {
+  return prog === "node" || prog === "nodejs" || prog === "node.exe";
+}
+
+/** Node flags that take no value and cannot run other code, so the script is the next word. */
+const NODE_PLAIN_FLAGS = new Set(["--no-warnings", "--trace-warnings", "--enable-source-maps", "--no-deprecation"]);
+
+/**
+ * The AgentReel CLI entry point as installed by npm:
+ * `.../node_modules/@agentreel/agent/dist/cli.js`. The path must hold no `..`
+ * segment, so it names the installed package and not a file reached through it.
+ */
+function isAgentreelCliScript(tok: string): boolean {
+  const t = tok.toLowerCase();
+  if (!t.endsWith("/node_modules/@agentreel/agent/dist/cli.js")) return false;
+  return !t.split("/").includes("..");
+}
+
+/**
+ * Index of the script `node` runs, when it is the AgentReel CLI and nothing
+ * else in the node command line can run other code: the first argument must
+ * be the script, optionally after a few value-less flags. `-e`, `-p`,
+ * `-r`, `--require`, `--import` and any other flag mean no skip, so the path
+ * is checked like any other token.
+ */
+function nodeAgentreelScriptIndex(toks: string[], pi: number): number {
+  if (pi < 0 || !isNodeProgram(basename(toks[pi]!))) return -1;
+  for (let i = pi + 1; i < toks.length; i++) {
+    const t = toks[i]!;
+    if (t.startsWith("-")) {
+      if (NODE_PLAIN_FLAGS.has(t)) continue;
+      return -1;
+    }
+    return isAgentreelCliScript(t) ? i : -1;
+  }
+  return -1;
+}
+
 function checkCommand(command: string): SelfProtectMatch | null {
   const clean = rewriteWhichAgentreel(dequoteShell(command));
   const segs = shellSegments(clean);
@@ -328,6 +367,9 @@ function checkCommand(command: string): SelfProtectMatch | null {
     const prog = pi >= 0 ? basename(toks[pi]!) : "";
     const args = pi >= 0 ? toks.slice(pi + 1) : [];
     const readOnly = READ_ONLY_PROGRAMS.has(prog) && !segmentHasOutputRedirect(seg);
+    // `node .../@agentreel/agent/dist/cli.js doctor` runs the CLI; it does not
+    // write to the package. Its script path is skipped for SELF001 only.
+    const cliIdx = nodeAgentreelScriptIndex(toks, pi);
 
     // SELF005: env tampering.
     if (prog === "unset" && args.some((a) => ENV_NAMES.test(a))) return m("SELF005");
@@ -355,7 +397,9 @@ function checkCommand(command: string): SelfProtectMatch | null {
     }
 
     // SELF003: uninstall, logout, pause.
-    const agentIdx = toks.findIndex((t) => basename(t) === "agentreel" || /^@agentreel\/agent(@|$)/.test(t));
+    const agentIdx = toks.findIndex(
+      (t, i) => basename(t) === "agentreel" || /^@agentreel\/agent(@|$)/.test(t) || i === cliIdx,
+    );
     if (agentIdx >= 0) {
       const rest = toks.slice(agentIdx + 1).map((t) => t.toLowerCase());
       if (rest.some((t) => t === "uninstall" || t === "logout" || t === "pause")) return m("SELF003");
@@ -383,6 +427,7 @@ function checkCommand(command: string): SelfProtectMatch | null {
     if (
       !readOnly &&
       toks.some((t, i) => {
+        if (i === cliIdx) return false;
         if (i === pi) {
           const b = basename(t);
           if (b === "agentreel" || b === "agentreel.exe") return false;
