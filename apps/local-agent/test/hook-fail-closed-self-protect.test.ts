@@ -4,6 +4,7 @@ import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import type { Policy } from "../src/policy/types.js";
+import { buildHookCommand } from "../src/hooks/hook-command.js";
 
 const testHome = mkdtempSync(join(tmpdir(), "agentreel-selfprotect-"));
 process.env.HOME = testHome;
@@ -1013,6 +1014,24 @@ describe("hook binary discovered from the managed hook command", () => {
     expect(selfProtect.matchSelfProtect({ toolName: "Bash", command: `rm ${bin}` })?.rule_id).toBe("SELF001");
     expect(selfProtect.matchSelfProtect({ toolName: "Bash", command: `chmod -x ${bin}` })?.rule_id).toBe("SELF001");
     expect(selfProtect.matchSelfProtect({ toolName: "Write", file_path: bin })?.rule_id).toBe("SELF002");
+  });
+
+  it("still finds the binary when the installed command starts with the NODE_OPTIONS scrub (POSIX and Windows forms)", () => {
+    const bin = join(work, "scrubbed-bin");
+    for (const platform of ["linux", "win32"] as const) {
+      const hooks = join(work, `scrubbed-hooks-${platform}.json`);
+      writeFileSync(hooks, JSON.stringify({
+        version: 1,
+        hooks: {
+          beforeShellExecution: [
+            { command: buildHookCommand(bin, "cursor-hook", "beforeShellExecution", platform), failClosed: true },
+          ],
+        },
+      }));
+      selfProtect._setHookConfigPathsForTests([hooks]);
+      expect(selfProtect.matchSelfProtect({ toolName: "Bash", command: `rm ${bin}` })?.rule_id, platform).toBe("SELF001");
+      expect(selfProtect.matchSelfProtect({ toolName: "Write", file_path: bin })?.rule_id, platform).toBe("SELF002");
+    }
   });
 
   it("is graceful when the hook file is unreadable and still blocks the standard binary name", () => {

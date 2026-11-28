@@ -1,6 +1,7 @@
 import { readFileSync, writeFileSync, existsSync, copyFileSync, mkdirSync } from "node:fs";
 import { dirname } from "node:path";
 import { claudeSettingsPath } from "../paths.js";
+import { buildHookCommand, isScrubbedHookCommand } from "./hook-command.js";
 import {
   DEFAULT_HOOK_TIMEOUT_S,
   DEFAULT_PRE_EXEC_HOOK_TIMEOUT_S,
@@ -73,11 +74,12 @@ function buildHookEntry(
   hookCommandPrefix: string,
   preExecTimeoutS: number,
 ): HookEntry {
-  // Final command shape: `<prefix> hook <Event>`.
-  // Claude Code settings.json uses `timeout` in seconds.
+  // Final command shape: `env -u NODE_OPTIONS <prefix> hook <Event>` (or the
+  // Windows cmd form), see hook-command.ts. Claude Code settings.json uses
+  // `timeout` in seconds.
   return {
     type: "command",
-    command: `${hookCommandPrefix} hook ${event}`,
+    command: buildHookCommand(hookCommandPrefix, "hook", event),
     timeout: claudeHookTimeoutForEvent(event, preExecTimeoutS),
     ...(CLAUDE_PRE_EXEC_SET.has(event) ? { onFailure: "block" as const } : {}),
   };
@@ -200,5 +202,36 @@ export function inspectClaudePreExecHook(
       preToolUseTimeoutS: null,
       preToolUseFailClosed: false,
     };
+  }
+}
+
+export interface ClaudeHookScrubCheck {
+  /** AgentReel hook entries found in settings.json. */
+  entries: number;
+  /** Entries whose command does not drop NODE_OPTIONS first (installed before the scrub existed). */
+  unscrubbed: number;
+}
+
+/** Counts AgentReel-managed Claude hook commands that do not scrub NODE_OPTIONS. */
+export function inspectClaudeHookScrub(
+  settingsPath: string = claudeSettingsPath(),
+): ClaudeHookScrubCheck {
+  if (!existsSync(settingsPath)) return { entries: 0, unscrubbed: 0 };
+  try {
+    const settings = readSettings(settingsPath);
+    let entries = 0;
+    let unscrubbed = 0;
+    for (const groups of Object.values(settings.hooks ?? {})) {
+      for (const g of groups ?? []) {
+        if (g.__agentreel !== CLAUDE_HOOK_MARKER) continue;
+        for (const h of g.hooks ?? []) {
+          entries += 1;
+          if (typeof h.command !== "string" || !isScrubbedHookCommand(h.command)) unscrubbed += 1;
+        }
+      }
+    }
+    return { entries, unscrubbed };
+  } catch {
+    return { entries: 0, unscrubbed: 0 };
   }
 }

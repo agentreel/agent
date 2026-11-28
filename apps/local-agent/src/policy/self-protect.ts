@@ -1,6 +1,7 @@
 import { readFileSync } from "node:fs";
 import { systemCursorHooksPath } from "../cursor/hooks-install.js";
 import { hookCommandBinaryPath } from "../managed/hook-path.js";
+import { stripHookScrubWrapper } from "../hooks/hook-command.js";
 import { claudeSettingsPath, cursorHooksPath } from "../paths.js";
 import { hasDisallowedNodeOptions } from "./node-options.js";
 
@@ -26,7 +27,13 @@ import { hasDisallowedNodeOptions } from "./node-options.js";
  * - SELF004: `disableAllHooks`, and `claude --settings` / `--setting-sources`.
  * - SELF005: unsetting or overriding HOME, CLAUDE_CONFIG_DIR, CLAUDECODE,
  *   CLAUDE_CODE_CHILD_SESSION, CURSOR_AGENT or AGENTREEL_* (`unset`,
- *   `env -u`, `env -i`, `export HOME=`, `HOME=... claude`).
+ *   `env -u`, `env -i`, `env -`, `export HOME=`, `export -n`,
+ *   `HOME=... claude`), and setting NODE_OPTIONS to anything off the allow
+ *   list in node-options.ts. These command-text rules apply only while an
+ *   enforcing org policy is loaded. The runtime NODE_OPTIONS check in
+ *   node-options-runtime.ts is separate, always on, and detection only: the
+ *   installed hook command (`env -u NODE_OPTIONS ...`) is what stops a
+ *   preload, see hooks/hook-command.ts.
  *
  * Best effort against string tricks: input is NFKC-normalized and quotes and
  * backslashes are stripped before matching. Every check is a single linear
@@ -43,7 +50,8 @@ export const SELF_PROTECT_NAMES: Record<SelfProtectMatch["rule_id"], string> = {
   SELF002: "edits to AgentReel, Claude Code or Cursor hook and policy files",
   SELF003: "uninstalling, pausing, logging out of AgentReel, or running agentreel managed",
   SELF004: "disabling hooks (disableAllHooks or claude --settings)",
-  SELF005: "unsetting or overriding HOME, CLAUDE_CONFIG_DIR, CLAUDECODE, CURSOR_AGENT or AGENTREEL_* variables",
+  SELF005:
+    "unsetting or overriding HOME, CLAUDE_CONFIG_DIR, CLAUDECODE, CLAUDE_CODE_CHILD_SESSION, CURSOR_AGENT or AGENTREEL_* variables, or setting NODE_OPTIONS to anything off the allow list",
 };
 
 /** Lowercased path fragments that mark a protected file or directory.
@@ -209,7 +217,7 @@ function hookBinariesFromConfig(): string[] {
       const commands: string[] = [];
       collectCommandStrings(JSON.parse(raw) as unknown, commands);
       for (const cmd of commands) {
-        const bin = hookCommandBinaryPath(cmd);
+        const bin = hookCommandBinaryPath(stripHookScrubWrapper(cmd));
         if (bin) out.push(bin);
       }
     } catch {

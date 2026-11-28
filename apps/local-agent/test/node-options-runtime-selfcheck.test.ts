@@ -1,4 +1,4 @@
-import { mkdtempSync, readFileSync, rmSync } from "node:fs";
+import { mkdtempSync, rmSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { afterEach, beforeEach, describe, expect, it } from "vitest";
@@ -6,10 +6,12 @@ import {
   envNodeOptionsIsDisallowed,
   enforceCliEnvNodeOptions,
   enforceHookEnvNodeOptions,
+  execArgvIsDisallowed,
+  RUNTIME_SELF005_EXEC_ARGV_MESSAGE,
   RUNTIME_SELF005_MESSAGE,
   RUNTIME_SELF005_RULE,
 } from "../src/policy/node-options-runtime.js";
-import { startAgentreelCli } from "../src/cli-start.js";
+import { HOOK_DENY_EXIT_CODE, startAgentreelCli } from "../src/cli-start.js";
 import { formatClaudePreToolUseDeny } from "../src/hooks/handler.js";
 import { cursorHookResponse } from "../src/cursor/hook-normalize.js";
 
@@ -128,7 +130,7 @@ describe("hook-runner startup self-check", () => {
   it("denies --require at the hook entry", () => {
     const logs: string[] = [];
     process.env.NODE_OPTIONS = "--require=/tmp/evil.js";
-    expect(enforceHookEnvNodeOptions({ log: (line) => logs.push(line) })).toBe(true);
+    expect(enforceHookEnvNodeOptions({ log: (line) => logs.push(line) })).toBe("node_options");
     expect(logs.join("")).toContain(RUNTIME_SELF005_RULE);
   });
 
@@ -156,6 +158,26 @@ describe("hook-runner startup self-check", () => {
     expect(out).toContain(formatClaudePreToolUseDeny(RUNTIME_SELF005_MESSAGE));
     expect(out).toContain("deny");
     expect(out).toContain("SELF005");
+  });
+
+  it("Claude events other than PreToolUse get no PreToolUse-shaped deny", async () => {
+    process.env.NODE_OPTIONS = "--require=/tmp/evil.js";
+    const { runHook } = await import("../src/hooks/handler.js");
+    for (const event of ["SessionStart", "UserPromptSubmit", "PostToolUse", "Stop"]) {
+      let out = "";
+      await runHook(event, {
+        readStdin: async () => "{}",
+        writeStdout: (s) => {
+          out += s;
+        },
+      });
+      expect(out, event).toBe("");
+    }
+  });
+
+  it("a preload flag in execArgv is denied at the hook entry too", () => {
+    expect(enforceHookEnvNodeOptions({ log: () => {}, execArgv: ["--require", "/tmp/e.js"] })).toBe("exec_argv");
+    expect(RUNTIME_SELF005_EXEC_ARGV_MESSAGE).toContain("SELF005");
   });
 
   it("Cursor hook entry writes a SELF005 deny and does not run the rest", async () => {
@@ -191,43 +213,182 @@ describe("hook-runner startup self-check", () => {
   it("denies -r, --import, --loader and --experimental-loader at the hook entry", () => {
     for (const value of ["-r /tmp/x.js", "--import=/tmp/x.mjs", "--loader=/tmp/l.mjs", "--experimental-loader=/tmp/l.mjs"]) {
       process.env.NODE_OPTIONS = value;
-      expect(enforceHookEnvNodeOptions({ log: () => {} })).toBe(true);
+      expect(enforceHookEnvNodeOptions({ log: () => {} })).toBe("node_options");
     }
   });
 
   it("allows listed flags, unset and empty at the hook entry", () => {
     process.env.NODE_OPTIONS = "--no-warnings --enable-source-maps";
-    expect(enforceHookEnvNodeOptions({ log: () => {} })).toBe(false);
+    expect(enforceHookEnvNodeOptions({ log: () => {}, execArgv: [] })).toBeNull();
     delete process.env.NODE_OPTIONS;
-    expect(enforceHookEnvNodeOptions({ log: () => {} })).toBe(false);
+    expect(enforceHookEnvNodeOptions({ log: () => {}, execArgv: [] })).toBeNull();
     process.env.NODE_OPTIONS = "";
-    expect(enforceHookEnvNodeOptions({ log: () => {} })).toBe(false);
+    expect(enforceHookEnvNodeOptions({ log: () => {}, execArgv: [] })).toBeNull();
   });
 
   it("denies unparseable input at the hook entry", () => {
     process.env.NODE_OPTIONS = '--no-warnings "--require=x';
-    expect(enforceHookEnvNodeOptions({ log: () => {} })).toBe(true);
+    expect(enforceHookEnvNodeOptions({ log: () => {} })).toBe("node_options");
   });
 });
 
-describe("CLI loads the rest of the app only after the self-check", () => {
-  it("entry and cli-start call the check before the dynamic import of the CLI", () => {
-    const entry = readFileSync(new URL("../src/entry.ts", import.meta.url), "utf8");
-    const start = readFileSync(new URL("../src/cli-start.ts", import.meta.url), "utf8");
-    expect(entry).toMatch(/startAgentreelCli\(\)/);
-    expect(start.indexOf("enforceCliEnvNodeOptions")).toBeGreaterThanOrEqual(0);
-    expect(start.indexOf("enforceCliEnvNodeOptions")).toBeLessThan(start.indexOf('import("./cli.js")'));
-  });
+describe("execArgv preload flags", () => {
+  const denied = [
+    ["--require", "/tmp/e.js"],
+    ["--require=/tmp/e.js"],
+    ["-r", "/tmp/e.js"],
+    ["-r=/tmp/e.js"],
+    ["-r/tmp/e.js"],
+    ["--import", "/tmp/e.mjs"],
+    ["--import=/tmp/e.mjs"],
+    ["--loader=/tmp/l.mjs"],
+    ["--experimental-loader", "/tmp/l.mjs"],
+    ["--eval", "1"],
+    ["-e", "1"],
+    ["-p", "1"],
+    ["--inspect"],
+    ["--inspect-brk=0"],
+    ["--conditions", "node", "--require", "/tmp/e.js"],
+    ["--REQUIRE=/tmp/e.js"],
+    ["--\uFF52equire=/tmp/e.js"],
+  ];
+  for (const argv of denied) {
+    it(`denies ${JSON.stringify(argv)}`, () => {
+      expect(execArgvIsDisallowed(argv)).toBe(true);
+    });
+  }
 
-  it("startAgentreelCli exits before loading the CLI when NODE_OPTIONS is disallowed", async () => {
+  const allowed = [
+    [],
+    ["--conditions", "node", "--conditions", "development"],
+    ["--max-old-space-size=4096"],
+    ["--enable-source-maps", "--no-warnings"],
+  ];
+  for (const argv of allowed) {
+    it(`allows ${JSON.stringify(argv)}`, () => {
+      expect(execArgvIsDisallowed(argv)).toBe(false);
+    });
+  }
+
+  it("CLI startup denies a preload flag in execArgv and exits 1", () => {
     const exits: number[] = [];
     const logs: string[] = [];
-    await startAgentreelCli({
-      value: "--require=/tmp/evil.js",
-      exit: (code) => exits.push(code),
-      log: (line) => logs.push(line),
-    });
+    expect(
+      enforceCliEnvNodeOptions({
+        value: undefined,
+        execArgv: ["--require", "/tmp/e.js"],
+        exit: (c) => exits.push(c),
+        log: (l) => logs.push(l),
+      }),
+    ).toBe(true);
     expect(exits).toEqual([1]);
     expect(logs.join("")).toContain(RUNTIME_SELF005_RULE);
+  });
+});
+
+describe("entry answers hook and cursor-hook with the host's deny and exit 2", () => {
+  async function entry(argv: string[], value = "--require=/tmp/evil.js") {
+    const exits: number[] = [];
+    let stdout = "";
+    let stderr = "";
+    const logs: string[] = [];
+    await startAgentreelCli({
+      value,
+      argv,
+      exit: (c) => exits.push(c),
+      log: (l) => logs.push(l),
+      writeStdout: (t) => {
+        stdout += t;
+      },
+      writeStderr: (t) => {
+        stderr += t;
+      },
+    });
+    return { exits, stdout, stderr, logs };
+  }
+
+  it("`hook PreToolUse` writes the Claude PreToolUse deny, a stderr reason, and exits 2", async () => {
+    const r = await entry(["hook", "PreToolUse"]);
+    expect(r.exits).toEqual([HOOK_DENY_EXIT_CODE]);
+    expect(HOOK_DENY_EXIT_CODE).toBe(2);
+    expect(JSON.parse(r.stdout)).toEqual({
+      hookSpecificOutput: {
+        hookEventName: "PreToolUse",
+        permissionDecision: "deny",
+        permissionDecisionReason: RUNTIME_SELF005_MESSAGE,
+      },
+    });
+    expect(r.stderr).toContain("SELF005");
+    expect(r.logs.join("")).toContain(RUNTIME_SELF005_RULE);
+  });
+
+  it("Claude events without a deny shape print nothing on stdout and exit 1 with the reason on stderr", async () => {
+    for (const event of ["SessionStart", "SessionEnd", "UserPromptSubmit", "PostToolUse", "Stop"]) {
+      const r = await entry(["hook", event]);
+      expect(r.exits, event).toEqual([1]);
+      expect(r.stdout, event).toBe("");
+      expect(r.stderr, event).toContain("SELF005");
+    }
+  });
+
+  it("`cursor-hook` pre-exec events write the Cursor deny shape and exit 2", async () => {
+    for (const event of ["preToolUse", "beforeShellExecution", "beforeMCPExecution", "beforeReadFile"]) {
+      const r = await entry(["cursor-hook", event]);
+      expect(r.exits, event).toEqual([2]);
+      const body = JSON.parse(r.stdout) as Record<string, unknown>;
+      expect(body.permission, event).toBe("deny");
+      expect(body.user_message, event).toBe(RUNTIME_SELF005_MESSAGE);
+      expect(r.stderr, event).toContain("SELF005");
+    }
+  });
+
+  it("`cursor-hook` with an unknown or missing event fails closed with the pre-exec shape", async () => {
+    for (const argv of [["cursor-hook", "somethingNew"], ["cursor-hook"]]) {
+      const r = await entry(argv);
+      expect(r.exits, argv.join(" ")).toEqual([2]);
+      expect((JSON.parse(r.stdout) as { permission: string }).permission).toBe("deny");
+    }
+  });
+
+  it("`cursor-hook` capture-only events print nothing and exit 1", async () => {
+    for (const event of ["afterFileEdit", "postToolUse", "stop"]) {
+      const r = await entry(["cursor-hook", event]);
+      expect(r.exits, event).toEqual([1]);
+      expect(r.stdout, event).toBe("");
+    }
+  });
+
+  it("finds the subcommand after leading flags", async () => {
+    const r = await entry(["--no-color", "hook", "PreToolUse"]);
+    expect(r.exits).toEqual([2]);
+  });
+
+  it("an execArgv preload is denied for hooks with exit 2 and the execArgv reason", async () => {
+    const exits: number[] = [];
+    let stdout = "";
+    let stderr = "";
+    await startAgentreelCli({
+      value: undefined,
+      execArgv: ["--import", "/tmp/e.mjs"],
+      argv: ["hook", "PreToolUse"],
+      exit: (c) => exits.push(c),
+      log: () => {},
+      writeStdout: (t) => {
+        stdout += t;
+      },
+      writeStderr: (t) => {
+        stderr += t;
+      },
+    });
+    expect(exits).toEqual([2]);
+    expect(stdout).toContain(RUNTIME_SELF005_EXEC_ARGV_MESSAGE);
+    expect(stderr).toContain("preload or loader flag");
+  });
+
+  it("other commands exit 1 and print no hook JSON", async () => {
+    const r = await entry(["doctor"]);
+    expect(r.exits).toEqual([1]);
+    expect(r.stdout).toBe("");
+    expect(r.logs.join("")).toContain(RUNTIME_SELF005_RULE);
   });
 });

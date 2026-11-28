@@ -12,12 +12,13 @@ import {
   type HeartbeatReason,
 } from "../heartbeat/heartbeat.js";
 import {
+  inspectCursorHookScrub,
   inspectCursorPreExecHooks,
   inspectSystemCursorHooks,
   systemCursorHooksPath,
   type SystemCursorHooksState,
 } from "../cursor/hooks-install.js";
-import { inspectClaudePreExecHook } from "../hooks/install.js";
+import { inspectClaudeHookScrub, inspectClaudePreExecHook } from "../hooks/install.js";
 import {
   claudeSettingsPath,
   cursorHooksPath,
@@ -82,6 +83,16 @@ export interface DoctorReport {
   expectedPreExecTimeoutS: number;
   maxPolicyApprovalExpiresS: number | null;
   needsReinit: boolean;
+  /**
+   * Installed hook commands that do not drop NODE_OPTIONS before Node starts
+   * (written before the scrub existed). They still get the in-process
+   * detection-only check; `agentreel init` rewrites them.
+   */
+  hookScrub: {
+    claude: { entries: number; unscrubbed: number };
+    cursor: { entries: number; unscrubbed: number };
+    needsMigration: boolean;
+  };
   heartbeat: { enabled: boolean; reason: HeartbeatReason; text: string };
   claude: {
     fileExists: boolean;
@@ -199,6 +210,11 @@ export function inspectDoctorState(opts: DoctorInspectOptions = {}): DoctorRepor
     maxPolicyApprovalExpiresS !== null &&
     maxPolicyApprovalExpiresS > cursorEffectiveTimeoutS - HOOK_DEADLINE_MARGIN_S;
 
+  const scrubClaude = inspectClaudeHookScrub(opts.claudeSettingsPath ?? claudeSettingsPath());
+  const scrubCursor = cursorManaged
+    ? { entries: 0, unscrubbed: 0 }
+    : inspectCursorHookScrub(opts.cursorHooksPath ?? cursorHooksPath());
+
   const orgLinked =
     (typeof cfg.orgSlug === "string" && cfg.orgSlug.length > 0) ||
     (loaded.source === "server_cache" && getPolicyOrgId(policy) !== null);
@@ -223,6 +239,11 @@ export function inspectDoctorState(opts: DoctorInspectOptions = {}): DoctorRepor
     expectedPreExecTimeoutS,
     maxPolicyApprovalExpiresS,
     needsReinit: claudeNeedsReinit || cursorNeedsReinit,
+    hookScrub: {
+      claude: scrubClaude,
+      cursor: scrubCursor,
+      needsMigration: scrubClaude.unscrubbed > 0 || scrubCursor.unscrubbed > 0,
+    },
     claude: {
       ...claudeRaw,
       timeoutOk: claudeTimeoutOk,
@@ -370,6 +391,18 @@ export function formatDoctorReport(report: DoctorReport): string {
       "",
       pc.yellow(
         `  warning:        policy max approval expires_s (${report.maxPolicyApprovalExpiresS}s) needs a longer hook timeout than installed for ${hosts.join(", ")}. Run \`npx @agentreel/agent init\` to update hook timeouts.`,
+      ),
+    );
+  }
+
+  if (report.hookScrub.needsMigration) {
+    const hosts: string[] = [];
+    if (report.hookScrub.claude.unscrubbed > 0) hosts.push(`claude (${report.hookScrub.claude.unscrubbed} of ${report.hookScrub.claude.entries})`);
+    if (report.hookScrub.cursor.unscrubbed > 0) hosts.push(`cursor (${report.hookScrub.cursor.unscrubbed} of ${report.hookScrub.cursor.entries})`);
+    lines.push(
+      "",
+      pc.yellow(
+        `  warning:        installed hook commands for ${hosts.join(", ")} do not drop NODE_OPTIONS before Node starts, so a preload in NODE_OPTIONS can still run first. Run \`npx @agentreel/agent init\` to rewrite them.`,
       ),
     );
   }

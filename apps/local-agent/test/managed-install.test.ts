@@ -26,6 +26,7 @@ import { applyManagedInstall, planManagedInstall, underRoot } from "../src/manag
 import { managedInstallCommand, resolveInvokingUserHome } from "../src/commands/managed.js";
 import { removeCursorUserHooks } from "../src/managed/pack.js";
 import { installClaudeCodeHooks } from "../src/hooks/install.js";
+import { buildHookCommand, stripHookScrubWrapper } from "../src/hooks/hook-command.js";
 import { installCursorHooks, uninstallCursorHooks } from "../src/cursor/hooks-install.js";
 import { CURSOR_HOOK_EVENTS } from "../src/cursor/hook-normalize.js";
 import { shouldSkipTelemetryForArgv } from "../src/telemetry.js";
@@ -112,7 +113,10 @@ describe("managed pack builders", () => {
       const managedClaude = buildClaudeManagedHooks({ hookCommand: HOOK });
       expect(Object.keys(managedClaude).sort()).toEqual(Object.keys(userClaude).sort());
       for (const [event, groups] of Object.entries(managedClaude)) {
-        expect(groups[0]!.hooks[0]!).toEqual(userClaude[event][0].hooks[0]);
+        // The per-user installer now drops NODE_OPTIONS first; the managed pack
+        // (src/managed/*) does not yet, so compare the command it wraps.
+        const user = userClaude[event][0].hooks[0];
+        expect(groups[0]!.hooks[0]!).toEqual({ ...user, command: stripHookScrubWrapper(user.command) });
         expect(groups[0]!.matcher).toBe(userClaude[event][0].matcher);
         expect(groups[0]!.__agentreel).toBe(userClaude[event][0].__agentreel);
       }
@@ -120,7 +124,8 @@ describe("managed pack builders", () => {
       const managedCursor = buildCursorManagedHooks({ hookCommand: HOOK });
       expect(Object.keys(managedCursor).sort()).toEqual(Object.keys(userCursor).sort());
       for (const [event, defs] of Object.entries(managedCursor)) {
-        expect(defs[0]!).toEqual(userCursor[event][0]);
+        const user = userCursor[event][0];
+        expect(defs[0]!).toEqual({ ...user, command: stripHookScrubWrapper(user.command) });
       }
     } finally {
       rmSync(home, { recursive: true, force: true });
@@ -360,7 +365,7 @@ describe("removing AgentReel's entries from the user's ~/.cursor/hooks.json", ()
     expect(filesUnder(root)).toEqual([path]);
     const out = lines.join("\n");
     expect(out).toContain(`Cursor user hooks (removing AgentReel's entries; the managed file replaces them)`);
-    expect(out).toContain(`-        "command": "${HOOK} cursor-hook beforeShellExecution",`);
+    expect(out).toContain(`-        "command": ${JSON.stringify(buildHookCommand(HOOK, "cursor-hook", "beforeShellExecution"))},`);
     expect(out).toContain("would update");
   });
 
