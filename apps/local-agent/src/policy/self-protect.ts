@@ -28,8 +28,10 @@ import { hasDisallowedNodeOptions } from "./node-options.js";
  * - SELF005: unsetting or overriding HOME, CLAUDE_CONFIG_DIR, CLAUDECODE,
  *   CLAUDE_CODE_CHILD_SESSION, CURSOR_AGENT or AGENTREEL_* (`unset`,
  *   `env -u`, `env -i`, `env -`, `export HOME=`, `export -n`,
- *   `HOME=... claude`), and setting NODE_OPTIONS to anything off the allow
- *   list in node-options.ts. These command-text rules apply only while an
+ *   `export -n`, `declare` / `typeset` (including `-n`), `HOME=... claude`),
+ *   setting NODE_OPTIONS to anything off the allow list in node-options.ts,
+ *   `npm config set node-options`, or writing `node-options` to `~/.npmrc`.
+ *   These command-text rules apply only while an
  *   enforcing org policy is loaded. The runtime NODE_OPTIONS check in
  *   node-options-runtime.ts is separate, always on, and detection only: the
  *   installed hook command (`env -u NODE_OPTIONS ...`) is what stops a
@@ -51,7 +53,7 @@ export const SELF_PROTECT_NAMES: Record<SelfProtectMatch["rule_id"], string> = {
   SELF003: "uninstalling, pausing, logging out of AgentReel, or running agentreel managed",
   SELF004: "disabling hooks (disableAllHooks or claude --settings)",
   SELF005:
-    "unsetting or overriding HOME, CLAUDE_CONFIG_DIR, CLAUDECODE, CLAUDE_CODE_CHILD_SESSION, CURSOR_AGENT or AGENTREEL_* variables, or setting NODE_OPTIONS to anything off the allow list",
+    "unsetting or overriding HOME, CLAUDE_CONFIG_DIR, CLAUDECODE, CLAUDE_CODE_CHILD_SESSION, CURSOR_AGENT or AGENTREEL_* variables, setting NODE_OPTIONS off the allow list, or setting npm node-options (npm config set or ~/.npmrc)",
 };
 
 /** Lowercased path fragments that mark a protected file or directory.
@@ -410,6 +412,18 @@ function checkCommand(command: string): SelfProtectMatch | null {
       }
     }
 
+    // SELF005: npm (and pnpm/yarn/bun) can inject NODE_OPTIONS into a child
+    // from `npm config set node-options` or a `node-options=` line in .npmrc.
+    if (["npm", "pnpm", "yarn", "bun"].includes(prog)) {
+      const cfg = args.indexOf("config");
+      if (cfg >= 0 && args[cfg + 1] === "set") {
+        if (args.slice(cfg + 2).some((a) => /^node-options\b/i.test(a))) return m("SELF005");
+      }
+    }
+    if (!readOnly && /(?:^|[\s/'"])(?:~\/)?\.npmrc\b/i.test(seg) && /node-options/i.test(seg)) {
+      return m("SELF005");
+    }
+
     // SELF003: uninstall, logout, pause.
     const agentIdx = toks.findIndex(
       (t, i) => basename(t) === "agentreel" || /^@agentreel\/agent(@|$)/.test(t) || i === cliIdx,
@@ -481,13 +495,17 @@ export function matchSelfProtect(input: SelfProtectInput): SelfProtectMatch | nu
     if (input.file_path && !READ_TOOLS.test(tool) && isProtectedPath(input.file_path.normalize("NFKC"))) {
       return m("SELF002");
     }
-    // Content written by a tool that turns hooks off.
+    // Content written by a tool that turns hooks off, or that would make
+    // npm inject NODE_OPTIONS into hook processes started with npx.
     const ti = input.toolInput;
     if (!READ_TOOLS.test(tool) && ti && typeof ti === "object" && !Array.isArray(ti)) {
       const rec = ti as Record<string, unknown>;
+      const npmrc = input.file_path && /(?:^|[\\/])\.npmrc$/i.test(input.file_path.replace(/\\/g, "/"));
       for (const k of ["content", "new_string", "contents", "text"]) {
         const v = rec[k];
-        if (typeof v === "string" && v.includes("disableAllHooks")) return m("SELF004");
+        if (typeof v !== "string") continue;
+        if (v.includes("disableAllHooks")) return m("SELF004");
+        if (npmrc && /node-options/i.test(v)) return m("SELF005");
       }
     }
     return null;

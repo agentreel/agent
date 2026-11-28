@@ -177,6 +177,9 @@ describe("inspectHookCommandPath", () => {
     expect(hookCommandBinaryPath(buildHookCommand("/usr/local/bin/agentreel", "hook", "PreToolUse", "win32"))).toBe(
       "/usr/local/bin/agentreel",
     );
+    expect(
+      hookCommandBinaryPath(buildHookCommand("/usr/local/bin/agentreel", "cursor-hook", "beforeShellExecution", "win32")),
+    ).toBe("/usr/local/bin/agentreel");
   });
 });
 

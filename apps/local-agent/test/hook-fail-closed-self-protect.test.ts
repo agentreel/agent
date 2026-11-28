@@ -785,6 +785,15 @@ const DENIED: Array<[string, string]> = [
   ["SELF005", "env -u HOME claude"],
   ["SELF005", "env -i bash"],
   ["SELF005", "export HOME=/tmp/empty"],
+  ["SELF005", "export -n HOME"],
+  ["SELF005", "declare HOME=/tmp/empty"],
+  ["SELF005", "declare -n HOME"],
+  ["SELF005", "typeset HOME=/tmp/empty"],
+  ["SELF005", "typeset -n HOME"],
+  ["SELF005", "npm config set node-options --require=/tmp/evil.js"],
+  ["SELF005", "npm config set node-options=--require=/tmp/evil.js"],
+  ["SELF005", "pnpm config set node-options --require=/tmp/evil.js"],
+  ["SELF005", "echo node-options=--require=/tmp/x.js >> ~/.npmrc"],
   ["SELF005", "HOME=/tmp/empty claude -p hi"],
   ["SELF005", "CLAUDE_CONFIG_DIR=/tmp/c claude"],
   ["SELF003", "node /usr/local/lib/node_modules/@agentreel/agent/dist/cli.js managed install --hook-command /tmp/evil"],
@@ -941,6 +950,33 @@ describe("(d) self-protect matcher", () => {
     expect(
       selfProtect.matchSelfProtect({ toolName: "Write", file_path: "/tmp/s.json", toolInput: { content: '{"disableAllHooks":true}' } })?.rule_id,
     ).toBe("SELF004");
+  });
+
+  it("denies writing node-options into .npmrc, but not other .npmrc edits", () => {
+    expect(
+      selfProtect.matchSelfProtect({
+        toolName: "Write",
+        file_path: "/home/alice/.npmrc",
+        toolInput: { content: "node-options=--require /tmp/evil.js\n" },
+      })?.rule_id,
+    ).toBe("SELF005");
+    expect(
+      selfProtect.matchSelfProtect({
+        toolName: "Edit",
+        file_path: "~/.npmrc",
+        toolInput: { new_string: "node-options=--import /tmp/evil.mjs" },
+      })?.rule_id,
+    ).toBe("SELF005");
+    expect(
+      selfProtect.matchSelfProtect({
+        toolName: "Write",
+        file_path: "/home/alice/.npmrc",
+        toolInput: { content: "fund=false\n" },
+      }),
+    ).toBeNull();
+    expect(
+      selfProtect.matchSelfProtect({ toolName: "Bash", command: "npm config set fund false" }),
+    ).toBeNull();
   });
 
   it("stays linear on 200k-character inputs", () => {

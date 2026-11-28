@@ -230,6 +230,11 @@ function writeUserHooksFile(path: string, content: string): UserHooksWrite {
     fs.fsyncSync(tmpFd);
     fs.closeSync(tmpFd);
     tmpFd = null;
+    // Windows refuses to replace a file that still has an open handle.
+    if (origFd !== null) {
+      fs.closeSync(origFd);
+      origFd = null;
+    }
     (_userHooksWriteForTests.rename ?? fs.renameSync)(tmpPath, path);
     tmpPath = null;
     return { ok: true, backup: b };
@@ -422,8 +427,8 @@ export type InstallCursorHooksResult =
     };
 
 /**
- * Add `env -u NODE_OPTIONS <prefix> cursor-hook <event>` (Windows: the cmd form,
- * see hooks/hook-command.ts) to ~/.cursor/hooks.json for every hook.
+ * Add a NODE_OPTIONS-scrubbed `<prefix> cursor-hook <event>` (POSIX env -u,
+ * Windows PowerShell form; see hooks/hook-command.ts) to ~/.cursor/hooks.json.
  * Pre-exec hooks receive the longer approval timeout (in seconds); other hooks
  * keep the default 5s timeout. Re-running replaces our previous entries idempotently.
  */

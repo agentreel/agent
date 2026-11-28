@@ -104,23 +104,26 @@ describe("managed pack builders", () => {
     expect(hooks.afterFileEdit![0]).toEqual({ command: posix("cursor-hook", "afterFileEdit"), timeout: 5 });
   });
 
-  it("Windows managed hook commands use cmd to drop NODE_OPTIONS, not env -u", () => {
+  it("Windows managed Claude hooks use the POSIX env -u form with shell bash; Cursor uses PowerShell", () => {
     const claude = buildClaudeManagedHooks({ hookCommand: HOOK, platform: "win32" });
     expect(claude.PreToolUse![0]!.hooks[0]).toEqual({
       type: "command",
       command: win("hook", "PreToolUse"),
+      shell: "bash",
       timeout: 130,
       onFailure: "block",
     });
-    expect(win("hook", "PreToolUse")).toContain("cmd /d /s /c");
-    expect(win("hook", "PreToolUse")).toContain("set NODE_OPTIONS=");
-    expect(win("hook", "PreToolUse")).not.toContain("env -u");
+    expect(win("hook", "PreToolUse")).toContain("env -u NODE_OPTIONS -u npm_config_node_options");
+    expect(win("hook", "PreToolUse")).not.toContain("cmd /d");
     const cursor = buildCursorManagedHooks({ hookCommand: HOOK, platform: "win32" });
     expect(cursor.beforeShellExecution![0]).toEqual({
       command: win("cursor-hook", "beforeShellExecution"),
       timeout: 130,
       failClosed: true,
     });
+    expect(win("cursor-hook", "beforeShellExecution")).toContain("Remove-Item Env:NODE_OPTIONS");
+    expect(win("cursor-hook", "beforeShellExecution")).toContain("Remove-Item Env:npm_config_node_options");
+    expect(win("cursor-hook", "beforeShellExecution")).not.toContain("cmd /d");
   });
 
   it("uses the same events, commands and timeouts as the per-user installers", () => {

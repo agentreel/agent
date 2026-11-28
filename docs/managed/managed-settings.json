@@ -17,7 +17,7 @@
         "hooks": [
           {
             "type": "command",
-            "command": "env -u NODE_OPTIONS /usr/local/bin/agentreel hook SessionStart",
+            "command": "env -u NODE_OPTIONS -u npm_config_node_options /usr/local/bin/agentreel hook SessionStart",
             "timeout": 5
           }
         ]
@@ -30,7 +30,7 @@
         "hooks": [
           {
             "type": "command",
-            "command": "env -u NODE_OPTIONS /usr/local/bin/agentreel hook SessionEnd",
+            "command": "env -u NODE_OPTIONS -u npm_config_node_options /usr/local/bin/agentreel hook SessionEnd",
             "timeout": 5
           }
         ]
@@ -43,7 +43,7 @@
         "hooks": [
           {
             "type": "command",
-            "command": "env -u NODE_OPTIONS /usr/local/bin/agentreel hook UserPromptSubmit",
+            "command": "env -u NODE_OPTIONS -u npm_config_node_options /usr/local/bin/agentreel hook UserPromptSubmit",
             "timeout": 5
           }
         ]
@@ -56,7 +56,7 @@
         "hooks": [
           {
             "type": "command",
-            "command": "env -u NODE_OPTIONS /usr/local/bin/agentreel hook PreToolUse",
+            "command": "env -u NODE_OPTIONS -u npm_config_node_options /usr/local/bin/agentreel hook PreToolUse",
             "timeout": 130,
             "onFailure": "block"
           }
@@ -70,7 +70,7 @@
         "hooks": [
           {
             "type": "command",
-            "command": "env -u NODE_OPTIONS /usr/local/bin/agentreel hook PostToolUse",
+            "command": "env -u NODE_OPTIONS -u npm_config_node_options /usr/local/bin/agentreel hook PostToolUse",
             "timeout": 5
           }
         ]
@@ -83,7 +83,7 @@
         "hooks": [
           {
             "type": "command",
-            "command": "env -u NODE_OPTIONS /usr/local/bin/agentreel hook Notification",
+            "command": "env -u NODE_OPTIONS -u npm_config_node_options /usr/local/bin/agentreel hook Notification",
             "timeout": 5
           }
         ]
@@ -96,7 +96,7 @@
         "hooks": [
           {
             "type": "command",
-            "command": "env -u NODE_OPTIONS /usr/local/bin/agentreel hook Stop",
+            "command": "env -u NODE_OPTIONS -u npm_config_node_options /usr/local/bin/agentreel hook Stop",
             "timeout": 5
           }
         ]
@@ -109,7 +109,7 @@
         "hooks": [
           {
             "type": "command",
-            "command": "env -u NODE_OPTIONS /usr/local/bin/agentreel hook SubagentStop",
+            "command": "env -u NODE_OPTIONS -u npm_config_node_options /usr/local/bin/agentreel hook SubagentStop",
             "timeout": 5
           }
         ]
@@ -122,7 +122,7 @@
         "hooks": [
           {
             "type": "command",
-            "command": "env -u NODE_OPTIONS /usr/local/bin/agentreel hook PreCompact",
+            "command": "env -u NODE_OPTIONS -u npm_config_node_options /usr/local/bin/agentreel hook PreCompact",
             "timeout": 5
           }
         ]

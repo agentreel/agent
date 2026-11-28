@@ -17,9 +17,11 @@
  *    for `hook` and `cursor-hook` a deny with exit 2 (see cli-start.ts).
  *
  * What prevents the bypass is the installed hook command, which starts with
- * `env -u NODE_OPTIONS` (Windows: `cmd /d /s /c "set NODE_OPTIONS=&& ..."`),
- * see hooks/hook-command.ts. A preload never loads there, so there is
- * nothing to hide. Hooks installed before that change keep the weaker,
+ * `env -u NODE_OPTIONS -u npm_config_node_options` (Claude on Windows: the
+ * same form with `shell: "bash"`; Cursor on Windows: PowerShell
+ * `Remove-Item Env:NODE_OPTIONS` / `Env:npm_config_node_options`). See
+ * hooks/hook-command.ts. A preload never loads there, so there is nothing
+ * to hide. Hooks installed before that change keep the weaker,
  * detection-only behaviour until `agentreel init` is run again; `agentreel
  * doctor` reports them.
  *

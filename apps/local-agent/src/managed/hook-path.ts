@@ -46,8 +46,9 @@ export interface InspectHookPathOptions {
 export function hookCommandBinaryPath(hookCommand: string): string | null {
   const trimmed = stripHookScrubWrapper(hookCommand).trim();
   if (!trimmed) return null;
-  if (trimmed.startsWith('"')) {
-    const end = trimmed.indexOf('"', 1);
+  if (trimmed.startsWith('"') || trimmed.startsWith("'")) {
+    const q = trimmed[0]!;
+    const end = trimmed.indexOf(q, 1);
     if (end <= 1) return null;
     const inside = trimmed.slice(1, end);
     return inside || null;

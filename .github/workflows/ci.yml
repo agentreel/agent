@@ -98,4 +98,4 @@ jobs:
 
       - name: Hook self-check tests
         working-directory: apps/local-agent
-        run: pnpm exec vitest run test/node-options-selfcheck-bundle.test.ts test/hook-command-scrub.test.ts test/managed-install.test.ts
+        run: pnpm exec vitest run test/node-options-selfcheck-bundle.test.ts test/hook-command-scrub.test.ts

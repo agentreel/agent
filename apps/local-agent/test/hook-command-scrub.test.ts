@@ -4,6 +4,7 @@ import { dirname, join } from "node:path";
 import { afterAll, beforeEach, describe, expect, it } from "vitest";
 import {
   buildHookCommand,
+  buildHookInvocation,
   isScrubbedHookCommand,
   stripHookScrubWrapper,
 } from "../src/hooks/hook-command.js";
@@ -22,31 +23,70 @@ afterAll(() => rmSync(home, { recursive: true, force: true }));
 
 const BIN = "/usr/local/bin/agentreel";
 
+describe("quotePath", () => {
+  it("leaves a simple path unquoted", () => {
+    expect(quotePath("/usr/local/bin/agentreel")).toBe("/usr/local/bin/agentreel");
+  });
+
+  it("quotes spaces and escapes $, backticks, double quotes and backslashes", () => {
+    expect(quotePath("/a b/cli.js")).toBe('"/a b/cli.js"');
+    expect(quotePath("/tmp/$(id)/cli.js")).toBe('"/tmp/\\$(id)/cli.js"');
+    expect(quotePath("/tmp/`id`/cli.js")).toBe('"/tmp/\\`id\\`/cli.js"');
+    expect(quotePath('/tmp/say"hi')).toBe('"/tmp/say\\"hi"');
+    expect(quotePath("C:\\Program Files\\agentreel\\cli.js")).toBe(
+      '"C:\\\\Program Files\\\\agentreel\\\\cli.js"',
+    );
+  });
+});
+
 describe("buildHookCommand", () => {
-  it("POSIX: drops NODE_OPTIONS with env -u before the program", () => {
+  const posixScrub = "env -u NODE_OPTIONS -u npm_config_node_options ";
+
+  it("POSIX: drops NODE_OPTIONS and npm_config_node_options with env -u before the program", () => {
     expect(buildHookCommand(BIN, "hook", "PreToolUse", "linux")).toBe(
-      "env -u NODE_OPTIONS /usr/local/bin/agentreel hook PreToolUse",
+      posixScrub + "/usr/local/bin/agentreel hook PreToolUse",
     );
     expect(buildHookCommand(BIN, "cursor-hook", "beforeShellExecution", "darwin")).toBe(
-      "env -u NODE_OPTIONS /usr/local/bin/agentreel cursor-hook beforeShellExecution",
+      posixScrub + "/usr/local/bin/agentreel cursor-hook beforeShellExecution",
     );
+    expect(isScrubbedHookCommand(`env -u NODE_OPTIONS ${BIN} hook Stop`)).toBe(false);
   });
 
-  it("Windows: unsets NODE_OPTIONS in cmd.exe, not with env -u", () => {
-    const cmd = buildHookCommand('"C:\\Program Files\\agentreel\\cli.js"', "hook", "PreToolUse", "win32");
-    expect(cmd).toBe(
-      'cmd /d /s /c "set NODE_OPTIONS=&& "C:\\Program Files\\agentreel\\cli.js" hook PreToolUse"',
+  it("Claude on Windows uses the POSIX env -u form and sets shell bash (Git Bash is the default host shell)", () => {
+    const inv = buildHookInvocation('"C:\\Program Files\\agentreel\\cli.js"', "hook", "PreToolUse", "win32");
+    expect(inv.shell).toBe("bash");
+    expect(inv.command).toBe(
+      posixScrub + '"C:\\Program Files\\agentreel\\cli.js" hook PreToolUse',
     );
+    expect(inv.command).not.toContain("cmd /d");
+    expect(buildHookInvocation(BIN, "hook", "Stop", "linux").shell).toBeUndefined();
+  });
+
+  it("Cursor on Windows uses PowerShell to drop NODE_OPTIONS, not cmd or env -u", () => {
+    const cmd = buildHookCommand('"C:\\Program Files\\agentreel\\cli.js"', "cursor-hook", "beforeShellExecution", "win32");
+    expect(cmd).toContain("Remove-Item Env:NODE_OPTIONS");
+    expect(cmd).toContain("Remove-Item Env:npm_config_node_options");
+    expect(cmd).toContain("& 'C:\\Program Files\\agentreel\\cli.js'");
+    expect(cmd).toContain("cursor-hook beforeShellExecution");
+    expect(cmd).not.toContain("cmd /d");
     expect(cmd).not.toContain("env -u");
+    expect(buildHookInvocation(BIN, "cursor-hook", "beforeShellExecution", "win32").shell).toBeUndefined();
   });
 
-  it("keeps quoted and npx prefixes intact", () => {
+  it("keeps quoted and npx prefixes intact, and adds --node-options= for npx and bunx", () => {
     expect(buildHookCommand(quotePath("/a b/cli.js"), "hook", "Stop", "linux")).toBe(
-      'env -u NODE_OPTIONS "/a b/cli.js" hook Stop',
+      posixScrub + '"/a b/cli.js" hook Stop',
     );
     expect(buildHookCommand("npx -y @agentreel/agent", "hook", "Stop", "linux")).toBe(
-      "env -u NODE_OPTIONS npx -y @agentreel/agent hook Stop",
+      posixScrub + "npx --node-options= -y @agentreel/agent hook Stop",
     );
+    expect(buildHookCommand("bunx -y @agentreel/agent", "hook", "Stop", "linux")).toBe(
+      posixScrub + "bunx --node-options= -y @agentreel/agent hook Stop",
+    );
+    expect(buildHookCommand("npx --node-options= -y @agentreel/agent", "hook", "Stop", "linux")).toBe(
+      posixScrub + "npx --node-options= -y @agentreel/agent hook Stop",
+    );
+    expect(isScrubbedHookCommand(posixScrub + "npx -y @agentreel/agent hook Stop")).toBe(false);
   });
 
   it("does not wrap a command twice", () => {
@@ -57,14 +97,17 @@ describe("buildHookCommand", () => {
   });
 
   it("isScrubbedHookCommand and stripHookScrubWrapper round-trip on both forms", () => {
-    for (const platform of ["linux", "win32"] as const) {
-      const cmd = buildHookCommand(BIN, "hook", "Stop", platform);
-      expect(isScrubbedHookCommand(cmd), platform).toBe(true);
-      expect(stripHookScrubWrapper(cmd), platform).toBe(`${BIN} hook Stop`);
-    }
+    const posix = buildHookCommand(BIN, "hook", "Stop", "linux");
+    expect(isScrubbedHookCommand(posix)).toBe(true);
+    expect(stripHookScrubWrapper(posix)).toBe(`${BIN} hook Stop`);
+    const claudeWin = buildHookCommand(BIN, "hook", "Stop", "win32");
+    expect(isScrubbedHookCommand(claudeWin)).toBe(true);
+    expect(stripHookScrubWrapper(claudeWin)).toBe(`${BIN} hook Stop`);
+    const cursorWin = buildHookCommand(BIN, "cursor-hook", "Stop", "win32");
+    expect(isScrubbedHookCommand(cursorWin)).toBe(true);
+    expect(stripHookScrubWrapper(cursorWin)).toContain(BIN);
     expect(isScrubbedHookCommand(`${BIN} hook Stop`)).toBe(false);
     expect(stripHookScrubWrapper(`${BIN} hook Stop`)).toBe(`${BIN} hook Stop`);
-    // Only the exact NODE_OPTIONS scrub counts, not any other env wrapper.
     expect(isScrubbedHookCommand(`env -u HOME ${BIN} hook Stop`)).toBe(false);
     expect(isScrubbedHookCommand(`env ${BIN} hook Stop`)).toBe(false);
   });
@@ -88,6 +131,8 @@ describe("installers write the scrubbed command and re-install migrates old entr
       const entry = groups[0]!.hooks[0]!;
       expect(entry.command, event).toBe(buildHookCommand(BIN, "hook", event));
       expect(isScrubbedHookCommand(entry.command), event).toBe(true);
+      const inv = buildHookInvocation(BIN, "hook", event);
+      expect(entry.shell, event).toBe(inv.shell);
     }
     expect(settings.hooks.PreToolUse![0]!.hooks[0]!.onFailure).toBe("block");
     expect(inspectClaudeHookScrub(claudePath)).toEqual({ entries: 9, unscrubbed: 0 });

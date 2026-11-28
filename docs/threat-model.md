@@ -24,7 +24,7 @@ Where you see a code:
 | SELF002 | A Write/Edit-style tool call would change one of those same protected files. |
 | SELF003 | The command would uninstall, log out of, or pause AgentReel, remove the `@agentreel/agent` package, or run `agentreel managed` other than `--dry-run`. |
 | SELF004 | The command would disable hooks (`disableAllHooks`, or `claude --settings` / `--setting-sources`). |
-| SELF005 | The command would unset or override a protected environment variable (`HOME`, `CLAUDE_CONFIG_DIR`, `CLAUDECODE`, `CLAUDE_CODE_CHILD_SESSION`, `CURSOR_AGENT`, or `AGENTREEL_*`), or set `NODE_OPTIONS` to anything off the six-flag allow list. Command-text triggers: `unset NAME`, `export NAME=...`, `export -n NAME`, `NAME=... claude` (and `cursor`, `cursor-agent`, `code`), `env -u NAME` / `env --unset=NAME`, and `env -i` / `env --ignore-environment` / `env -` (which clear all of them). At runtime: `process.env.NODE_OPTIONS` off the allow list, or a preload, loader, eval or inspector flag in `process.execArgv`. A visible runtime failure on `hook PreToolUse` and `cursor-hook` pre-exec events exits 2 with deny JSON; `hook Stop` and the other lifecycle or capture-only events exit 1 with the reason (see below). |
+| SELF005 | The command would unset or override a protected environment variable (`HOME`, `CLAUDE_CONFIG_DIR`, `CLAUDECODE`, `CLAUDE_CODE_CHILD_SESSION`, `CURSOR_AGENT`, or `AGENTREEL_*`), or set `NODE_OPTIONS` to anything off the six-flag allow list. Command-text triggers: `unset NAME`, `export NAME=...`, `export -n NAME`, `declare` / `typeset` (including `declare -n` and `typeset -n`), `NAME=... claude` (and `cursor`, `cursor-agent`, `code`), `env -u NAME` / `env --unset=NAME`, and `env -i` / `env --ignore-environment` / `env -` (which clear all of them). Also `npm` / `pnpm` / `yarn` / `bun config set node-options`, and a write or edit of `~/.npmrc` (or another `.npmrc`) whose content sets `node-options`. At runtime: `process.env.NODE_OPTIONS` off the allow list, or a preload, loader, eval or inspector flag in `process.execArgv`. A visible runtime failure on `hook PreToolUse` and `cursor-hook` pre-exec events exits 2 with deny JSON; `hook Stop` and the other lifecycle or capture-only events exit 1 with the reason (see below). |
 
 Runtime SELF005 exit codes: `hook PreToolUse` and the Cursor pre-exec events (`preToolUse`, `beforeShellExecution`, `beforeMCPExecution`, `beforeReadFile`) print the host deny JSON, print the reason on stderr, and exit 2, which Claude Code and Cursor treat as a block. `hook Stop` and the other Claude lifecycle events (`SessionStart`, `SessionEnd`, `UserPromptSubmit`, `PostToolUse`, `Notification`, `SubagentStop`, `PreCompact`) and Cursor capture-only hooks have no deny shape, so they print the reason on stderr and exit 1, not 2. Exit 2 on `Stop` is "keep going" in Claude Code and would prevent the session from ending.
 
@@ -52,17 +52,21 @@ that any in-process check sees nothing. This was confirmed on the built
 bundle for `--require`, `-r` and `--import`.
 
 So the hook commands that `agentreel init` and `agentreel managed install`
-write drop `NODE_OPTIONS` before Node starts:
+write drop `NODE_OPTIONS` and `npm_config_node_options` before Node starts.
+`npx` and `bunx` prefixes also get `--node-options=` (empty), because npm
+would otherwise inject `NODE_OPTIONS` from `~/.npmrc` or
+`npm_config_node_options` after `env -u NODE_OPTIONS` alone:
 
 | Host | Installed command |
 | --- | --- |
-| macOS, Linux | `env -u NODE_OPTIONS <agentreel> hook <Event>` (Cursor: `cursor-hook <event>`) |
-| Windows | `cmd /d /s /c "set NODE_OPTIONS=&& <agentreel> hook <Event>"` |
+| macOS, Linux | `env -u NODE_OPTIONS -u npm_config_node_options <agentreel> hook <Event>` (Cursor: `cursor-hook <event>`). An `npx` or `bunx` prefix also gets `--node-options=`. |
+| Windows, Claude Code | The same POSIX `env -u` form, with the hook entry's `shell` field set to `"bash"`. Claude Code's default host shell on Windows is Git Bash when Git is installed. The older `cmd /d /s /c "set NODE_OPTIONS=&& ..."` form is mis-tokenized there: a path with spaces breaks the command, and `/d` `/s` `/c` can be path-mangled, which would block every PreToolUse and stop lifecycle capture. If bash is missing, PreToolUse fails closed via `onFailure: "block"`. |
+| Windows, Cursor | PowerShell: `Remove-Item Env:NODE_OPTIONS` and `Env:npm_config_node_options`, then the prefix and `cursor-hook` event. Cursor has no hook `shell` field; the desktop app runs hooks through PowerShell. |
 
-A preload set in `NODE_OPTIONS` never loads in the hook process. If `env` or
-`cmd` cannot be started the command fails: Claude Code PreToolUse entries are
-written with `onFailure: "block"` and Cursor pre-exec entries with
-`failClosed: true`, so the tool call is denied.
+A preload set in `NODE_OPTIONS` never loads in the hook process. If `env`
+or PowerShell cannot be started the command fails: Claude Code PreToolUse
+entries are written with `onFailure: "block"` and Cursor pre-exec entries
+with `failClosed: true`, so the tool call is denied.
 
 Limits:
 
@@ -70,13 +74,20 @@ Limits:
   warns about them. Users must re-run `agentreel init` (or `agentreel managed
   install` for a managed pack) to get the scrubbed hook commands.
 - The managed pack writes the same scrubbed commands as the per-user
-  installers (`env -u` on linux and darwin, `cmd` when the builders are asked
-  for win32). `agentreel managed install` itself still supports only Linux,
-  WSL and macOS.
-- Hook commands run through a POSIX shell on Windows (for example Git Bash),
-  and a custom `AGENTREEL_HOOK_COMMAND`, are untested.
-- Only `NODE_OPTIONS` is scrubbed. Other ways to run code in a process the
-  agent starts, such as a modified `PATH` or `node` binary, are out of scope.
+  installers (POSIX `env -u` on linux and darwin, and the Claude `shell:
+  "bash"` / Cursor PowerShell forms when the builders are asked for win32).
+  `agentreel managed install` itself still supports only Linux, WSL and
+  macOS.
+- The windows-latest CI job runs the installed command through Git Bash
+  `bash.exe` (Claude) and Windows PowerShell (Cursor), including a prefix
+  path with spaces. A custom `AGENTREEL_HOOK_COMMAND` is still untested as
+  a host integration.
+- Only `NODE_OPTIONS` and `npm_config_node_options` are scrubbed (plus
+  `--node-options=` for `npx` / `bunx`). A shell rc file (`bashrc` and
+  friends) or `launchctl setenv` can put `NODE_OPTIONS` back depending on
+  how the host starts the shell; that is a known follow-up, not claimed
+  coverage. Other ways to run code in a process the agent starts, such as
+  a modified `PATH` or `node` binary, are out of scope.
 
 ## The runtime self-check is detection only
 

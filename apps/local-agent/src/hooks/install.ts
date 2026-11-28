@@ -1,7 +1,7 @@
 import { readFileSync, writeFileSync, existsSync, copyFileSync, mkdirSync } from "node:fs";
 import { dirname } from "node:path";
 import { claudeSettingsPath } from "../paths.js";
-import { buildHookCommand, isScrubbedHookCommand } from "./hook-command.js";
+import { buildHookInvocation, isScrubbedHookCommand } from "./hook-command.js";
 import {
   DEFAULT_HOOK_TIMEOUT_S,
   DEFAULT_PRE_EXEC_HOOK_TIMEOUT_S,
@@ -27,6 +27,8 @@ const HOOK_EVENTS = [
 type HookEntry = {
   type: "command";
   command: string;
+  /** Claude Code: "bash" or "powershell". Set on Windows so Git Bash runs the POSIX form. */
+  shell?: "bash" | "powershell";
   timeout?: number;
   /**
    * "block" on pre-exec hooks only (Claude Code v2.1.295+): a crash, timeout
@@ -74,19 +76,30 @@ function buildHookEntry(
   hookCommandPrefix: string,
   preExecTimeoutS: number,
 ): HookEntry {
-  // Final command shape: `env -u NODE_OPTIONS <prefix> hook <Event>` (or the
-  // Windows cmd form), see hook-command.ts. Claude Code settings.json uses
-  // `timeout` in seconds.
+  // Final command shape: `env -u NODE_OPTIONS -u npm_config_node_options
+  // <prefix> hook <Event>` (Claude on Windows also sets shell: "bash"),
+  // see hook-command.ts. Claude Code settings.json uses timeout in seconds.
+  const invocation = buildHookInvocation(hookCommandPrefix, "hook", event);
   return {
     type: "command",
-    command: buildHookCommand(hookCommandPrefix, "hook", event),
+    command: invocation.command,
     timeout: claudeHookTimeoutForEvent(event, preExecTimeoutS),
+    ...(invocation.shell ? { shell: invocation.shell } : {}),
     ...(CLAUDE_PRE_EXEC_SET.has(event) ? { onFailure: "block" as const } : {}),
   };
 }
 
 export function quotePath(p: string): string {
-  return /[\s'"$`\\]/.test(p) ? `"${p.replace(/"/g, '\\"')}"` : p;
+  // Quote when the path would be split or expanded by a POSIX shell (Git
+  // Bash included). Escape backslash, double quote, $ and backtick so
+  // $(...) and backticks in a path cannot run.
+  if (!/[\s'"$`\\]/.test(p)) return p;
+  const escaped = p
+    .replace(/\\/g, "\\\\")
+    .replace(/"/g, '\\"')
+    .replace(/\$/g, "\\$")
+    .replace(/`/g, "\\`");
+  return `"${escaped}"`;
 }
 
 export interface InstallClaudeHooksOptions {
