@@ -27,7 +27,7 @@ agentreel init
 - **Hooks in `~/.cursor/hooks.json`**: `agentreel init` installs `sessionStart`, `sessionEnd`, `beforeSubmitPrompt`, `preToolUse`, `beforeShellExecution`, `beforeMCPExecution`, `beforeReadFile`, `postToolUse`, `postToolUseFailure`, `afterShellExecution`, `afterMCPExecution`, `afterFileEdit`, `subagentStop`, and `stop`. That records shell commands with output, exit code and duration, MCP and other tool calls, file reads and edits, and prompts. The four pre-exec hooks (`preToolUse`, `beforeShellExecution`, `beforeMCPExecution`, `beforeReadFile`) can enforce org policy.
 - **Local history watcher (optional)**: `agentreel watch` follows local history and turns saved snapshots into diffs. With the hooks installed it records manual edits only.
 - **Who and where**: each session records the OS user, hostname, git user, repo remote (credentials stripped), branch and commit at start and end, and the agent and agentreel versions. `agentreel config hostname hash` stores a salted hash instead of the machine name, `omit` leaves it out, and `agentreel config attribution off` turns all of it off.
-- **PII scrubbing, default-on**: AWS / GitHub / OpenAI / Anthropic / Stripe / Slack / Google / npm tokens, JWTs, PEM private keys, dotenv `KEY=VAL` lines, emails, IPv4. Scrubs *before* anything is persisted, never after.
+- **PII scrubbing, default-on**: AWS / GitHub / Stripe / Slack / Google / npm tokens, other cloud API keys, JWTs, PEM private keys, dotenv `KEY=VAL` lines, emails, IPv4. Scrubs *before* anything is persisted, never after.
 - **`.agentreelignore`**: gitignore-syntax exclusions per workspace.
 - **Local first**: works offline. Sign in only when you want to share.
 
@@ -65,13 +65,13 @@ Get an API key at [agentreel.dev/dashboard/settings](https://agentreel.dev/dashb
 | `~/.agentreel/sessions.db`| SQLite buffer for sessions + events               |
 | `~/.agentreel/config.json`| API key (if linked), API base URL                 |
 | `~/.agentreel/agent.log`  | Hook-handler error log                            |
-| `~/.claude/settings.json` | Claude Code hooks (added by `agentreel init`)     |
-| `~/.cursor/hooks.json`    | Cursor hooks (added by `agentreel init`)          |
+| `~/.claude/settings.json` | Hooks added by `agentreel init`                   |
+| `~/.cursor/hooks.json`    | Hooks added by `agentreel init`                   |
 | `<workspace>/.agentreelignore` | Per-project exclusions, gitignore syntax     |
 
 ## Privacy
 
-PII scrubbing runs at the source, not in the cloud. The unified diff stored on each Cursor edit is computed against the **scrubbed** versions of the file, so secrets never enter the patch text. Verify it yourself:
+PII scrubbing runs at the source, not in the cloud. The unified diff stored on each captured file edit is computed against the **scrubbed** versions of the file, so secrets never enter the patch text. Verify it yourself:
 
 ```sh
 agentreel status
