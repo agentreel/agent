@@ -682,16 +682,18 @@ describe("built bundle: encoding and shell-literal paths", () => {
     const prefix = hookPrefix(node, cliPath);
     expect(cliPath).toContain("$(id)");
     expect(cliPath).toContain("`id`");
-    expect(prefix).toContain("\\$(id)");
-    expect(prefix).toContain("\\`id\\`");
+    expect(prefix).toContain("$(id)");
+    expect(prefix).toContain("`id`");
+    expect(prefix).toContain("'");
     const settingsPath = join(home, ".claude", "settings.json");
     installClaudeCodeHooks(prefix, { settingsPath });
     const settings = JSON.parse(readFileSync(settingsPath, "utf8")) as {
       hooks: Record<string, Array<{ hooks: Array<{ command: string; shell?: string }> }>>;
     };
     const entry = settings.hooks.PreToolUse![0]!.hooks[0]!;
-    expect(entry.command).toContain("\\$(id)");
-    expect(entry.command).toContain("\\`id\\`");
+    expect(entry.command).toContain("$(id)");
+    expect(entry.command).toContain("`id`");
+    expect(entry.command).toContain("'");
     expectScrubbed(entry.command);
     const r = runHost(entry.command, home, { nodeOptions: `--require=${deleteCjs}`, input: PRE_TOOL_USE });
     expect(existsSync(marker), r.detail).toBe(false);

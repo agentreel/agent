@@ -5,7 +5,7 @@
  */
 import { lstatSync, realpathSync } from "node:fs";
 import { dirname, isAbsolute, resolve } from "node:path";
-import { stripHookScrubWrapper } from "../hooks/hook-command.js";
+import { stripHookScrubWrapper, tokenize, usesPowerShellSingleQuotes } from "../hooks/hook-command.js";
 import type { ManagedPlatform } from "./pack.js";
 import { underRoot } from "./install.js";
 
@@ -46,14 +46,8 @@ export interface InspectHookPathOptions {
 export function hookCommandBinaryPath(hookCommand: string): string | null {
   const trimmed = stripHookScrubWrapper(hookCommand).trim();
   if (!trimmed) return null;
-  if (trimmed.startsWith('"') || trimmed.startsWith("'")) {
-    const q = trimmed[0]!;
-    const end = trimmed.indexOf(q, 1);
-    if (end <= 1) return null;
-    const inside = trimmed.slice(1, end);
-    return inside || null;
-  }
-  return trimmed.split(/\s+/)[0] ?? null;
+  const style = usesPowerShellSingleQuotes(trimmed) ? "powershell" : "posix";
+  return tokenize(trimmed, { singleQuotes: style })[0] ?? null;
 }
 
 function defaultStat(path: string): PathIdentity | null {
