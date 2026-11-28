@@ -106,8 +106,9 @@ export function planManagedInstall(opts: ManagedInstallOptions): ManagedFilePlan
   const plans: ManagedFilePlan[] = targets.map(({ target, systemPath }) => {
     const path = underRoot(root, systemPath);
     const { raw, value } = readJsonObject(path);
+    const build = { ...opts, platform: opts.platform ?? resolveManagedPlatform() };
     const merged =
-      target === "claude" ? mergeClaudeManagedSettings(value, opts) : mergeCursorManagedHooks(value, opts);
+      target === "claude" ? mergeClaudeManagedSettings(value, build) : mergeCursorManagedHooks(value, build);
     const after = serializeJson(merged);
     const action = raw === null ? "create" : raw === after ? "unchanged" : "update";
     const diff =

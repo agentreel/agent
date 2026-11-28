@@ -22,6 +22,7 @@ import { runCursorHook } from "./cursor/hook-runner.js";
 import { configCommand } from "./commands/config.js";
 import { scanCommand } from "./commands/scan.js";
 import { policyCommand } from "./commands/policy.js";
+import { heartbeatCommand } from "./commands/heartbeat.js";
 import { doctorCommand } from "./commands/doctor.js";
 import { managedInstallCommand } from "./commands/managed.js";
 
@@ -159,6 +160,13 @@ program
   .description("show cached policy source, etag, age, mode, offline setting, and rule counts")
   .action(() => {
     policyCommand();
+  });
+
+program
+  .command("heartbeat [action]")
+  .description("daemon heartbeat: on | off | status (default on for org-linked devices, opt-in otherwise; AGENTREEL_HEARTBEAT=0 always disables)")
+  .action((action?: string) => {
+    heartbeatCommand(action);
   });
 
 program

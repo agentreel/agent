@@ -1,6 +1,7 @@
 import { readFileSync, writeFileSync, existsSync, copyFileSync, mkdirSync } from "node:fs";
 import { dirname } from "node:path";
 import { claudeSettingsPath } from "../paths.js";
+import { buildHookInvocation, isScrubbedHookCommand } from "./hook-command.js";
 import {
   DEFAULT_HOOK_TIMEOUT_S,
   DEFAULT_PRE_EXEC_HOOK_TIMEOUT_S,
@@ -26,6 +27,8 @@ const HOOK_EVENTS = [
 type HookEntry = {
   type: "command";
   command: string;
+  /** Claude Code: "bash" or "powershell". Set on Windows so Git Bash runs the POSIX form. */
+  shell?: "bash" | "powershell";
   timeout?: number;
   /**
    * "block" on pre-exec hooks only (Claude Code v2.1.295+): a crash, timeout
@@ -73,18 +76,30 @@ function buildHookEntry(
   hookCommandPrefix: string,
   preExecTimeoutS: number,
 ): HookEntry {
-  // Final command shape: `<prefix> hook <Event>`.
-  // Claude Code settings.json uses `timeout` in seconds.
+  // Final command shape: `env -u NODE_OPTIONS -u npm_config_node_options
+  // <prefix> hook <Event>` (Claude on Windows also sets shell: "bash"),
+  // see hook-command.ts. Claude Code settings.json uses timeout in seconds.
+  const invocation = buildHookInvocation(hookCommandPrefix, "hook", event);
   return {
     type: "command",
-    command: `${hookCommandPrefix} hook ${event}`,
+    command: invocation.command,
     timeout: claudeHookTimeoutForEvent(event, preExecTimeoutS),
+    ...(invocation.shell ? { shell: invocation.shell } : {}),
     ...(CLAUDE_PRE_EXEC_SET.has(event) ? { onFailure: "block" as const } : {}),
   };
 }
 
 export function quotePath(p: string): string {
-  return /[\s'"$`\\]/.test(p) ? `"${p.replace(/"/g, '\\"')}"` : p;
+  // Quote when the path would be split or expanded by a POSIX shell (Git
+  // Bash included). Escape backslash, double quote, $ and backtick so
+  // $(...) and backticks in a path cannot run.
+  if (!/[\s'"$`\\]/.test(p)) return p;
+  const escaped = p
+    .replace(/\\/g, "\\\\")
+    .replace(/"/g, '\\"')
+    .replace(/\$/g, "\\$")
+    .replace(/`/g, "\\`");
+  return `"${escaped}"`;
 }
 
 export interface InstallClaudeHooksOptions {
@@ -200,5 +215,36 @@ export function inspectClaudePreExecHook(
       preToolUseTimeoutS: null,
       preToolUseFailClosed: false,
     };
+  }
+}
+
+export interface ClaudeHookScrubCheck {
+  /** AgentReel hook entries found in settings.json. */
+  entries: number;
+  /** Entries whose command does not drop NODE_OPTIONS first (installed before the scrub existed). */
+  unscrubbed: number;
+}
+
+/** Counts AgentReel-managed Claude hook commands that do not scrub NODE_OPTIONS. */
+export function inspectClaudeHookScrub(
+  settingsPath: string = claudeSettingsPath(),
+): ClaudeHookScrubCheck {
+  if (!existsSync(settingsPath)) return { entries: 0, unscrubbed: 0 };
+  try {
+    const settings = readSettings(settingsPath);
+    let entries = 0;
+    let unscrubbed = 0;
+    for (const groups of Object.values(settings.hooks ?? {})) {
+      for (const g of groups ?? []) {
+        if (g.__agentreel !== CLAUDE_HOOK_MARKER) continue;
+        for (const h of g.hooks ?? []) {
+          entries += 1;
+          if (typeof h.command !== "string" || !isScrubbedHookCommand(h.command)) unscrubbed += 1;
+        }
+      }
+    }
+    return { entries, unscrubbed };
+  } catch {
+    return { entries: 0, unscrubbed: 0 };
   }
 }

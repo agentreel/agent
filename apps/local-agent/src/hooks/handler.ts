@@ -34,10 +34,11 @@ import {
   recordSessionEndGit,
 } from "../session-attribution.js";
 import { readStdin } from "../util/stdin.js";
+import { claudeDenyForEvent, formatClaudePreToolUseDeny } from "./claude-deny.js";
 import { applyIgnoreRules } from "./ignore-payload.js";
 import {
   enforceHookEnvNodeOptions,
-  RUNTIME_SELF005_MESSAGE,
+  runtimeSelf005Message,
 } from "../policy/node-options-runtime.js";
 
 const HOOK_EVENT_TO_TYPE: Record<string, EventType> = {
@@ -64,15 +65,7 @@ function logError(err: unknown): void {
   }
 }
 
-export function formatClaudePreToolUseDeny(reason: string): string {
-  return JSON.stringify({
-    hookSpecificOutput: {
-      hookEventName: "PreToolUse",
-      permissionDecision: "deny",
-      permissionDecisionReason: reason,
-    },
-  });
-}
+export { formatClaudePreToolUseDeny };
 
 export function extractClaudePreExecRequest(
   input: ClaudeCodeHookInput,
@@ -298,16 +291,22 @@ export async function runHook(
   const hookStartMs = opts.hookStartMs ?? Date.now();
   const readInput = opts.readStdin ?? readStdin;
   const writeOutput = opts.writeStdout ?? ((s: string) => process.stdout.write(s));
-  if (enforceHookEnvNodeOptions()) {
-    writeOutput(formatClaudePreToolUseDeny(RUNTIME_SELF005_MESSAGE) + "\n");
-    return;
-  }
   let wrote = false;
   const write = (line: string) => {
     wrote = true;
     writeOutput(line + "\n");
   };
   try {
+    // Detection only (see node-options-runtime.ts): the installed command
+    // already scrubs NODE_OPTIONS, and in the shipped CLI cli-start.ts has
+    // answered before this runs. Inside the try so a throw here fails closed
+    // like the rest of the hook. Only PreToolUse has a deny shape.
+    const violation = enforceHookEnvNodeOptions();
+    if (violation) {
+      const deny = claudeDenyForEvent(eventArg, runtimeSelf005Message(violation));
+      if (deny) write(deny);
+      return;
+    }
     const cfg = readConfig();
     const raw = await readInput();
     let parsed: unknown;

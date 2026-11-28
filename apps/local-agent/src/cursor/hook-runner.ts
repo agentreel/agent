@@ -31,7 +31,7 @@ import {
 import { readStdin } from "../util/stdin.js";
 import {
   enforceHookEnvNodeOptions,
-  RUNTIME_SELF005_MESSAGE,
+  runtimeSelf005Message,
 } from "../policy/node-options-runtime.js";
 import {
   CURSOR_HOOK_SUBCOMMAND,
@@ -335,21 +335,20 @@ export async function runCursorHook(
   const hookStartMs = opts.hookStartMs ?? Date.now();
   const readInput = opts.readStdin ?? readStdin;
   const writeOutput = opts.writeStdout ?? ((s: string) => process.stdout.write(s));
-  if (enforceHookEnvNodeOptions()) {
-    const hook = canonicalHookName(eventArg);
-    const message = RUNTIME_SELF005_MESSAGE;
-    writeOutput(
-      cursorHookResponse(hook, {
-        permission: "deny",
-        user_message: message,
-        agent_message: message,
-      }) + "\n",
-    );
-    return;
-  }
   let hook = canonicalHookName(eventArg);
   let decision: CursorPermissionDecision | undefined;
   try {
+    // Detection only (see node-options-runtime.ts): the installed command
+    // already scrubs NODE_OPTIONS, and in the shipped CLI cli-start.ts has
+    // answered before this runs. Inside the try so a throw here still ends in
+    // the finally below, which always answers. The deny is the pre-exec shape;
+    // other hooks have none and answer as usual.
+    const violation = enforceHookEnvNodeOptions();
+    if (violation) {
+      const message = runtimeSelf005Message(violation);
+      decision = { permission: "deny", user_message: message, agent_message: message };
+      return;
+    }
     const raw = await readInput().catch(() => "");
     const cfg = readConfig();
     let parsed: unknown;

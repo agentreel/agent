@@ -4,6 +4,7 @@ import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import type { Policy } from "../src/policy/types.js";
+import { buildHookCommand } from "../src/hooks/hook-command.js";
 
 const testHome = mkdtempSync(join(tmpdir(), "agentreel-selfprotect-"));
 process.env.HOME = testHome;
@@ -784,6 +785,15 @@ const DENIED: Array<[string, string]> = [
   ["SELF005", "env -u HOME claude"],
   ["SELF005", "env -i bash"],
   ["SELF005", "export HOME=/tmp/empty"],
+  ["SELF005", "export -n HOME"],
+  ["SELF005", "declare HOME=/tmp/empty"],
+  ["SELF005", "declare -n HOME"],
+  ["SELF005", "typeset HOME=/tmp/empty"],
+  ["SELF005", "typeset -n HOME"],
+  ["SELF005", "npm config set node-options --require=/tmp/evil.js"],
+  ["SELF005", "npm config set node-options=--require=/tmp/evil.js"],
+  ["SELF005", "pnpm config set node-options --require=/tmp/evil.js"],
+  ["SELF005", "echo node-options=--require=/tmp/x.js >> ~/.npmrc"],
   ["SELF005", "HOME=/tmp/empty claude -p hi"],
   ["SELF005", "CLAUDE_CONFIG_DIR=/tmp/c claude"],
   ["SELF003", "node /usr/local/lib/node_modules/@agentreel/agent/dist/cli.js managed install --hook-command /tmp/evil"],
@@ -942,6 +952,33 @@ describe("(d) self-protect matcher", () => {
     ).toBe("SELF004");
   });
 
+  it("denies writing node-options into .npmrc, but not other .npmrc edits", () => {
+    expect(
+      selfProtect.matchSelfProtect({
+        toolName: "Write",
+        file_path: "/home/alice/.npmrc",
+        toolInput: { content: "node-options=--require /tmp/evil.js\n" },
+      })?.rule_id,
+    ).toBe("SELF005");
+    expect(
+      selfProtect.matchSelfProtect({
+        toolName: "Edit",
+        file_path: "~/.npmrc",
+        toolInput: { new_string: "node-options=--import /tmp/evil.mjs" },
+      })?.rule_id,
+    ).toBe("SELF005");
+    expect(
+      selfProtect.matchSelfProtect({
+        toolName: "Write",
+        file_path: "/home/alice/.npmrc",
+        toolInput: { content: "fund=false\n" },
+      }),
+    ).toBeNull();
+    expect(
+      selfProtect.matchSelfProtect({ toolName: "Bash", command: "npm config set fund false" }),
+    ).toBeNull();
+  });
+
   it("stays linear on 200k-character inputs", () => {
     const inputs = [
       "<".repeat(200_000),
@@ -1013,6 +1050,24 @@ describe("hook binary discovered from the managed hook command", () => {
     expect(selfProtect.matchSelfProtect({ toolName: "Bash", command: `rm ${bin}` })?.rule_id).toBe("SELF001");
     expect(selfProtect.matchSelfProtect({ toolName: "Bash", command: `chmod -x ${bin}` })?.rule_id).toBe("SELF001");
     expect(selfProtect.matchSelfProtect({ toolName: "Write", file_path: bin })?.rule_id).toBe("SELF002");
+  });
+
+  it("still finds the binary when the installed command starts with the NODE_OPTIONS scrub (POSIX and Windows forms)", () => {
+    const bin = join(work, "scrubbed-bin");
+    for (const platform of ["linux", "win32"] as const) {
+      const hooks = join(work, `scrubbed-hooks-${platform}.json`);
+      writeFileSync(hooks, JSON.stringify({
+        version: 1,
+        hooks: {
+          beforeShellExecution: [
+            { command: buildHookCommand(bin, "cursor-hook", "beforeShellExecution", platform), failClosed: true },
+          ],
+        },
+      }));
+      selfProtect._setHookConfigPathsForTests([hooks]);
+      expect(selfProtect.matchSelfProtect({ toolName: "Bash", command: `rm ${bin}` })?.rule_id, platform).toBe("SELF001");
+      expect(selfProtect.matchSelfProtect({ toolName: "Write", file_path: bin })?.rule_id, platform).toBe("SELF002");
+    }
   });
 
   it("is graceful when the hook file is unreadable and still blocks the standard binary name", () => {

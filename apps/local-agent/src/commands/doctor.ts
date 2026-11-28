@@ -7,12 +7,18 @@ import {
   type AgentConfig,
 } from "../config.js";
 import {
+  describeHeartbeatReason,
+  heartbeatDecision,
+  type HeartbeatReason,
+} from "../heartbeat/heartbeat.js";
+import {
+  inspectCursorHookScrub,
   inspectCursorPreExecHooks,
   inspectSystemCursorHooks,
   systemCursorHooksPath,
   type SystemCursorHooksState,
 } from "../cursor/hooks-install.js";
-import { inspectClaudePreExecHook } from "../hooks/install.js";
+import { inspectClaudeHookScrub, inspectClaudePreExecHook } from "../hooks/install.js";
 import {
   claudeSettingsPath,
   cursorHooksPath,
@@ -30,6 +36,7 @@ import {
 import {
   computeMaxPolicyApprovalExpiresS,
   computePreExecTimeoutS,
+  getPolicyOrgId,
   HOOK_DEADLINE_MARGIN_S,
   isNoOrgPolicy,
 } from "../policy/types.js";
@@ -54,6 +61,7 @@ export interface DoctorInspectOptions {
   systemCursorHooksPath?: string;
   config?: AgentConfig;
   now?: number;
+  env?: NodeJS.ProcessEnv;
 }
 
 export interface DoctorReport {
@@ -75,6 +83,17 @@ export interface DoctorReport {
   expectedPreExecTimeoutS: number;
   maxPolicyApprovalExpiresS: number | null;
   needsReinit: boolean;
+  /**
+   * Installed hook commands that do not drop NODE_OPTIONS before Node starts
+   * (written before the scrub existed). They still get the in-process
+   * detection-only check; `agentreel init` rewrites them.
+   */
+  hookScrub: {
+    claude: { entries: number; unscrubbed: number };
+    cursor: { entries: number; unscrubbed: number };
+    needsMigration: boolean;
+  };
+  heartbeat: { enabled: boolean; reason: HeartbeatReason; text: string };
   claude: {
     fileExists: boolean;
     preToolUseInstalled: boolean;
@@ -191,7 +210,18 @@ export function inspectDoctorState(opts: DoctorInspectOptions = {}): DoctorRepor
     maxPolicyApprovalExpiresS !== null &&
     maxPolicyApprovalExpiresS > cursorEffectiveTimeoutS - HOOK_DEADLINE_MARGIN_S;
 
+  const scrubClaude = inspectClaudeHookScrub(opts.claudeSettingsPath ?? claudeSettingsPath());
+  const scrubCursor = cursorManaged
+    ? { entries: 0, unscrubbed: 0 }
+    : inspectCursorHookScrub(opts.cursorHooksPath ?? cursorHooksPath());
+
+  const orgLinked =
+    (typeof cfg.orgSlug === "string" && cfg.orgSlug.length > 0) ||
+    (loaded.source === "server_cache" && getPolicyOrgId(policy) !== null);
+  const hb = heartbeatDecision(cfg, opts.env ?? process.env, orgLinked);
+
   return {
+    heartbeat: { enabled: hb.enabled, reason: hb.reason, text: describeHeartbeatReason(hb) },
     policyLoaded: policy !== null,
     noOrgPolicy,
     policySource: loaded.source,
@@ -209,6 +239,11 @@ export function inspectDoctorState(opts: DoctorInspectOptions = {}): DoctorRepor
     expectedPreExecTimeoutS,
     maxPolicyApprovalExpiresS,
     needsReinit: claudeNeedsReinit || cursorNeedsReinit,
+    hookScrub: {
+      claude: scrubClaude,
+      cursor: scrubCursor,
+      needsMigration: scrubClaude.unscrubbed > 0 || scrubCursor.unscrubbed > 0,
+    },
     claude: {
       ...claudeRaw,
       timeoutOk: claudeTimeoutOk,
@@ -316,6 +351,11 @@ export function formatDoctorReport(report: DoctorReport): string {
     }
   }
 
+  lines.push(
+    `  heartbeat:      ${report.heartbeat.enabled ? pc.green(report.heartbeat.text) : pc.yellow(report.heartbeat.text)}`,
+    pc.dim("                  sends counts, states and gaps only; never command text. Hook-gap detection: Claude Code only."),
+  );
+
   if (report.lockdownReason) {
     lines.push(
       `  ${pc.red("!")} lockdown: this org enforces its policy, but the cached policy is ${report.lockdownReason.replace("policy_", "")}. Every built-in rule blocks until \`npx @agentreel/agent auth\` fetches it again.`,
@@ -351,6 +391,18 @@ export function formatDoctorReport(report: DoctorReport): string {
       "",
       pc.yellow(
         `  warning:        policy max approval expires_s (${report.maxPolicyApprovalExpiresS}s) needs a longer hook timeout than installed for ${hosts.join(", ")}. Run \`npx @agentreel/agent init\` to update hook timeouts.`,
+      ),
+    );
+  }
+
+  if (report.hookScrub.needsMigration) {
+    const hosts: string[] = [];
+    if (report.hookScrub.claude.unscrubbed > 0) hosts.push(`claude (${report.hookScrub.claude.unscrubbed} of ${report.hookScrub.claude.entries})`);
+    if (report.hookScrub.cursor.unscrubbed > 0) hosts.push(`cursor (${report.hookScrub.cursor.unscrubbed} of ${report.hookScrub.cursor.entries})`);
+    lines.push(
+      "",
+      pc.yellow(
+        `  warning:        installed hook commands for ${hosts.join(", ")} do not drop NODE_OPTIONS before Node starts, so a preload in NODE_OPTIONS can still run first. Run \`npx @agentreel/agent init\` to rewrite them.`,
       ),
     );
   }
