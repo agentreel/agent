@@ -326,3 +326,94 @@ describe("pipelines into a bare stdin shell (round 7)", () => {
     expect(rule("cat <<'EOF'\nNODE_OPTIONS=--require=/tmp/evil.js\nEOF")).toBeNull();
   });
 });
+
+
+describe("NODE_OPTIONS raw-text backstop and remaining wrappers (round 8)", () => {
+  const bad = "NODE_OPTIONS=--require=x agentreel doctor";
+
+  it("denies a HIGH subshell group piped into sh", () => {
+    expect(rule(`(printf '${bad}') | sh`)).toBe("SELF005");
+  });
+  it("denies a HIGH subshell group with two statements piped into sh", () => {
+    expect(rule(`(printf '${bad}'; printf x) | sh`)).toBe("SELF005");
+  });
+
+  it("denies HIGH process substitution into sh", () => {
+    expect(rule(`sh <(printf '${bad}')`)).toBe("SELF005");
+  });
+  it("denies HIGH process substitution into bash", () => {
+    expect(rule(`bash <(printf '${bad}')`)).toBe("SELF005");
+  });
+
+  it("denies busybox sh heredoc payload", () => {
+    expect(rule(`busybox sh <<'EOF'\n${bad}\nEOF`)).toBe("SELF005");
+  });
+  it("denies busybox sh here-string payload", () => {
+    expect(rule(`busybox sh <<<'${bad}'`)).toBe("SELF005");
+  });
+
+  it("denies printf | fish", () => {
+    expect(rule(`printf '${bad}' | fish`)).toBe("SELF005");
+  });
+  it("denies printf | csh", () => {
+    expect(rule(`printf '${bad}' | csh`)).toBe("SELF005");
+  });
+  it("denies printf | tcsh", () => {
+    expect(rule(`printf '${bad}' | tcsh`)).toBe("SELF005");
+  });
+
+  it("denies printf | xargs sh -c", () => {
+    expect(rule(`printf '${bad}' | xargs sh -c`)).toBe("SELF005");
+  });
+  it("denies printf | xargs bash -c", () => {
+    expect(rule(`printf '${bad}' | xargs bash -c`)).toBe("SELF005");
+  });
+  it("denies printf | xargs sh", () => {
+    expect(rule(`printf '${bad}' | xargs sh`)).toBe("SELF005");
+  });
+
+  it("denies a weird unparseable form that still contains NODE_OPTIONS", () => {
+    expect(rule("source /dev/stdin <<<'NODE_OPTIONS=--require=x agentreel doctor'")).toBe("SELF005");
+  });
+
+  it("still allows export of an allowed value", () => {
+    expect(rule("export NODE_OPTIONS=--max-old-space-size=4096")).toBeNull();
+  });
+  it("still allows unset NODE_OPTIONS", () => {
+    expect(rule("unset NODE_OPTIONS")).toBeNull();
+  });
+  it("still allows env -u NODE_OPTIONS", () => {
+    expect(rule("env -u NODE_OPTIONS node x")).toBeNull();
+  });
+  it("still does not treat an unpiped cat heredoc without NODE_OPTIONS as a hit", () => {
+    expect(rule("cat <<'EOF'\nhello world\nEOF")).toBeNull();
+  });
+  it("still does not treat a cat heredoc (not piped to a shell) as executed", () => {
+    expect(rule("cat <<'EOF'\nNODE_OPTIONS=--require=/tmp/evil.js\nEOF")).toBeNull();
+  });
+
+  it("allows the proven read: echo $NODE_OPTIONS", () => {
+    expect(rule("echo $NODE_OPTIONS")).toBeNull();
+  });
+  it("allows the proven read: echo \"$NODE_OPTIONS\"", () => {
+    expect(rule('echo "$NODE_OPTIONS"')).toBeNull();
+  });
+  it("allows the proven read: printenv NODE_OPTIONS", () => {
+    expect(rule("printenv NODE_OPTIONS")).toBeNull();
+  });
+  it("allows the proven read: env | grep NODE_OPTIONS", () => {
+    expect(rule("env | grep NODE_OPTIONS")).toBeNull();
+  });
+  it("allows the proven read: echo ${NODE_OPTIONS}", () => {
+    expect(rule("echo ${NODE_OPTIONS}")).toBeNull();
+  });
+  it("allows unset -v NODE_OPTIONS", () => {
+    expect(rule("unset -v NODE_OPTIONS")).toBeNull();
+  });
+  it("allows env --unset NODE_OPTIONS", () => {
+    expect(rule("env --unset NODE_OPTIONS node x")).toBeNull();
+  });
+  it("allows env -uNODE_OPTIONS", () => {
+    expect(rule("env -uNODE_OPTIONS node x")).toBeNull();
+  });
+});
