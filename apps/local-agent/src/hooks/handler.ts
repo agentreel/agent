@@ -10,7 +10,7 @@ import {
 } from "../config.js";
 import { recomputeSessionCost } from "../cost/transcript.js";
 import { isCursorPayload, nativeCursorHooksInstalled, recordCursorHook } from "../cursor/hook-runner.js";
-import { getSessionAttribution, insertEvent, upsertSession } from "../db.js";
+import { insertEvent, upsertSession } from "../db.js";
 import { logPath, ensureAgentreelDir } from "../paths.js";
 import {
   enforcePreExec,
@@ -21,7 +21,11 @@ import {
 } from "../policy/enforce.js";
 import { computeHookDeadlineMs } from "../policy/types.js";
 import { scrubAny } from "../redact/scrubber.js";
-import { ensureSessionAttribution, recordSessionEndGit } from "../session-attribution.js";
+import {
+  ensureSessionAttribution,
+  preExecAttribution,
+  recordSessionEndGit,
+} from "../session-attribution.js";
 import { readStdin } from "../util/stdin.js";
 import { applyIgnoreRules } from "./ignore-payload.js";
 
@@ -117,68 +121,15 @@ export async function handleClaudeHookInput(
   const sessionId = input.session_id ?? "unknown-session";
   const capturePaused = isCapturePaused(deps.config ?? readConfig());
 
-  if (!capturePaused) {
-    if (type === "session_start") {
-      upsertSession({
-        id: sessionId,
-        tool: "claude-code",
-        startedAt: ts,
-        cwd: input.cwd,
-      });
-    } else if (type === "session_end") {
-      upsertSession({
-        id: sessionId,
-        tool: "claude-code",
-        startedAt: ts,
-        endedAt: ts,
-        cwd: input.cwd,
-      });
-    } else {
-      upsertSession({
-        id: sessionId,
-        tool: "claude-code",
-        startedAt: ts,
-        cwd: input.cwd,
-      });
-    }
-
-    try {
-      ensureSessionAttribution(sessionId, {
-        cwd: input.cwd,
-        tool: "claude-code",
-        toolVersion: () => claudeVersionFromTranscript(input.transcript_path),
-      });
-      if (type === "stop" || type === "session_end") recordSessionEndGit(sessionId, input.cwd);
-    } catch (err) {
-      logError(err);
-    }
-
-    const safePayload = scrubAny(applyIgnoreRules(input as never) as typeof input);
-    const event: AgentEvent = {
-      id: nanoid(),
-      sessionId,
-      tool: "claude-code",
-      type,
-      ts,
-      cwd: input.cwd,
-      payload: safePayload,
-    };
-    insertEvent(event);
-  }
-
   let stdout: string | null = null;
   let outcome: PreExecOutcome | undefined;
 
+  // Policy check first: no DB write may run before the decision.
   if (type === "tool_use_pre") {
     try {
-      let attribution: Attribution | null = null;
-      if (!capturePaused) {
-        try {
-          attribution = getSessionAttribution<Attribution>(sessionId);
-        } catch {
-          attribution = null;
-        }
-      }
+      const attribution: Attribution | null = capturePaused
+        ? null
+        : preExecAttribution(sessionId, input.cwd);
       const req = extractClaudePreExecRequest(input, sessionId, ts, attribution);
       outcome = await enforcePreExec(req, deps);
       if (!outcome.permitted && outcome.message) {
@@ -187,6 +138,62 @@ export async function handleClaudeHookInput(
     } catch (err) {
       logError(err);
       stdout = null;
+    }
+  }
+
+  // Record after the policy decision, and never let a DB error change it.
+  // A corrupt or unusable sessions.db used to throw here before
+  // enforcePreExec ran, which let blocked commands through.
+  if (!capturePaused) {
+    try {
+      if (type === "session_start") {
+        upsertSession({
+          id: sessionId,
+          tool: "claude-code",
+          startedAt: ts,
+          cwd: input.cwd,
+        });
+      } else if (type === "session_end") {
+        upsertSession({
+          id: sessionId,
+          tool: "claude-code",
+          startedAt: ts,
+          endedAt: ts,
+          cwd: input.cwd,
+        });
+      } else {
+        upsertSession({
+          id: sessionId,
+          tool: "claude-code",
+          startedAt: ts,
+          cwd: input.cwd,
+        });
+      }
+
+      try {
+        ensureSessionAttribution(sessionId, {
+          cwd: input.cwd,
+          tool: "claude-code",
+          toolVersion: () => claudeVersionFromTranscript(input.transcript_path),
+        });
+        if (type === "stop" || type === "session_end") recordSessionEndGit(sessionId, input.cwd);
+      } catch (err) {
+        logError(err);
+      }
+
+      const safePayload = scrubAny(applyIgnoreRules(input as never) as typeof input);
+      const event: AgentEvent = {
+        id: nanoid(),
+        sessionId,
+        tool: "claude-code",
+        type,
+        ts,
+        cwd: input.cwd,
+        payload: safePayload,
+      };
+      insertEvent(event);
+    } catch (err) {
+      logError(err);
     }
   }
 
