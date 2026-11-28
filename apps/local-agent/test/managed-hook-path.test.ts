@@ -192,6 +192,9 @@ describe("agentreel managed install hook-path guard", () => {
           env: {},
           log: (l) => lines.push(l),
           error: (l) => lines.push(l),
+          // A person at a terminal with no agent above them.
+          isTTY: true,
+          ancestry: () => [],
           stat: (p) => entries[p] ?? null,
           realpath: (p) => (entries[p] ? p : null),
         },
@@ -243,6 +246,9 @@ describe("agentreel managed install hook-path guard", () => {
           env: {},
           log: (l) => lines.push(l),
           error: (l) => lines.push(l),
+          // A person at a terminal with no agent above them.
+          isTTY: true,
+          ancestry: () => [],
           stat: (p) => entries[p] ?? null,
           realpath: (p) => (entries[p] ? p : null),
         },
@@ -291,6 +297,9 @@ describe("agentreel managed install hook-path guard", () => {
           env: {},
           log: (l) => lines.push(l),
           error: (l) => lines.push(l),
+          // A person at a terminal with no agent above them.
+          isTTY: true,
+          ancestry: () => [],
           stat: (p) => {
             seen.push(p);
             return entries[p] ?? null;
