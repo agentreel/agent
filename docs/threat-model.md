@@ -61,7 +61,7 @@ would otherwise inject `NODE_OPTIONS` from `~/.npmrc` or
 | --- | --- |
 | macOS, Linux | `env -u NODE_OPTIONS -u npm_config_node_options <agentreel> hook <Event>` (Cursor: `cursor-hook <event>`). An `npx` or `bunx` prefix also gets `--node-options=`. |
 | Windows, Claude Code | The same POSIX `env -u` form, with the hook entry's `shell` field set to `"bash"`. Claude Code's default host shell on Windows is Git Bash when Git is installed. The older `cmd /d /s /c "set NODE_OPTIONS=&& ..."` form is mis-tokenized there: a path with spaces breaks the command, and `/d` `/s` `/c` can be path-mangled, which would block every PreToolUse and stop lifecycle capture. If bash is missing, PreToolUse fails closed via `onFailure: "block"`. |
-| Windows, Cursor | PowerShell: `Remove-Item Env:NODE_OPTIONS` and `Env:npm_config_node_options`, then the prefix and `cursor-hook` event. The hook JSON is inherited on stdin. This is run through `powershell -File` (or an equivalent runspace). `powershell -Command` does not inherit stdin reliably. Cursor has no hook `shell` field; the desktop app runs hooks through PowerShell. |
+| Windows, Cursor | PowerShell: `Remove-Item Env:NODE_OPTIONS` and `Env:npm_config_node_options`, then `$input |` the prefix and `cursor-hook` event. `& node` does not inherit PowerShell's stdin, so `$input` has to be piped. This is run through `powershell -File` (or an equivalent runspace) with a real stdin. `powershell -Command` and Node `spawnSync` `input` do not bind `$input` reliably. Cursor has no hook `shell` field; the desktop app runs hooks through PowerShell. |
 
 A preload set in `NODE_OPTIONS` never loads in the hook process. If `env`
 or PowerShell cannot be started the command fails: Claude Code PreToolUse

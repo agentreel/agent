@@ -66,8 +66,7 @@ describe("buildHookCommand", () => {
     const cmd = buildHookCommand('"C:\\Program Files\\agentreel\\cli.js"', "cursor-hook", "beforeShellExecution", "win32");
     expect(cmd).toContain("Remove-Item Env:NODE_OPTIONS");
     expect(cmd).toContain("Remove-Item Env:npm_config_node_options");
-    expect(cmd).toContain("& 'C:\\Program Files\\agentreel\\cli.js'");
-    expect(cmd).not.toContain("$input");
+    expect(cmd).toContain("$input | & 'C:\\Program Files\\agentreel\\cli.js'");
     expect(cmd).toContain("cursor-hook beforeShellExecution");
     expect(cmd).not.toContain("cmd /d");
     expect(cmd).not.toContain("env -u");
