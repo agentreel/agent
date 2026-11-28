@@ -325,7 +325,7 @@ describe("docs say what is sent, and Claude Code only", () => {
     expect(d).toMatch(/migration|0024/i);
   });
 
-  it("README and CHANGELOG state counts and gaps only, the default, and Claude Code only", () => {
+  it("README and docs/heartbeat.md state counts and gaps only, the default, and Claude Code only", () => {
     const r = read("README.md");
     const bullet = r.split("\n").find((l) => l.startsWith("- **Heartbeat and hook gaps**")) ?? "";
     expect(bullet).toContain("counts and gaps only");
@@ -333,12 +333,12 @@ describe("docs say what is sent, and Claude Code only", () => {
     expect(bullet).toContain("org");
     expect(bullet).toContain("agentreel heartbeat on");
     expect(bullet).not.toMatch(/cursor/i);
-    const c = read("CHANGELOG.md");
-    const entry = c.split("\n").find((l) => l.startsWith("- Daemon heartbeat")) ?? "";
-    expect(entry).toContain("counts and gaps only");
-    expect(entry).toContain("Claude Code only");
-    expect(entry).toContain("agentreel heartbeat on");
-    const wentry = c.split("\n").find((l) => l.startsWith("- Transcript watcher")) ?? "";
-    expect(wentry).toContain("Claude Code only");
+    // Customer-facing CHANGELOG entries are written by Salmon; the
+    // technical contract is in README and docs/heartbeat.md.
+    const d = read("docs/heartbeat.md");
+    expect(d).toContain("Claude Code only");
+    expect(d).toContain("Never command text");
+    expect(d).toContain("agentreel heartbeat on");
+    expect(d).toContain("AGENTREEL_HEARTBEAT=0");
   });
 });
