@@ -407,17 +407,19 @@ describe("telemetry opt-out never fetches", () => {
     }
     const logPath = fetchLogPath();
     rmSync(join(home, ".agentreel"), { recursive: true, force: true });
-    const out = execFileSync("node", [cliPath, "--version"], {
-      env: {
-        ...process.env,
-        HOME: home,
-        NODE_ENV: "production",
-        VITEST: "",
-        VITEST_WORKER_ID: "",
-        AGENTREEL_TELEMETRY: "0",
-        AGENTREEL_TELEMETRY_FETCH_LOG: logPath,
-        NODE_OPTIONS: `--import ${fetchSuccessPreload}`,
-      },
+    const env = {
+      ...process.env,
+      HOME: home,
+      NODE_ENV: "production",
+      VITEST: "",
+      VITEST_WORKER_ID: "",
+      AGENTREEL_TELEMETRY: "0",
+      AGENTREEL_TELEMETRY_FETCH_LOG: logPath,
+    };
+    // Preload via argv --import. NODE_OPTIONS=--import is denied by the runtime self-check.
+    delete env.NODE_OPTIONS;
+    const out = execFileSync("node", ["--import", fetchSuccessPreload, cliPath, "--version"], {
+      env,
       encoding: "utf8",
       stdio: ["pipe", "pipe", "pipe"],
     });
@@ -432,17 +434,18 @@ describe("telemetry opt-out never fetches", () => {
     }
     const logPath = fetchLogPath();
     rmSync(join(home, ".agentreel"), { recursive: true, force: true });
-    execFileSync("node", [cliPath, "--version"], {
-      env: {
-        ...process.env,
-        HOME: home,
-        NODE_ENV: "production",
-        VITEST: "",
-        VITEST_WORKER_ID: "",
-        CI: "true",
-        AGENTREEL_TELEMETRY_FETCH_LOG: logPath,
-        NODE_OPTIONS: `--import ${fetchSuccessPreload}`,
-      },
+    const env = {
+      ...process.env,
+      HOME: home,
+      NODE_ENV: "production",
+      VITEST: "",
+      VITEST_WORKER_ID: "",
+      CI: "true",
+      AGENTREEL_TELEMETRY_FETCH_LOG: logPath,
+    };
+    delete env.NODE_OPTIONS;
+    execFileSync("node", ["--import", fetchSuccessPreload, cliPath, "--version"], {
+      env,
       encoding: "utf8",
       stdio: ["pipe", "pipe", "pipe"],
     });
@@ -553,15 +556,16 @@ describe("telemetry CLI exit code", () => {
       return;
     }
     expect(() => {
-      execFileSync("node", [cliPath, "--version"], {
-        env: {
-          ...process.env,
-          HOME: home,
-          NODE_ENV: "production",
-          VITEST: "",
-          VITEST_WORKER_ID: "",
-          NODE_OPTIONS: `--import ${fetchMockPreload}`,
-        },
+      const env = {
+        ...process.env,
+        HOME: home,
+        NODE_ENV: "production",
+        VITEST: "",
+        VITEST_WORKER_ID: "",
+      };
+      delete env.NODE_OPTIONS;
+      execFileSync("node", ["--import", fetchMockPreload, cliPath, "--version"], {
+        env,
         encoding: "utf8",
         stdio: ["pipe", "pipe", "pipe"],
       });

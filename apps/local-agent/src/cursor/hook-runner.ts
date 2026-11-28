@@ -30,6 +30,10 @@ import {
 } from "../session-attribution.js";
 import { readStdin } from "../util/stdin.js";
 import {
+  enforceHookEnvNodeOptions,
+  RUNTIME_SELF005_MESSAGE,
+} from "../policy/node-options-runtime.js";
+import {
   CURSOR_HOOK_SUBCOMMAND,
   canonicalHookName,
   coerceCommand,
@@ -331,6 +335,18 @@ export async function runCursorHook(
   const hookStartMs = opts.hookStartMs ?? Date.now();
   const readInput = opts.readStdin ?? readStdin;
   const writeOutput = opts.writeStdout ?? ((s: string) => process.stdout.write(s));
+  if (enforceHookEnvNodeOptions()) {
+    const hook = canonicalHookName(eventArg);
+    const message = RUNTIME_SELF005_MESSAGE;
+    writeOutput(
+      cursorHookResponse(hook, {
+        permission: "deny",
+        user_message: message,
+        agent_message: message,
+      }) + "\n",
+    );
+    return;
+  }
   let hook = canonicalHookName(eventArg);
   let decision: CursorPermissionDecision | undefined;
   try {

@@ -119,7 +119,9 @@ export async function uninstallCommand(): Promise<void> {
     writeConfig(after);
   }
   const cur = uninstallCursorHooks();
-  if (cur.removed > 0) {
+  if (cur.refused) {
+    console.log(pc.yellow("!") + ` ${cur.refused}`);
+  } else if (cur.removed > 0) {
     console.log(pc.green("✓") + " Removed AgentReel hooks from ~/.cursor/hooks.json");
     if (cur.backup) console.log(pc.dim(`  (backup: ${cur.backup})`));
   }
