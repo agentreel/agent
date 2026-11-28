@@ -52,6 +52,7 @@ Get an API key at [agentreel.dev/dashboard/settings](https://agentreel.dev/dashb
 | `agentreel forget` | Remove sessions from the local buffer |
 | `agentreel logout` | Clear local API credentials |
 | `agentreel uninstall` | Remove installed hooks |
+| `sudo agentreel managed install` | Enterprise managed policy: system-wide Claude Code managed settings and Cursor hooks (`--dry-run`, `--root`). See [docs/managed-settings.md](docs/managed-settings.md) |
 
 ## Secret scanning (gitleaks)
 
