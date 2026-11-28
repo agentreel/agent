@@ -1,4 +1,4 @@
-import { copyFileSync, existsSync, mkdirSync, readFileSync, writeFileSync } from "node:fs";
+import { copyFileSync, existsSync, lstatSync, mkdirSync, readFileSync, writeFileSync } from "node:fs";
 import { dirname } from "node:path";
 import { cursorHooksPath } from "../paths.js";
 import {
@@ -95,6 +95,32 @@ export function systemCursorHooksOwnedByAgentreel(path: string = systemCursorHoo
 }
 
 /**
+ * The same rule as the managed installer's user-file cleanup
+ * (`planCursorUserCleanup` in src/managed/install.ts): never write through a
+ * symlink. If ~/.cursor or ~/.cursor/hooks.json is a symlink (for example to
+ * the managed /etc/cursor/hooks.json), or the file is not a regular file,
+ * the file is left alone. Returns the warning text, or null when it is safe
+ * to edit or there is nothing there.
+ */
+function refuseUnsafeUserHooksFile(path: string): string | null {
+  try {
+    const dirIsLink = lstatSync(dirname(path)).isSymbolicLink();
+    let fileState: "absent" | "regular" | "other" = "absent";
+    try {
+      fileState = lstatSync(path).isFile() ? "regular" : "other";
+    } catch (err) {
+      if ((err as NodeJS.ErrnoException).code !== "ENOENT") fileState = "other";
+    }
+    if (fileState === "absent" && !dirIsLink) return null;
+    if (!dirIsLink && fileState === "regular") return null;
+    if (dirIsLink && fileState === "absent") return null;
+    return `${path} or its directory is a symlink or not a regular file, so AgentReel's entries were not removed from it.`;
+  } catch {
+    return null;
+  }
+}
+
+/**
  * Remove this user's AgentReel entries from a per-user hooks file, leaving
  * everyone else's hooks, unknown keys, and the rest of the file intact.
  * Writes a backup first. No-ops (no backup, no write) when there is nothing
@@ -102,8 +128,10 @@ export function systemCursorHooksOwnedByAgentreel(path: string = systemCursorHoo
  */
 export function removeUserAgentreelCursorHooks(
   path: string = cursorHooksPath(),
-): { backup: string | null; removed: number } {
+): { backup: string | null; removed: number; refused?: string } {
   try {
+    const refused = refuseUnsafeUserHooksFile(path);
+    if (refused) return { backup: null, removed: 0, refused };
     if (!existsSync(path)) return { backup: null, removed: 0 };
     const file = read(path);
     let removed = 0;
@@ -140,6 +168,8 @@ export type InstallCursorHooksResult =
       preExecTimeoutS: number;
       backup: string | null;
       removed: number;
+      /** Set when the user file was a symlink or not a regular file and was left untouched. */
+      warning?: string;
     };
 
 /**
@@ -166,6 +196,7 @@ export function installCursorHooks(
       preExecTimeoutS,
       backup: cleaned.backup,
       removed: cleaned.removed,
+      ...(cleaned.refused ? { warning: cleaned.refused } : {}),
     };
   }
   mkdirSync(dirname(path), { recursive: true });

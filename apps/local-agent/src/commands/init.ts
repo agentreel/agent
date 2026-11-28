@@ -114,6 +114,7 @@ export async function initCommand(opts: InitOptions = {}): Promise<void> {
       pc.green("✓") +
         ` Cursor hooks are owned by the managed pack (${cursor.managedPath}); skipped ~/.cursor/hooks.json so nothing is captured twice`,
     );
+    if (cursor.warning) console.log(pc.yellow("!") + ` ${cursor.warning}`);
   } else if (cursor) {
     console.log(
       pc.green("✓") +
