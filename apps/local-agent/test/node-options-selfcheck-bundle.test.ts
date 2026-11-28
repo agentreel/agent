@@ -3,18 +3,22 @@
  * fresh into a private directory), through the same entry a host uses:
  *
  *  - the in-process check is detection only: it denies a preload it can see;
- *  - the INSTALLED hook command (`env -u NODE_OPTIONS ...`) is what stops a
+ *  - the INSTALLED hook command (`env -u NODE_OPTIONS ...` on POSIX, or
+ *    `cmd /d /s /c "set NODE_OPTIONS=&& ..."` on Windows) is what stops a
  *    preload that deletes NODE_OPTIONS, because the preload never loads.
+ *    Both the per-user installers and the managed pack write that command.
  */
 import { execFileSync, spawnSync } from "node:child_process";
-import { existsSync, mkdirSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from "node:fs";
+import { existsSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { dirname, join } from "node:path";
 import { fileURLToPath } from "node:url";
 import { afterAll, beforeAll, describe, expect, it } from "vitest";
 import type { Policy } from "../src/policy/types.js";
+import { isScrubbedHookCommand } from "../src/hooks/hook-command.js";
 import { installClaudeCodeHooks, quotePath } from "../src/hooks/install.js";
 import { installCursorHooks } from "../src/cursor/hooks-install.js";
+import { buildClaudeManagedHooks, buildCursorManagedHooks } from "../src/managed/pack.js";
 import { writeCachedPolicyAtomic } from "../src/policy/cache.js";
 
 const packageRoot = join(dirname(fileURLToPath(import.meta.url)), "..");
@@ -22,8 +26,6 @@ const packageRoot = join(dirname(fileURLToPath(import.meta.url)), "..");
 const buildDir = join(packageRoot, "node_modules", ".cache", `agentreel-selfcheck-${process.pid}`);
 const cli = join(buildDir, "cli.js");
 const work = mkdtempSync(join(tmpdir(), "agentreel-selfcheck-bundle-"));
-const posixOnly = process.platform === "win32" ? it.skip : it;
-
 // Preloads. `touch*` leave NODE_OPTIONS alone (a visible violation); `delete*`
 // remove it first, which is what blinds an in-process check.
 const marker = join(work, "preload-ran");
@@ -33,7 +35,12 @@ const deleteCjs = join(work, "delete.cjs");
 const deleteMjs = join(work, "delete.mjs");
 
 beforeAll(() => {
-  execFileSync("pnpm", ["exec", "tsup", "--out-dir", buildDir], { cwd: packageRoot, stdio: "pipe" });
+  const pnpmCmd = process.platform === "win32" ? "pnpm.cmd" : "pnpm";
+  execFileSync(pnpmCmd, ["exec", "tsup", "--out-dir", buildDir], {
+    cwd: packageRoot,
+    stdio: "pipe",
+    shell: process.platform === "win32",
+  });
   writeFileSync(touchCjs, `require("node:fs").writeFileSync(${JSON.stringify(marker)}, "ran");\n`);
   writeFileSync(touchMjs, `import { writeFileSync } from "node:fs";\nwriteFileSync(${JSON.stringify(marker)}, "ran");\n`);
   writeFileSync(
@@ -65,7 +72,62 @@ function baseEnv(home: string): NodeJS.ProcessEnv {
     NODE_ENV: "production",
     AGENTREEL_TELEMETRY: "0",
   };
+  // Windows: cmd, Node and better-sqlite3 need the system directories and
+  // temp paths. Do not copy the real user home.
+  for (const key of [
+    "SystemRoot",
+    "SYSTEMROOT",
+    "windir",
+    "WINDIR",
+    "SystemDrive",
+    "PATHEXT",
+    "COMSPEC",
+    "TEMP",
+    "TMP",
+    "APPDATA",
+    "LOCALAPPDATA",
+    "ProgramFiles",
+    "ProgramData",
+    "NUMBER_OF_PROCESSORS",
+  ]) {
+    if (process.env[key]) env[key] = process.env[key];
+  }
   return env;
+}
+
+/** Run an installed hook command the way the host would (sh or cmd). */
+function runHost(
+  command: string,
+  home: string,
+  opts: { nodeOptions?: string; input?: string; path?: string } = {},
+) {
+  const env = baseEnv(home);
+  if (opts.nodeOptions !== undefined) env.NODE_OPTIONS = opts.nodeOptions;
+  if (opts.path !== undefined) env.PATH = opts.path;
+  const input = opts.input ?? "";
+  const r =
+    process.platform === "win32"
+      ? spawnSync(process.env.ComSpec || "cmd.exe", ["/d", "/s", "/c", command], {
+          env,
+          input,
+          encoding: "utf8",
+        })
+      : spawnSync("/bin/sh", ["-c", command], { env, input, encoding: "utf8" });
+  return { status: r.status, stdout: r.stdout ?? "", stderr: r.stderr ?? "" };
+}
+
+function hookPrefix(): string {
+  return `${quotePath(process.execPath)} ${quotePath(cli)}`;
+}
+
+function expectScrubbed(command: string): void {
+  expect(isScrubbedHookCommand(command)).toBe(true);
+  if (process.platform === "win32") {
+    expect(command.startsWith('cmd /d /s /c "set NODE_OPTIONS=&& ')).toBe(true);
+    expect(command).not.toContain("env -u");
+  } else {
+    expect(command.startsWith("env -u NODE_OPTIONS ")).toBe(true);
+  }
 }
 
 function runCli(
@@ -211,7 +273,7 @@ describe("built bundle: a preload that deletes NODE_OPTIONS", () => {
 
   const claudeHookCommand = (home: string, event: string): string => {
     const settingsPath = join(home, ".claude", "settings.json");
-    installClaudeCodeHooks(`${quotePath(process.execPath)} ${quotePath(cli)}`, { settingsPath });
+    installClaudeCodeHooks(hookPrefix(), { settingsPath });
     const settings = JSON.parse(readFileSync(settingsPath, "utf8")) as {
       hooks: Record<string, Array<{ hooks: Array<{ command: string }> }>>;
     };
@@ -220,59 +282,78 @@ describe("built bundle: a preload that deletes NODE_OPTIONS", () => {
 
   const cursorHookCommand = (home: string, event: string): string => {
     const hooksPath = join(home, ".cursor", "hooks.json");
-    installCursorHooks(`${quotePath(process.execPath)} ${quotePath(cli)}`, hooksPath, {
+    installCursorHooks(hookPrefix(), hooksPath, {
       systemHooksPath: join(home, "no-system-hooks.json"),
     });
     const file = JSON.parse(readFileSync(hooksPath, "utf8")) as { hooks: Record<string, Array<{ command: string }>> };
     return file.hooks[event]![0]!.command;
   };
 
-  function sh(command: string, home: string, nodeOptions: string, input: string) {
-    const env = baseEnv(home);
-    env.NODE_OPTIONS = nodeOptions;
-    const r = spawnSync("sh", ["-c", command], { env, input, encoding: "utf8" });
-    return { status: r.status, stdout: r.stdout, stderr: r.stderr };
+  const sources: Array<[string, (home: string) => { command: string; kind: "claude" | "cursor" }]> = [
+    ["per-user Claude", (home) => ({ command: claudeHookCommand(home, "PreToolUse"), kind: "claude" })],
+    [
+      "managed pack Claude",
+      () => ({
+        command: buildClaudeManagedHooks({ hookCommand: hookPrefix(), platform: process.platform }).PreToolUse![0]!
+          .hooks[0]!.command,
+        kind: "claude",
+      }),
+    ],
+    [
+      "per-user Cursor",
+      (home) => ({ command: cursorHookCommand(home, "beforeShellExecution"), kind: "cursor" }),
+    ],
+    [
+      "managed pack Cursor",
+      () => ({
+        command: buildCursorManagedHooks({ hookCommand: hookPrefix(), platform: process.platform })
+          .beforeShellExecution![0]!.command,
+        kind: "cursor",
+      }),
+    ],
+  ];
+
+  for (const [source, getCommand] of sources) {
+    for (const [label, nodeOptions] of deleting) {
+      it(`${source}: ${label} preload that deletes NODE_OPTIONS never runs and the hook enforces`, () => {
+        const home = freshHome();
+        cachePolicy(home);
+        const { command, kind } = getCommand(home);
+        expectScrubbed(command);
+        const r = runHost(command, home, { nodeOptions, input: kind === "claude" ? PRE_TOOL_USE : CURSOR_SHELL });
+        expect(existsSync(marker)).toBe(false);
+        expect(r.status, r.stderr).toBe(0);
+        if (kind === "claude") {
+          const body = JSON.parse(r.stdout) as {
+            hookSpecificOutput: { permissionDecision: string; permissionDecisionReason: string };
+          };
+          expect(body.hookSpecificOutput.permissionDecision).toBe("deny");
+          expect(body.hookSpecificOutput.permissionDecisionReason).not.toContain("SELF005");
+        } else {
+          const body = JSON.parse(r.stdout) as { permission: string; user_message?: string };
+          expect(body.permission).toBe("deny");
+          expect(body.user_message ?? "").not.toContain("SELF005");
+        }
+      });
+    }
   }
 
-  for (const [label, nodeOptions] of deleting) {
-    posixOnly(`installed Claude command (env -u NODE_OPTIONS): ${label} preload never runs and the hook enforces`, () => {
-      const home = freshHome();
-      cachePolicy(home);
-      const command = claudeHookCommand(home, "PreToolUse");
-      expect(command.startsWith("env -u NODE_OPTIONS ")).toBe(true);
-      const r = sh(command, home, nodeOptions, PRE_TOOL_USE);
-      // The preload did not load, so it could not hide anything...
-      expect(existsSync(marker)).toBe(false);
-      // ...and the hook ran for real: the org policy denies the force push.
-      expect(r.status).toBe(0);
-      const body = JSON.parse(r.stdout) as { hookSpecificOutput: { permissionDecision: string; permissionDecisionReason: string } };
-      expect(body.hookSpecificOutput.permissionDecision).toBe("deny");
-      expect(body.hookSpecificOutput.permissionDecisionReason).not.toContain("SELF005");
-    });
-
-    posixOnly(`installed Cursor command (env -u NODE_OPTIONS): ${label} preload never runs and the hook enforces`, () => {
-      const home = freshHome();
-      cachePolicy(home);
-      const command = cursorHookCommand(home, "beforeShellExecution");
-      expect(command.startsWith("env -u NODE_OPTIONS ")).toBe(true);
-      const r = sh(command, home, nodeOptions, CURSOR_SHELL);
-      expect(existsSync(marker)).toBe(false);
-      expect(r.status).toBe(0);
-      const body = JSON.parse(r.stdout) as { permission: string; user_message?: string };
-      expect(body.permission).toBe("deny");
-      expect(body.user_message ?? "").not.toContain("SELF005");
-    });
-  }
-
-  posixOnly("fails closed if the wrapper cannot start: a missing `env` is a failed command, not an allow", () => {
+  it("fails closed if the wrapper cannot start: a missing env or cmd is a failed command, not an allow", () => {
     const home = freshHome();
     const command = claudeHookCommand(home, "PreToolUse");
-    const env = baseEnv(home);
-    env.PATH = "/nonexistent";
-    const r = spawnSync("/bin/sh", ["-c", command], { env, input: PRE_TOOL_USE, encoding: "utf8" });
-    expect(r.status).not.toBe(0);
-    expect(r.stdout).toBe("");
-    // Claude PreToolUse entries carry onFailure "block"; Cursor pre-exec entries carry failClosed.
+    expectScrubbed(command);
+    // Rename the wrapper so the host cannot start it. On Windows, cmd.exe is
+    // still found in the system directory even with an empty PATH, so hiding
+    // it via PATH is not a real test; a missing name is.
+    const broken = command.replace(/^(env|cmd)\b/, "$1-agentreel-missing");
+    const missing = runHost(broken, home, { input: PRE_TOOL_USE });
+    expect(missing.status).not.toBe(0);
+    expect(missing.stdout.trim()).toBe("");
+    if (process.platform !== "win32") {
+      const hidden = runHost(command, home, { path: "/nonexistent", input: PRE_TOOL_USE });
+      expect(hidden.status).not.toBe(0);
+      expect(hidden.stdout.trim()).toBe("");
+    }
     const settings = JSON.parse(readFileSync(join(home, ".claude", "settings.json"), "utf8")) as {
       hooks: Record<string, Array<{ hooks: Array<{ onFailure?: string }> }>>;
     };
@@ -282,18 +363,19 @@ describe("built bundle: a preload that deletes NODE_OPTIONS", () => {
       hooks: Record<string, Array<{ failClosed?: boolean }>>;
     };
     expect(cursor.hooks.beforeShellExecution![0]!.failClosed).toBe(true);
+    const managedClaude = buildClaudeManagedHooks({ hookCommand: hookPrefix(), platform: process.platform });
+    expect(managedClaude.PreToolUse![0]!.hooks[0]!.onFailure).toBe("block");
+    const managedCursor = buildCursorManagedHooks({ hookCommand: hookPrefix(), platform: process.platform });
+    expect(managedCursor.beforeShellExecution![0]!.failClosed).toBe(true);
   });
 
   for (const [label, nodeOptions] of deleting) {
     it(`documents the detection-only limit: without the wrapper, ${label} deleting NODE_OPTIONS runs first and the in-process check sees nothing`, () => {
       const home = freshHome();
       const r = runCli(["--version"], { home, nodeOptions });
-      // The preload ran (marker) and the check was blind (the CLI ran).
       expect(existsSync(marker)).toBe(true);
       expect(r.status).toBe(0);
       expect(r.stderr).not.toContain("SELF005");
     });
   }
-
-  mkdirSync(join(work, "keep"), { recursive: true });
 });

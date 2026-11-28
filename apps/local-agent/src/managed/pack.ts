@@ -11,6 +11,7 @@
  *   Linux and WSL: /etc/cursor/hooks.json
  *   macOS:         /Library/Application Support/Cursor/hooks.json
  */
+import { buildHookCommand, type HookPlatform } from "../hooks/hook-command.js";
 import { claudeHookTimeoutForEvent, CLAUDE_HOOK_MARKER } from "../hooks/install.js";
 import { cursorHookTimeoutForEvent } from "../cursor/hooks-install.js";
 import {
@@ -83,6 +84,14 @@ export interface BuildOptions {
   /** Absolute, root-owned path to the agentreel binary (quoted if it has spaces). */
   hookCommand: string;
   preExecTimeoutS?: number;
+  /**
+   * How to wrap hook commands to drop NODE_OPTIONS before Node starts.
+   * linux and darwin use `env -u`; win32 uses `cmd /d /s /c "set NODE_OPTIONS=&& ..."`.
+   * Defaults to process.platform. `agentreel managed install` still supports
+   * only linux and darwin, and always passes that platform explicitly so the
+   * templates stay POSIX.
+   */
+  platform?: HookPlatform;
 }
 
 /** Hook groups for the managed Claude Code file. Pre-exec hooks block on failure. */
@@ -92,7 +101,7 @@ export function buildClaudeManagedHooks(opts: BuildOptions): Record<string, Clau
   for (const event of MANAGED_CLAUDE_HOOK_EVENTS) {
     const entry: ClaudeManagedHookEntry = {
       type: "command",
-      command: `${opts.hookCommand} hook ${event}`,
+      command: buildHookCommand(opts.hookCommand, "hook", event, opts.platform),
       timeout: claudeHookTimeoutForEvent(event, preExecTimeoutS),
     };
     // onFailure "block" (Claude Code v2.1.295+) turns a crash, timeout or
@@ -109,7 +118,7 @@ export function buildCursorManagedHooks(opts: BuildOptions): Record<string, Curs
   const hooks: Record<string, CursorManagedHookDef[]> = {};
   for (const event of CURSOR_HOOK_EVENTS) {
     const def: CursorManagedHookDef = {
-      command: `${opts.hookCommand} ${CURSOR_HOOK_SUBCOMMAND} ${event}`,
+      command: buildHookCommand(opts.hookCommand, CURSOR_HOOK_SUBCOMMAND, event, opts.platform),
       timeout: cursorHookTimeoutForEvent(event, preExecTimeoutS),
     };
     if (isCursorPreExecHook(event)) def.failClosed = true;

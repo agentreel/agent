@@ -26,12 +26,16 @@ import { applyManagedInstall, planManagedInstall, underRoot } from "../src/manag
 import { managedInstallCommand, resolveInvokingUserHome } from "../src/commands/managed.js";
 import { removeCursorUserHooks } from "../src/managed/pack.js";
 import { installClaudeCodeHooks } from "../src/hooks/install.js";
-import { buildHookCommand, stripHookScrubWrapper } from "../src/hooks/hook-command.js";
+import { buildHookCommand } from "../src/hooks/hook-command.js";
 import { installCursorHooks, uninstallCursorHooks } from "../src/cursor/hooks-install.js";
 import { CURSOR_HOOK_EVENTS } from "../src/cursor/hook-normalize.js";
 import { shouldSkipTelemetryForArgv } from "../src/telemetry.js";
 
 const HOOK = "/usr/local/bin/agentreel";
+// Managed tests that pin linux (templates, --platform linux) use the POSIX wrapper.
+const posix = (sub: string, ev: string): string => buildHookCommand(HOOK, sub, ev, "linux");
+const win = (sub: string, ev: string): string => buildHookCommand(HOOK, sub, ev, "win32");
+
 const LINUX = MANAGED_PATHS.linux;
 
 let root: string;
@@ -76,28 +80,47 @@ describe("managed pack builders", () => {
   });
 
   it("blocks on failure only on the Claude pre-exec hook, with the approval timeout", () => {
-    const hooks = buildClaudeManagedHooks({ hookCommand: HOOK });
+    const hooks = buildClaudeManagedHooks({ hookCommand: HOOK, platform: "linux" });
     expect(Object.keys(hooks)).toEqual([...MANAGED_CLAUDE_HOOK_EVENTS]);
     expect(hooks.PreToolUse![0]!.hooks[0]).toEqual({
       type: "command",
-      command: `${HOOK} hook PreToolUse`,
+      command: posix("hook", "PreToolUse"),
       timeout: 130,
       onFailure: "block",
     });
-    expect(hooks.Stop![0]!.hooks[0]).toEqual({ type: "command", command: `${HOOK} hook Stop`, timeout: 5 });
+    expect(hooks.Stop![0]!.hooks[0]).toEqual({ type: "command", command: posix("hook", "Stop"), timeout: 5 });
   });
 
   it("fails closed only on the Cursor pre-exec hooks", () => {
-    const hooks = buildCursorManagedHooks({ hookCommand: HOOK });
+    const hooks = buildCursorManagedHooks({ hookCommand: HOOK, platform: "linux" });
     expect(Object.keys(hooks)).toEqual([...CURSOR_HOOK_EVENTS]);
     const closed = Object.entries(hooks).filter(([, d]) => d[0]!.failClosed).map(([e]) => e).sort();
     expect(closed).toEqual(["beforeMCPExecution", "beforeReadFile", "beforeShellExecution", "preToolUse"]);
     expect(hooks.beforeShellExecution![0]).toEqual({
-      command: `${HOOK} cursor-hook beforeShellExecution`,
+      command: posix("cursor-hook", "beforeShellExecution"),
       timeout: 130,
       failClosed: true,
     });
-    expect(hooks.afterFileEdit![0]).toEqual({ command: `${HOOK} cursor-hook afterFileEdit`, timeout: 5 });
+    expect(hooks.afterFileEdit![0]).toEqual({ command: posix("cursor-hook", "afterFileEdit"), timeout: 5 });
+  });
+
+  it("Windows managed hook commands use cmd to drop NODE_OPTIONS, not env -u", () => {
+    const claude = buildClaudeManagedHooks({ hookCommand: HOOK, platform: "win32" });
+    expect(claude.PreToolUse![0]!.hooks[0]).toEqual({
+      type: "command",
+      command: win("hook", "PreToolUse"),
+      timeout: 130,
+      onFailure: "block",
+    });
+    expect(win("hook", "PreToolUse")).toContain("cmd /d /s /c");
+    expect(win("hook", "PreToolUse")).toContain("set NODE_OPTIONS=");
+    expect(win("hook", "PreToolUse")).not.toContain("env -u");
+    const cursor = buildCursorManagedHooks({ hookCommand: HOOK, platform: "win32" });
+    expect(cursor.beforeShellExecution![0]).toEqual({
+      command: win("cursor-hook", "beforeShellExecution"),
+      timeout: 130,
+      failClosed: true,
+    });
   });
 
   it("uses the same events, commands and timeouts as the per-user installers", () => {
@@ -113,10 +136,7 @@ describe("managed pack builders", () => {
       const managedClaude = buildClaudeManagedHooks({ hookCommand: HOOK });
       expect(Object.keys(managedClaude).sort()).toEqual(Object.keys(userClaude).sort());
       for (const [event, groups] of Object.entries(managedClaude)) {
-        // The per-user installer now drops NODE_OPTIONS first; the managed pack
-        // (src/managed/*) does not yet, so compare the command it wraps.
-        const user = userClaude[event][0].hooks[0];
-        expect(groups[0]!.hooks[0]!).toEqual({ ...user, command: stripHookScrubWrapper(user.command) });
+        expect(groups[0]!.hooks[0]!).toEqual(userClaude[event][0].hooks[0]);
         expect(groups[0]!.matcher).toBe(userClaude[event][0].matcher);
         expect(groups[0]!.__agentreel).toBe(userClaude[event][0].__agentreel);
       }
@@ -124,8 +144,7 @@ describe("managed pack builders", () => {
       const managedCursor = buildCursorManagedHooks({ hookCommand: HOOK });
       expect(Object.keys(managedCursor).sort()).toEqual(Object.keys(userCursor).sort());
       for (const [event, defs] of Object.entries(managedCursor)) {
-        const user = userCursor[event][0];
-        expect(defs[0]!).toEqual({ ...user, command: stripHookScrubWrapper(user.command) });
+        expect(defs[0]!).toEqual(userCursor[event][0]);
       }
     } finally {
       rmSync(home, { recursive: true, force: true });
@@ -142,10 +161,10 @@ describe("managed pack builders", () => {
   it("checked-in templates match the generator", () => {
     const docs = join(__dirname, "..", "..", "..", "docs", "managed");
     expect(readFileSync(join(docs, "managed-settings.json"), "utf8")).toBe(
-      serializeJson(mergeClaudeManagedSettings({}, { hookCommand: HOOK })),
+      serializeJson(mergeClaudeManagedSettings({}, { hookCommand: HOOK, platform: "linux" })),
     );
     expect(readFileSync(join(docs, "cursor-hooks.json"), "utf8")).toBe(
-      serializeJson(mergeCursorManagedHooks({}, { hookCommand: HOOK })),
+      serializeJson(mergeCursorManagedHooks({}, { hookCommand: HOOK, platform: "linux" })),
     );
   });
 });
@@ -162,7 +181,7 @@ describe("agentreel managed install", () => {
     expect(out).toContain("dry run");
     expect(out).toContain("would create");
     expect(out).toContain('+  "allowManagedHooksOnly": true,');
-    expect(out).toContain(`+        "command": "${HOOK} cursor-hook beforeShellExecution",`);
+    expect(out).toContain(`+        "command": ${JSON.stringify(posix("cursor-hook", "beforeShellExecution"))},`);
   });
 
   it("creates both files, then a re-run changes nothing and makes no backup", () => {
@@ -218,7 +237,7 @@ describe("agentreel managed install", () => {
     });
     expect(merged.hooks.PreToolUse).toHaveLength(2);
     expect(merged.hooks.PreToolUse[0].hooks[0].command).toBe("/opt/org/check.sh");
-    expect(merged.hooks.PreToolUse[1].hooks[0].command).toBe(`${HOOK} hook PreToolUse`);
+    expect(merged.hooks.PreToolUse[1].hooks[0].command).toBe(posix("hook", "PreToolUse"));
     expect(existsSync(underRoot(root, LINUX.cursorHooks))).toBe(false);
 
     // A second run is a no-op: no new backup.

@@ -5,6 +5,7 @@
  */
 import { lstatSync, realpathSync } from "node:fs";
 import { dirname, isAbsolute, resolve } from "node:path";
+import { stripHookScrubWrapper } from "../hooks/hook-command.js";
 import type { ManagedPlatform } from "./pack.js";
 import { underRoot } from "./install.js";
 
@@ -43,7 +44,7 @@ export interface InspectHookPathOptions {
 }
 
 export function hookCommandBinaryPath(hookCommand: string): string | null {
-  const trimmed = hookCommand.trim();
+  const trimmed = stripHookScrubWrapper(hookCommand).trim();
   if (!trimmed) return null;
   if (trimmed.startsWith('"')) {
     const end = trimmed.indexOf('"', 1);

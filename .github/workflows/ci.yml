@@ -67,3 +67,35 @@ jobs:
           npm init -y
           npm install "$tarball"
           npm audit --omit=dev --audit-level=high
+
+  # Built-bundle hook self-check on Windows, including the cmd NODE_OPTIONS
+  # scrub and the missing-wrapper fail-closed case. Not a full test matrix:
+  # other suites still assume a POSIX shell.
+  windows-hook-selfcheck:
+    name: hook self-check (Windows, Node 22)
+    runs-on: windows-latest
+    timeout-minutes: 20
+    steps:
+      - name: Checkout
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+
+      - name: Setup pnpm
+        uses: pnpm/action-setup@b906affcce14559ad1aafd4ab0e942779e9f58b1 # v4 (uses packageManager from package.json)
+
+      - name: Setup Node
+        uses: actions/setup-node@949feb2413d6458794dcd2491c4babbbce0c15c1 # v7.1.0
+        with:
+          node-version: 22
+          cache: pnpm
+
+      - name: Install
+        run: pnpm install --frozen-lockfile
+
+      - name: Build
+        run: pnpm --filter @agentreel/agent build
+
+      - name: Hook self-check tests
+        working-directory: apps/local-agent
+        run: pnpm exec vitest run test/node-options-selfcheck-bundle.test.ts test/hook-command-scrub.test.ts test/managed-install.test.ts

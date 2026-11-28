@@ -1,5 +1,6 @@
 /**
- * Builds the command string installed into Claude Code and Cursor hook files.
+ * Builds the command string installed into Claude Code and Cursor hook files,
+ * including the managed pack (src/managed/pack.ts).
  *
  * Every installed hook command starts by removing NODE_OPTIONS from the
  * environment of the process that runs AgentReel:
