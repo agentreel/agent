@@ -39,17 +39,12 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Fixed
 
-- Upload timeout and retry: `postIngest` (used by `agentreel push`, the daemon flush and `agentreel link` validation) had no timeout, so a hung ingest could stall forever. Each attempt now aborts after 15s (`INGEST_TIMEOUT_MS`, covering the response body too) and fails with a transient `IngestError` (status 0). Timeouts, network errors, 5xx, 408 and 429 are retried up to 4 attempts in total with exponential backoff and full jitter (base 500ms, cap 8s), honoring a `Retry-After` header up to the cap. Other 4xx and a 2xx with `ok:false` still fail at once without a retry.
-
 - Enforced-org marker: a missing, unreadable, invalid or edited `policy.json` no longer means allow once an org has enforced. Whenever the agent caches an org policy in `enforce` mode it writes `policy.json.enforced.json` (mode 0600) with the org and a SHA-256 of the policy. While that marker exists, a missing, unreadable or invalid cache, or one whose policy no longer matches the hash (for example edited to `mode:"observe"` or with a block rule removed), loads a lockdown policy: every built-in Guard rule enabled with action `block`, in enforce mode, under the org's name. `agentreel doctor` and `agentreel policy` show the lockdown and its reason. Fetching a non-enforcing policy, or an explicit `agentreel auth` or `logout`, removes the marker. An enforcing cache written by an older agent gets its marker on first load. This is a tamper alarm for honest mistakes and simple edits. The signed policy verifier (Ed25519 over the `GET /api/v1/policy` payload) is the real fix and lands separately once the web contract is published.
-
 
 - Guard shell evasions: the built-in rules matched only the literal command text, so the 19 evasions in the re-audit (section 3.2) ran unblocked under an enforcing policy. In the pre-exec policy check each command rule now also runs on a normalized form of the command (NFKC, quotes and backslashes dropped, `$(echo X)` and backticks inlined, simple `VAR=value` expanded, `--recursive`/`--force` shortened, SQL `/**/` comments removed) and on synthetic equivalents: `find ~ -delete` and `python -c`/`node -e` home deletes read as `rm -rf ~`, a `base64 -d | sh` payload is decoded and checked, `bash <(curl ...)` and `sh -c "$(curl ...)"` read as `curl | sh`, `git push origin +main` reads as a force push, and a secret file or secret variable sent with `wget --post-file`, `nc`, a pipe, or in a URL or `-d` value reads as secret exfiltration. SQL files run with `psql -f`, `--file=` or `mysql <` are read (regular files, 256 KiB cap) and checked for `DROP TABLE` and friends. All passes are linear time; `matchRule` and `src/guard/linear-match.ts` are unchanged, findings still show the original command, and localhost targets and auth headers are not treated as exfiltration.
 
 
-
 - Local `policyMode: "block"` now blocks: `guard-config.json` with `policyMode: "block"` was silently treated as observe. With no org policy cached, it now loads as an enforcing policy with every one of the 31 built-in rules at `block` (rules listed with `enabled: false` stay off, severity overrides and allowlists still apply). `"warn"` (the default) and `"off"` are unchanged, and a server org policy always takes precedence. Docs and the precision-test notes now say 31 built-in rules, not 30.
-
 
 
 
