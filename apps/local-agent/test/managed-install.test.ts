@@ -35,7 +35,13 @@ const LINUX = MANAGED_PATHS.linux;
 
 let root: string;
 let lines: string[];
-const quiet = () => ({ log: (l: string) => lines.push(l), error: (l: string) => lines.push(l) });
+// A person at a terminal with no agent above them, so these tests do not depend on how vitest is run.
+const quiet = () => ({
+  log: (l: string) => lines.push(l),
+  error: (l: string) => lines.push(l),
+  isTTY: true,
+  ancestry: () => [],
+});
 
 function filesUnder(dir: string): string[] {
   if (!existsSync(dir)) return [];
