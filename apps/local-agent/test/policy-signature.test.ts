@@ -1,4 +1,4 @@
-import { createPrivateKey, sign } from "node:crypto";
+import { createPrivateKey, generateKeyPairSync, sign, type KeyObject } from "node:crypto";
 import { mkdtempSync, readFileSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
@@ -12,6 +12,9 @@ const pinned = await import("../src/policy/pinned-keys.js");
 const cache = await import("../src/policy/cache.js");
 const fetchMod = await import("../src/policy/fetch.js");
 const enforce = await import("../src/policy/enforce.js");
+const trust = await import("../src/policy/trust.js");
+// checkPolicyTrust reads mode and org_id from the policy; the signed body has both.
+const policyOf = (body: unknown) => body as never;
 
 // Published web contract test vector (agentreel/web PR #49). TEST KEY ONLY.
 const VECTOR = JSON.parse(
@@ -75,7 +78,9 @@ describe("web contract test vector", () => {
   });
 
   it("the shipped CLI does not pin the test key", () => {
-    expect(pinned.PINNED_POLICY_KEYS.some((k) => k.keyId === VECTOR.key_id)).toBe(false);
+    expect(Object.hasOwn(pinned.PINNED_POLICY_KEYS, VECTOR.key_id)).toBe(false);
+    expect(Object.keys(pinned.PINNED_POLICY_KEYS).length).toBeLessThanOrEqual(pinned.MAX_PINNED_POLICY_KEYS);
+    expect(() => pinned.validatePinnedPolicyKeys(pinned.PINNED_POLICY_KEYS)).not.toThrow();
   });
 });
 
@@ -378,5 +383,87 @@ describe("fail closed while no key is pinned", () => {
     expect(loaded.source).toBe("enforced_lockdown");
     expect(loaded.lockdownReason).toBe("policy_invalid");
     expect((await run(cachePath)).permitted).toBe(false);
+  });
+});
+
+// ---------------------------------------------------------------- pinning by key id
+
+function newKey() {
+  const { privateKey: priv, publicKey: pub } = generateKeyPairSync("ed25519");
+  const x = pub.export({ format: "jwk" }).x as string;
+  return { priv, publicKey: x, keyId: sig.policyKeyId(Buffer.from(x, "base64url")) };
+}
+
+function signWith(body: Record<string, unknown>, priv: KeyObject, keyId: string, signedAt = "2026-11-28T02:00:00.000Z") {
+  const out: Record<string, unknown> = { ...clone(body), signature: { alg: "Ed25519", key_id: keyId, signed_at: signedAt } };
+  (out.signature as Record<string, string>).value = sign(null, Buffer.from(sig.policySigningInput(out), "utf8"), priv).toString(
+    "base64url",
+  );
+  return out;
+}
+
+describe("PINNED_POLICY_KEYS is keyed by key id, at most two keys", () => {
+  const next = newKey();
+  const two = { [VECTOR.key_id]: VECTOR.public_key_b64url, [next.keyId]: next.publicKey };
+
+  it("both pinned keys (current and next) verify", () => {
+    pinned._setPinnedPolicyKeysForTests(two);
+    expect(pinned.pinnedPolicyKeys().map((k) => k.keyId).sort()).toEqual(Object.keys(two).sort());
+    const byCurrent = trust.checkPolicyTrust(policyOf(VECTOR.signed_policy), VECTOR.signed_policy);
+    expect(byCurrent).toMatchObject({ ok: true, signed: true, keyId: VECTOR.key_id });
+    const body = signWith(unsignedBase(), next.priv, next.keyId);
+    expect(trust.checkPolicyTrust(policyOf(body), body)).toMatchObject({ ok: true, signed: true, keyId: next.keyId });
+  });
+
+  it("an unpinned key is rejected and the enforcing policy fails closed", async () => {
+    pinned._setPinnedPolicyKeysForTests(two);
+    const rogue = newKey();
+    const body = signWith(unsignedBase(), rogue.priv, rogue.keyId);
+    const res = trust.checkPolicyTrust(policyOf(body), body);
+    expect(res.ok === false && res.reason).toBe("unknown_key_id");
+    const cachePath = cachePathFor();
+    expect((await fetchWith(cachePath, respond(body))).status).toBe("invalid_policy");
+    expect(cache.readCachedPolicy(cachePath)).toBeNull();
+    expect(cache.loadEffectivePolicy({ cachePath, guardConfigPath: join(testHome, "none.json") }).source).toBe(
+      "enforced_lockdown",
+    );
+  });
+
+  it("a signature that claims a pinned kid but is made by another key is rejected", () => {
+    pinned._setPinnedPolicyKeysForTests(two);
+    const rogue = newKey();
+    const body = signWith(unsignedBase(), rogue.priv, next.keyId);
+    expect(sig.verifyPolicySignature(body, pinned.pinnedPolicyKeys()).ok).toBe(false);
+  });
+
+  it("a missing kid is rejected and the enforcing policy fails closed", async () => {
+    pinned._setPinnedPolicyKeysForTests(two);
+    const body = clone(VECTOR.signed_policy) as Record<string, unknown>;
+    delete (body.signature as Record<string, unknown>).key_id;
+    const res = trust.checkPolicyTrust(policyOf(body), body);
+    expect(res.ok).toBe(false);
+    expect(res.ok === false && res.reason).toBe("malformed_signature");
+    const cachePath = cachePathFor();
+    expect((await fetchWith(cachePath, respond(body))).status).toBe("invalid_policy");
+    expect(cache.loadEffectivePolicy({ cachePath, guardConfigPath: join(testHome, "none.json") }).source).toBe(
+      "enforced_lockdown",
+    );
+  });
+
+  it("a third key is refused by config validation, and then nothing verifies", () => {
+    const third = newKey();
+    const three = { ...two, [third.keyId]: third.publicKey };
+    expect(() => pinned.validatePinnedPolicyKeys(three)).toThrow(/at most 2/);
+    expect(() => pinned.validatePinnedPolicyKeys(two)).not.toThrow();
+    pinned._setPinnedPolicyKeysForTests(three);
+    expect(pinned.pinnedPolicyKeys()).toEqual([]);
+    const res = trust.checkPolicyTrust(policyOf(VECTOR.signed_policy), VECTOR.signed_policy);
+    expect(res.ok === false && res.reason).toBe("unknown_key_id");
+  });
+
+  it("config validation refuses a key id that does not match its public key, or a bad key id", () => {
+    expect(() => pinned.validatePinnedPolicyKeys({ [VECTOR.key_id]: next.publicKey })).toThrow(/hash/);
+    expect(() => pinned.validatePinnedPolicyKeys({ "ed25519-XYZ": next.publicKey })).toThrow(/key id/);
+    expect(() => pinned.validatePinnedPolicyKeys({ [next.keyId]: "short" })).toThrow(/32-byte/);
   });
 });
