@@ -506,6 +506,69 @@ describe("per-user Cursor install defers to the managed pack", () => {
         }
       });
 
+      it("install, cleanup and uninstall refuse a hard-linked hooks.json and leave the other name unchanged", () => {
+        const victimBody = "victim-hard-link-bytes\n";
+        const hooksBody = JSON.stringify({
+          version: 1,
+          hooks: { preToolUse: [{ command: "agentreel cursor-hook preToolUse" }, { command: "/opt/other" }] },
+        }, null, 2) + "\n";
+        writeFileSync(systemCursorHooks, JSON.stringify({ version: 1, hooks: { preToolUse: [{ command: "agentreel cursor-hook preToolUse" }] } }));
+        const ops: Array<[string, (f: string) => { refused?: unknown; removed?: number; installedEvents?: unknown[] }]> = [
+          ["install", (f) => cursorInstall.installCursorHooks("agentreel", f, { systemHooksPath: join(work, "none.json") })],
+          ["cleanup", (f) => cursorInstall.installCursorHooks("agentreel", f, { systemHooksPath: systemCursorHooks })],
+          ["uninstall", (f) => cursorInstall.uninstallCursorHooks(f)],
+        ];
+        for (const [label, op] of ops) {
+          const dir = join(work, `hardlink-${label}`);
+          mkdirSync(dir);
+          const victim = join(dir, "other.json");
+          const hooks = join(dir, "hooks.json");
+          writeFileSync(victim, hooksBody);
+          fs.linkSync(victim, hooks);
+          expect(lstatSync(hooks).nlink).toBe(2);
+          writeFileSync(join(dir, "victim-copy"), victimBody);
+          // Keep an independent copy of the shared bytes via the victim path after the link.
+          const before = readFileSync(victim, "utf8");
+          expect(before).toBe(hooksBody);
+          const res = op(hooks);
+          expect(res.refused).toBeTruthy();
+          expect(res.installedEvents ?? []).toEqual([]);
+          expect(readFileSync(victim, "utf8")).toBe(before);
+          expect(readFileSync(hooks, "utf8")).toBe(before);
+          expect(lstatSync(hooks).nlink).toBe(2);
+        }
+      });
+
+      it("a first-backup-name EEXIST is retried with a new name and the write succeeds", () => {
+        const dir = join(work, "backup-eexist");
+        mkdirSync(dir);
+        const userFile = join(dir, "hooks.json");
+        writeFileSync(userFile, regularBody("/opt/keep"));
+        const occupied = join(dir, "occupied-backup");
+        writeFileSync(occupied, "occupied");
+        const seam = cursorInstall._userHooksWriteForTests;
+        const real = seam.nextBackupPath;
+        let calls = 0;
+        seam.nextBackupPath = (p) => {
+          calls += 1;
+          if (calls === 1) return occupied;
+          seam.nextBackupPath = real;
+          // Fall through to the real unique name.
+          return `${p}.agentreel-backup-retried-${calls}`;
+        };
+        try {
+          const res = cursorInstall.installCursorHooks("agentreel", userFile, { systemHooksPath: join(work, "none.json") });
+          expect(res.refused).toBeFalsy();
+          expect(res.backup).toBeTruthy();
+          expect(res.backup).not.toBe(occupied);
+          expect(readFileSync(occupied, "utf8")).toBe("occupied");
+          expect(calls).toBeGreaterThanOrEqual(2);
+          expect(readFileSync(userFile, "utf8")).toContain("cursor-hook");
+        } finally {
+          seam.nextBackupPath = real;
+        }
+      });
+
       it("two writes in the same millisecond both succeed and leave two distinct backups", () => {
         const dir = join(work, "same-ms-backup");
         mkdirSync(dir);
@@ -696,15 +759,74 @@ const DENIED: Array<[string, string]> = [
   ["SELF001", "node /tmp/node_modules/@agentreel/agent/dist/other.js doctor"],
   ["SELF001", "cat /usr/local/lib/node_modules/@agentreel/agent/dist/cli.js > /tmp/x"],
   ["SELF001", "cp /tmp/evil.js /usr/local/lib/node_modules/@agentreel/agent/dist/cli.js"],
-  ["SELF001", "NODE_OPTIONS=--require=/tmp/evil.js node /usr/local/lib/node_modules/@agentreel/agent/dist/cli.js doctor"],
-  ["SELF001", "NODE_OPTIONS=--import=/tmp/evil.mjs node /usr/local/lib/node_modules/@agentreel/agent/dist/cli.js doctor"],
-  ["SELF001", "NODE_OPTIONS='--require /tmp/evil.js' node /usr/local/lib/node_modules/@agentreel/agent/dist/cli.js doctor"],
-  ["SELF001", "env NODE_OPTIONS=--require=/tmp/evil.js node /usr/local/lib/node_modules/@agentreel/agent/dist/cli.js doctor"],
-  ["SELF001", "env NODE_OPTIONS=--import=/tmp/evil.mjs node /usr/local/lib/node_modules/@agentreel/agent/dist/cli.js managed install --dry-run"],
-  ["SELF001", "sudo NODE_OPTIONS=--require=/tmp/evil.js node /usr/local/lib/node_modules/@agentreel/agent/dist/cli.js doctor"],
+  ["SELF005", "NODE_OPTIONS=--require=/tmp/evil.js node /usr/local/lib/node_modules/@agentreel/agent/dist/cli.js doctor"],
+  ["SELF005", "NODE_OPTIONS=--import=/tmp/evil.mjs node /usr/local/lib/node_modules/@agentreel/agent/dist/cli.js doctor"],
+  ["SELF005", "NODE_OPTIONS='--require /tmp/evil.js' node /usr/local/lib/node_modules/@agentreel/agent/dist/cli.js doctor"],
+  ["SELF005", "env NODE_OPTIONS=--require=/tmp/evil.js node /usr/local/lib/node_modules/@agentreel/agent/dist/cli.js doctor"],
+  ["SELF005", "env NODE_OPTIONS=--import=/tmp/evil.mjs node /usr/local/lib/node_modules/@agentreel/agent/dist/cli.js managed install --dry-run"],
+  ["SELF005", "sudo NODE_OPTIONS=--require=/tmp/evil.js node /usr/local/lib/node_modules/@agentreel/agent/dist/cli.js doctor"],
   ["SELF005", "export NODE_OPTIONS=--require=/tmp/evil.js"],
   ["SELF005", "unset NODE_OPTIONS"],
   ["SELF005", "NODE_OPTIONS=--require=/tmp/evil.js claude -p hi"],
+  ["SELF005", "NODE_OPTIONS=--require=/tmp/evil.js agentreel doctor"],
+  ["SELF005", "NODE_OPTIONS=--import=/tmp/evil.mjs agentreel doctor"],
+  ["SELF005", "env NODE_OPTIONS=--require=/tmp/evil.js agentreel doctor"],
+  ["SELF005", "sudo NODE_OPTIONS=--require=/tmp/evil.js agentreel doctor"],
+  ["SELF005", "NODE_OPTIONS=--require=/tmp/evil.js agentreel status"],
+  ["SELF005", "NODE_OPTIONS=--import=/tmp/evil.mjs agentreel status"],
+  ["SELF005", "env NODE_OPTIONS=--require=/tmp/evil.js agentreel status"],
+  ["SELF005", "sudo NODE_OPTIONS=--require=/tmp/evil.js agentreel status"],
+  ["SELF005", "NODE_OPTIONS=--require=/tmp/evil.js npx @agentreel/agent doctor"],
+  ["SELF005", "NODE_OPTIONS=--import=/tmp/evil.mjs npx @agentreel/agent doctor"],
+  ["SELF005", "env NODE_OPTIONS=--require=/tmp/evil.js npx @agentreel/agent doctor"],
+  ["SELF005", "sudo NODE_OPTIONS=--require=/tmp/evil.js npx @agentreel/agent doctor"],
+  ["SELF005", "NODE_OPTIONS=--require=/tmp/evil.js npm exec @agentreel/agent doctor"],
+  ["SELF005", "NODE_OPTIONS=--import=/tmp/evil.mjs npm exec @agentreel/agent doctor"],
+  ["SELF005", "env NODE_OPTIONS=--require=/tmp/evil.js npm exec @agentreel/agent doctor"],
+  ["SELF005", "sudo NODE_OPTIONS=--require=/tmp/evil.js npm exec @agentreel/agent doctor"],
+  ["SELF005", "NODE_OPTIONS=--require=/tmp/evil.js pnpm exec @agentreel/agent doctor"],
+  ["SELF005", "NODE_OPTIONS=--import=/tmp/evil.mjs pnpm exec @agentreel/agent doctor"],
+  ["SELF005", "env NODE_OPTIONS=--require=/tmp/evil.js pnpm exec @agentreel/agent doctor"],
+  ["SELF005", "sudo NODE_OPTIONS=--require=/tmp/evil.js pnpm exec @agentreel/agent doctor"],
+  ["SELF005", "NODE_OPTIONS=--require=/tmp/evil.js pnpm dlx @agentreel/agent doctor"],
+  ["SELF005", "NODE_OPTIONS=--import=/tmp/evil.mjs pnpm dlx @agentreel/agent doctor"],
+  ["SELF005", "env NODE_OPTIONS=--require=/tmp/evil.js pnpm dlx @agentreel/agent doctor"],
+  ["SELF005", "sudo NODE_OPTIONS=--require=/tmp/evil.js pnpm dlx @agentreel/agent doctor"],
+  ["SELF005", "NODE_OPTIONS=--require=/tmp/evil.js yarn exec @agentreel/agent doctor"],
+  ["SELF005", "NODE_OPTIONS=--import=/tmp/evil.mjs yarn exec @agentreel/agent doctor"],
+  ["SELF005", "env NODE_OPTIONS=--require=/tmp/evil.js yarn exec @agentreel/agent doctor"],
+  ["SELF005", "sudo NODE_OPTIONS=--require=/tmp/evil.js yarn exec @agentreel/agent doctor"],
+  ["SELF005", "NODE_OPTIONS=--require=/tmp/evil.js bunx @agentreel/agent doctor"],
+  ["SELF005", "NODE_OPTIONS=--import=/tmp/evil.mjs bunx @agentreel/agent doctor"],
+  ["SELF005", "env NODE_OPTIONS=--require=/tmp/evil.js bunx @agentreel/agent doctor"],
+  ["SELF005", "sudo NODE_OPTIONS=--require=/tmp/evil.js bunx @agentreel/agent doctor"],
+  ["SELF005", "NODE_OPTIONS=--require=/tmp/evil.js bun run doctor"],
+  ["SELF005", "NODE_OPTIONS=--import=/tmp/evil.mjs bun run doctor"],
+  ["SELF005", "env NODE_OPTIONS=--require=/tmp/evil.js bun run doctor"],
+  ["SELF005", "sudo NODE_OPTIONS=--require=/tmp/evil.js bun run doctor"],
+  ["SELF005", "NODE_OPTIONS=--require=/tmp/evil.js node /usr/local/lib/node_modules/@agentreel/agent/dist/cli.js doctor"],
+  ["SELF005", "NODE_OPTIONS=--import=/tmp/evil.mjs node /usr/local/lib/node_modules/@agentreel/agent/dist/cli.js doctor"],
+  ["SELF005", "env NODE_OPTIONS=--require=/tmp/evil.js node /usr/local/lib/node_modules/@agentreel/agent/dist/cli.js doctor"],
+  ["SELF005", "sudo NODE_OPTIONS=--require=/tmp/evil.js node /usr/local/lib/node_modules/@agentreel/agent/dist/cli.js doctor"],
+  ["SELF005", "NODE_OPTIONS=--require=/tmp/evil.js nodejs /usr/local/lib/node_modules/@agentreel/agent/dist/cli.js doctor"],
+  ["SELF005", "NODE_OPTIONS=--import=/tmp/evil.mjs nodejs /usr/local/lib/node_modules/@agentreel/agent/dist/cli.js doctor"],
+  ["SELF005", "env NODE_OPTIONS=--require=/tmp/evil.js nodejs /usr/local/lib/node_modules/@agentreel/agent/dist/cli.js doctor"],
+  ["SELF005", "sudo NODE_OPTIONS=--require=/tmp/evil.js nodejs /usr/local/lib/node_modules/@agentreel/agent/dist/cli.js doctor"],
+  ["SELF005", "NODE_OPTIONS=--require=/tmp/evil.js /usr/bin/node /usr/local/lib/node_modules/@agentreel/agent/dist/cli.js doctor"],
+  ["SELF005", "NODE_OPTIONS=--import=/tmp/evil.mjs /usr/bin/node /usr/local/lib/node_modules/@agentreel/agent/dist/cli.js doctor"],
+  ["SELF005", "env NODE_OPTIONS=--require=/tmp/evil.js /usr/bin/node /usr/local/lib/node_modules/@agentreel/agent/dist/cli.js doctor"],
+  ["SELF005", "sudo NODE_OPTIONS=--require=/tmp/evil.js /usr/bin/node /usr/local/lib/node_modules/@agentreel/agent/dist/cli.js doctor"],
+  ["SELF005", "NODE_OPTIONS=--require=/tmp/evil.js tsx src/cli.ts doctor"],
+  ["SELF005", "NODE_OPTIONS=--import=/tmp/evil.mjs tsx src/cli.ts doctor"],
+  ["SELF005", "env NODE_OPTIONS=--require=/tmp/evil.js tsx src/cli.ts doctor"],
+  ["SELF005", "sudo NODE_OPTIONS=--require=/tmp/evil.js tsx src/cli.ts doctor"],
+  ["SELF005", "NODE_OPTIONS=--require=/tmp/evil.js ts-node src/cli.ts doctor"],
+  ["SELF005", "NODE_OPTIONS=--import=/tmp/evil.mjs ts-node src/cli.ts doctor"],
+  ["SELF005", "env NODE_OPTIONS=--require=/tmp/evil.js ts-node src/cli.ts doctor"],
+  ["SELF005", "sudo NODE_OPTIONS=--require=/tmp/evil.js ts-node src/cli.ts doctor"],
+  ["SELF005", "sudo -E env NODE_OPTIONS=--require=/tmp/evil.js agentreel doctor"],
+  ["SELF005", "sudo -E env NODE_OPTIONS=--require=/tmp/evil.js npx @agentreel/agent doctor"],
+  ["SELF005", "sudo -E env NODE_OPTIONS=--require=/tmp/evil.js node /usr/local/lib/node_modules/@agentreel/agent/dist/cli.js doctor"],
 ];
 
 const ALLOWED = [
