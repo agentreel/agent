@@ -7,6 +7,7 @@
     "build": "pnpm -r build",
     "agent": "pnpm --filter @agentreel/agent",
     "typecheck": "pnpm -r typecheck",
+    "lint": "eslint .",
     "test": "pnpm -r --if-present test"
   },
   "engines": {
@@ -18,5 +19,11 @@
       "better-sqlite3",
       "esbuild"
     ]
+  },
+  "devDependencies": {
+    "@eslint/js": "^9.39.5",
+    "eslint": "^9.39.5",
+    "globals": "^17.14.0",
+    "typescript-eslint": "^8.74.0"
   }
 }
