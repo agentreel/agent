@@ -454,6 +454,7 @@ describe("telemetry opt-out never fetches", () => {
 type IntegrationRunResult = {
   requests: Array<Record<string, unknown>>;
   telemetry: Record<string, unknown> | null;
+  exit: { code: number | null; signal: string | null };
 };
 
 function runTelemetryCliIntegration(
@@ -461,20 +462,32 @@ function runTelemetryCliIntegration(
   statusCode: number,
   integrationHome: string,
   keepState: boolean,
+  options?: { args?: string[]; stubDelayMs?: number },
 ): IntegrationRunResult {
   const outPath = join(integrationHome, "integration-result.json");
   const integrationScript = join(fixtureDir, "telemetry-cli-integration.mjs");
   const keepArg = keepState ? "keep" : "reset";
+  const env: NodeJS.ProcessEnv = {
+    ...process.env,
+    NODE_ENV: "production",
+    VITEST: "",
+    VITEST_WORKER_ID: "",
+  };
+  if (options?.stubDelayMs != null) {
+    env.AGENTREEL_TEST_STUB_DELAY_MS = String(options.stubDelayMs);
+  }
   execFileSync(
     "node",
-    [integrationScript, String(statusCode), integrationHome, outPath, keepArg],
+    [
+      integrationScript,
+      String(statusCode),
+      integrationHome,
+      outPath,
+      keepArg,
+      ...(options?.args ?? []),
+    ],
     {
-      env: {
-        ...process.env,
-        NODE_ENV: "production",
-        VITEST: "",
-        VITEST_WORKER_ID: "",
-      },
+      env,
       encoding: "utf8",
       stdio: ["pipe", "pipe", "pipe"],
     },
@@ -511,6 +524,20 @@ describe("telemetry CLI integration", () => {
     expect(typeof result.telemetry?.anon_id).toBe("string");
     expect(result.telemetry?.notice_shown).toBe(true);
     expect(result.telemetry?.first_run_sent).not.toBe(true);
+  });
+
+  it("built CLI unknown command flushes telemetry before process.exit", () => {
+    const integrationHome = mkdtempSync(join(tmpdir(), "agentreel-telemetry-cli-int-"));
+    const result = runTelemetryCliIntegration(fixtureDir, 200, integrationHome, false, {
+      args: ["not-a-command"],
+      stubDelayMs: 100,
+    });
+    expect(result.exit.code).toBe(1);
+    expect(result.requests).toHaveLength(1);
+    expect(result.requests[0]?.event).toBe("cli_first_run");
+    expect(result.telemetry?.first_run_sent).toBe(true);
+    expect(typeof result.telemetry?.anon_id).toBe("string");
+    expect(result.telemetry?.notice_shown).toBe(true);
   });
 });
 
