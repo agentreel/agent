@@ -50,7 +50,9 @@ export const _userHooksWriteForTests: {
   beforeOpen: ((path: string) => void) | undefined;
   /** Override the next backup path. Tests use this to force an EEXIST retry. */
   nextBackupPath: ((path: string) => string) | undefined;
-} = { noFollow: fs.constants.O_NOFOLLOW, beforeOpen: undefined, nextBackupPath: undefined };
+  /** Replace the final rename. Tests use this to force a rename failure. */
+  rename: ((from: string, to: string) => void) | undefined;
+} = { noFollow: fs.constants.O_NOFOLLOW, beforeOpen: undefined, nextBackupPath: undefined, rename: undefined };
 
 const OPEN_REFUSAL_CODES = new Set(["ELOOP", "EMLINK"]);
 
@@ -212,7 +214,9 @@ function writeUserHooksFile(path: string, content: string): UserHooksWrite {
     const mode = existingMode ?? 0o600;
     tmpPath = `${path}.agentreel-tmp-${process.pid}-${randomBytes(6).toString("hex")}`;
     try {
-      tmpFd = fs.openSync(tmpPath, c.O_WRONLY | c.O_CREAT | c.O_EXCL, mode);
+      // O_EXCL already refuses an existing name (a planted symlink included);
+      // O_NOFOLLOW, where the platform has it, is a second guard.
+      tmpFd = fs.openSync(tmpPath, c.O_WRONLY | c.O_CREAT | c.O_EXCL | (noFollow ?? 0), mode);
     } catch (err) {
       return fail((err as NodeJS.ErrnoException).code ?? "open");
     }
@@ -225,7 +229,7 @@ function writeUserHooksFile(path: string, content: string): UserHooksWrite {
     fs.fsyncSync(tmpFd);
     fs.closeSync(tmpFd);
     tmpFd = null;
-    fs.renameSync(tmpPath, path);
+    (_userHooksWriteForTests.rename ?? fs.renameSync)(tmpPath, path);
     tmpPath = null;
     return { ok: true, backup: b };
   } catch (err) {
