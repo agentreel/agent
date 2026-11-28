@@ -467,3 +467,38 @@ describe("PINNED_POLICY_KEYS is keyed by key id, at most two keys", () => {
     expect(() => pinned.validatePinnedPolicyKeys({ [next.keyId]: "short" })).toThrow(/32-byte/);
   });
 });
+
+describe("shipped PINNED_POLICY_KEYS (release B)", () => {
+  const PROD_KID = "ed25519-1091560a744b8a9e";
+  const PROD_PUB = "p9YDgiP5XFmVGoNtZDc4Ea70zAmt_fIDptdAlaF-cXo";
+
+  beforeEach(() => {
+    pinned._setPinnedPolicyKeysForTests(null);
+    pinned._setSignedPolicyRequiredForTests(true);
+  });
+
+  it("config validation accepts the single pinned entry", () => {
+    expect(Object.keys(pinned.PINNED_POLICY_KEYS)).toEqual([PROD_KID]);
+    expect(pinned.PINNED_POLICY_KEYS[PROD_KID]).toBe(PROD_PUB);
+    expect(() => pinned.validatePinnedPolicyKeys(pinned.PINNED_POLICY_KEYS)).not.toThrow();
+    expect(pinned.pinnedPolicyKeys()).toEqual([{ keyId: PROD_KID, publicKey: PROD_PUB }]);
+  });
+
+  it("the key id matches the public key", () => {
+    const raw = Buffer.from(PROD_PUB, "base64url");
+    expect(raw.length).toBe(32);
+    expect(sig.policyKeyId(raw)).toBe(PROD_KID);
+  });
+
+  it("a policy signed by a different key is rejected", () => {
+    const keys = pinned.pinnedPolicyKeys();
+    const res = sig.verifyPolicySignature(VECTOR.signed_policy, keys);
+    expect(res.ok === false && res.reason).toBe("unknown_key_id");
+    const other = newKey();
+    const body = signWith(unsignedBase(), other.priv, other.keyId);
+    const res2 = sig.verifyPolicySignature(body, keys);
+    expect(res2.ok === false && res2.reason).toBe("unknown_key_id");
+    expect(trust.checkPolicyTrust(policyOf(body), body).ok).toBe(false);
+  });
+});
+

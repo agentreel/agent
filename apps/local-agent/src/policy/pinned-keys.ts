@@ -18,12 +18,14 @@ export const MAX_PINNED_POLICY_KEYS = 2;
  * POLICY_SIGNING_PRIVATE_KEY, then a later release drops the old key.
  * Revocation: a release that removes the compromised key id.
  *
- * Empty until the production signing key exists. Generate it with
- * scripts/generate-policy-signing-key.sh (docs/policy-signing-key.md), which
- * writes the private key only to Secret Manager and prints the key id and
- * public key to pin here. Never pin the test vector key (seed 0x01..0x20).
+ * This release pins the production key stored as POLICY_SIGNING_PRIVATE_KEY
+ * version 1 (key id ed25519-1091560a744b8a9e). There is no next key yet.
+ * Generate a rotation key with scripts/generate-policy-signing-key.mjs
+ * (docs/policy-signing-key.md). Never pin the test vector key (seed 0x01..0x20).
  */
-export const PINNED_POLICY_KEYS: Readonly<Record<string, string>> = Object.freeze({});
+export const PINNED_POLICY_KEYS: Readonly<Record<string, string>> = Object.freeze({
+  "ed25519-1091560a744b8a9e": "p9YDgiP5XFmVGoNtZDc4Ea70zAmt_fIDptdAlaF-cXo",
+});
 
 /**
  * Checks a pinned key map and returns it as a list. Throws on more than
