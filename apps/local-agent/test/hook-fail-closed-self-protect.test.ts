@@ -1,4 +1,5 @@
 import { existsSync, lstatSync, mkdirSync, mkdtempSync, readdirSync, readFileSync, rmSync, symlinkSync, writeFileSync } from "node:fs";
+import * as fs from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
@@ -195,6 +196,162 @@ describe("per-user Cursor install defers to the managed pack", () => {
       const res = run(cursorHooks);
       expect(res.skipped && res.removed).toBe(1);
       expect(res.skipped && res.warning).toBeUndefined();
+    });
+
+    it("cleanup: a missing ~/.cursor directory is nothing to clean", () => {
+      writeFileSync(systemCursorHooks, managedBody);
+      const userFile = join(work, "missing-cursor", "hooks.json");
+      const res = run(userFile);
+      expect(res.skipped).toBe(true);
+      expect(res.skipped && res.removed).toBe(0);
+      expect(res.skipped && res.warning).toBeUndefined();
+      expect(existsSync(join(work, "missing-cursor"))).toBe(false);
+    });
+
+    it("cleanup: a non-ENOENT lstat error refuses and leaves the file unchanged", () => {
+      writeFileSync(systemCursorHooks, managedBody);
+      const userDir = join(work, "dot-cursor-eacces-clean");
+      mkdirSync(userDir);
+      const userFile = join(userDir, "hooks.json");
+      const body = JSON.stringify({ version: 1, hooks: { preToolUse: [{ command: "agentreel cursor-hook preToolUse" }] } }) + "\n";
+      writeFileSync(userFile, body);
+      const real = cursorInstall._userHooksLstatForTests.lstatSync;
+      const spy = vi.spyOn(cursorInstall._userHooksLstatForTests, "lstatSync").mockImplementation(((p: fs.PathLike, opts?: unknown) => {
+        if (String(p) === userFile) {
+          const err = new Error("permission denied") as NodeJS.ErrnoException;
+          err.code = "EACCES";
+          throw err;
+        }
+        return real.call(cursorInstall._userHooksLstatForTests, p, opts as never);
+      }) as typeof fs.lstatSync);
+      try {
+        const res = run(userFile);
+        expect(res.skipped).toBe(true);
+        expect(res.skipped && res.removed).toBe(0);
+        expect(res.skipped && res.backup).toBeNull();
+        expect(res.skipped && res.warning).toBeTruthy();
+        expect(readFileSync(userFile, "utf8")).toBe(body);
+        expect(noBackups(userDir)).toEqual([]);
+      } finally {
+        spy.mockRestore();
+      }
+    });
+  });
+
+  describe("install path never writes through a symlink or when lstat fails", () => {
+    const otherBody = "do-not-clobber\n";
+    const absentSystem = join(work, "no-system-hooks.json");
+    const install = (userPath: string) =>
+      cursorInstall.installCursorHooks("agentreel", userPath, { systemHooksPath: absentSystem });
+    const noBackups = (dir: string) => readdirSync(dir).filter((f) => f.includes("backup"));
+
+    it("install: hooks.json symlinked to another file: target bytes unchanged", () => {
+      const target = join(work, "other-hooks.json");
+      writeFileSync(target, otherBody);
+      const userDir = join(work, "dot-cursor-install");
+      mkdirSync(userDir);
+      const userFile = join(userDir, "hooks.json");
+      symlinkSync(target, userFile);
+      const res = install(userFile);
+      expect(res.skipped).toBe(false);
+      expect(res.refused).toBe(true);
+      expect(res.warning).toMatch(/symlink/);
+      expect(res.installedEvents).toEqual([]);
+      expect(res.backup).toBeNull();
+      expect(readFileSync(target, "utf8")).toBe(otherBody);
+      expect(lstatSync(userFile).isSymbolicLink()).toBe(true);
+      expect(noBackups(userDir)).toEqual([]);
+    });
+
+    it("install: ~/.cursor itself is a symlink: target bytes unchanged", () => {
+      const realDir = join(work, "real-cursor");
+      mkdirSync(realDir);
+      const target = join(realDir, "hooks.json");
+      writeFileSync(target, otherBody);
+      const linkDir = join(work, "dot-cursor-install-link");
+      symlinkSync(realDir, linkDir);
+      const res = install(join(linkDir, "hooks.json"));
+      expect(res.refused).toBe(true);
+      expect(res.warning).toMatch(/symlink/);
+      expect(res.installedEvents).toEqual([]);
+      expect(readFileSync(target, "utf8")).toBe(otherBody);
+      expect(noBackups(realDir)).toEqual([]);
+    });
+
+    it("install: a non-ENOENT lstat error refuses and leaves the file unchanged", () => {
+      const userDir = join(work, "dot-cursor-eacces-install");
+      mkdirSync(userDir);
+      const userFile = join(userDir, "hooks.json");
+      const body = JSON.stringify({ version: 1, hooks: { afterFileEdit: [{ command: "./fmt" }] } }) + "\n";
+      writeFileSync(userFile, body);
+      const real = cursorInstall._userHooksLstatForTests.lstatSync;
+      const spy = vi.spyOn(cursorInstall._userHooksLstatForTests, "lstatSync").mockImplementation(((p: fs.PathLike, opts?: unknown) => {
+        if (String(p) === userFile) {
+          const err = new Error("permission denied") as NodeJS.ErrnoException;
+          err.code = "EACCES";
+          throw err;
+        }
+        return real.call(cursorInstall._userHooksLstatForTests, p, opts as never);
+      }) as typeof fs.lstatSync);
+      try {
+        const res = install(userFile);
+        expect(res.refused).toBe(true);
+        expect(res.warning).toBeTruthy();
+        expect(res.installedEvents).toEqual([]);
+        expect(readFileSync(userFile, "utf8")).toBe(body);
+        expect(noBackups(userDir)).toEqual([]);
+      } finally {
+        spy.mockRestore();
+      }
+    });
+
+    it("control: a regular file still installs, leaving other hooks in place", () => {
+      const userDir = join(work, "dot-cursor-ok");
+      mkdirSync(userDir);
+      const userFile = join(userDir, "hooks.json");
+      writeFileSync(userFile, JSON.stringify({ version: 1, hooks: { afterFileEdit: [{ command: "./fmt" }] } }));
+      const res = install(userFile);
+      expect(res.skipped).toBe(false);
+      expect(res.refused).toBeFalsy();
+      expect(res.installedEvents.length).toBeGreaterThan(0);
+      const file = JSON.parse(readFileSync(userFile, "utf8")) as { hooks: Record<string, Array<{ command: string }>> };
+      expect(file.hooks.afterFileEdit[0]).toEqual({ command: "./fmt" });
+      expect(JSON.stringify(file)).toContain("cursor-hook");
+    });
+
+    it("control: a missing ~/.cursor directory still installs", () => {
+      const userFile = join(work, "brand-new-cursor", "hooks.json");
+      expect(existsSync(join(work, "brand-new-cursor"))).toBe(false);
+      const res = install(userFile);
+      expect(res.skipped).toBe(false);
+      expect(res.refused).toBeFalsy();
+      expect(res.installedEvents.length).toBeGreaterThan(0);
+      expect(existsSync(userFile)).toBe(true);
+    });
+
+    it("agentreel init prints the warning and does not claim a Cursor install", async () => {
+      const target = join(work, "other-hooks.json");
+      writeFileSync(target, otherBody);
+      const userDir = join(work, "dot-cursor-init");
+      mkdirSync(userDir);
+      const userFile = join(userDir, "hooks.json");
+      symlinkSync(target, userFile);
+      const log = vi.spyOn(console, "log").mockImplementation(() => {});
+      try {
+        await initMod.initCommand({
+          claude: false,
+          cursorHooksPath: userFile,
+          systemCursorHooksPath: absentSystem,
+          cachePath,
+          guardConfigPath,
+        });
+        const out = log.mock.calls.map((c) => String(c[0])).join("\n");
+        expect(out).toMatch(/symlink|untouched/);
+        expect(out).not.toContain("Installed");
+      } finally {
+        log.mockRestore();
+      }
+      expect(readFileSync(target, "utf8")).toBe(otherBody);
     });
   });
 

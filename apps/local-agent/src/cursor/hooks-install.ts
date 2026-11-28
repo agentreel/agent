@@ -1,4 +1,11 @@
-import { copyFileSync, existsSync, lstatSync, mkdirSync, readFileSync, writeFileSync } from "node:fs";
+import {
+  copyFileSync,
+  existsSync,
+  mkdirSync,
+  readFileSync,
+  writeFileSync,
+} from "node:fs";
+import * as fs from "node:fs";
 import { dirname } from "node:path";
 import { cursorHooksPath } from "../paths.js";
 import {
@@ -31,8 +38,20 @@ function read(path: string): CursorHooksFile {
   return raw.trim() ? (JSON.parse(raw) as CursorHooksFile) : {};
 }
 
+/**
+ * Spyable lstat used by the user-hooks safety check and by backup.
+ * Tests use `vi.spyOn(_userHooksLstatForTests, "lstatSync")`.
+ */
+export const _userHooksLstatForTests = { lstatSync: fs.lstatSync };
+
 function backup(path: string): string | null {
-  if (!existsSync(path)) return null;
+  try {
+    const st = _userHooksLstatForTests.lstatSync(path);
+    // Never follow a symlink: copyFileSync would copy the target.
+    if (st.isSymbolicLink() || !st.isFile()) return null;
+  } catch {
+    return null;
+  }
   const b = `${path}.agentreel-backup-${new Date().toISOString().replace(/[:.]/g, "-")}`;
   copyFileSync(path, b);
   return b;
@@ -99,24 +118,37 @@ export function systemCursorHooksOwnedByAgentreel(path: string = systemCursorHoo
  * (`planCursorUserCleanup` in src/managed/install.ts): never write through a
  * symlink. If ~/.cursor or ~/.cursor/hooks.json is a symlink (for example to
  * the managed /etc/cursor/hooks.json), or the file is not a regular file,
- * the file is left alone. Returns the warning text, or null when it is safe
- * to edit or there is nothing there.
+ * or lstat fails with anything other than ENOENT (EACCES, ELOOP, ENOTDIR
+ * and the rest), the path is left alone. Only a true ENOENT on the
+ * directory or the file means there is nothing to clean (and a fresh
+ * install may create it). Returns the warning text, or null when it is
+ * safe to edit or there is nothing there. Fail closed: the outer catch
+ * returns the warning, never null.
  */
 function refuseUnsafeUserHooksFile(path: string): string | null {
+  const warning =
+    `${path} or its directory is a symlink or not a regular file, so it was left untouched.`;
   try {
-    const dirIsLink = lstatSync(dirname(path)).isSymbolicLink();
-    let fileState: "absent" | "regular" | "other" = "absent";
+    let dirStat: fs.Stats;
     try {
-      fileState = lstatSync(path).isFile() ? "regular" : "other";
+      dirStat = _userHooksLstatForTests.lstatSync(dirname(path));
     } catch (err) {
-      if ((err as NodeJS.ErrnoException).code !== "ENOENT") fileState = "other";
+      if ((err as NodeJS.ErrnoException).code === "ENOENT") return null;
+      throw err;
     }
-    if (fileState === "absent" && !dirIsLink) return null;
-    if (!dirIsLink && fileState === "regular") return null;
-    if (dirIsLink && fileState === "absent") return null;
-    return `${path} or its directory is a symlink or not a regular file, so AgentReel's entries were not removed from it.`;
-  } catch {
+    if (dirStat.isSymbolicLink() || !dirStat.isDirectory()) return warning;
+
+    let fileStat: fs.Stats;
+    try {
+      fileStat = _userHooksLstatForTests.lstatSync(path);
+    } catch (err) {
+      if ((err as NodeJS.ErrnoException).code === "ENOENT") return null;
+      throw err;
+    }
+    if (fileStat.isSymbolicLink() || !fileStat.isFile()) return warning;
     return null;
+  } catch {
+    return warning;
   }
 }
 
@@ -152,7 +184,20 @@ export function removeUserAgentreelCursorHooks(
 }
 
 export type InstallCursorHooksResult =
-  | { skipped: false; backup: string | null; installedEvents: string[]; path: string; preExecTimeoutS: number }
+  | { skipped: false; refused?: undefined; backup: string | null; installedEvents: string[]; path: string; preExecTimeoutS: number }
+  /**
+   * The user hooks path is a symlink, not a regular file, or could not be
+   * inspected. Nothing was written or backed up.
+   */
+  | {
+      skipped: false;
+      refused: true;
+      warning: string;
+      backup: null;
+      installedEvents: [];
+      path: string;
+      preExecTimeoutS: number;
+    }
   /**
    * The managed pack owns the Cursor hooks (or the system file is
    * unreadable, which we treat as managed). Per-user hooks are not
@@ -197,6 +242,18 @@ export function installCursorHooks(
       backup: cleaned.backup,
       removed: cleaned.removed,
       ...(cleaned.refused ? { warning: cleaned.refused } : {}),
+    };
+  }
+  const refused = refuseUnsafeUserHooksFile(path);
+  if (refused) {
+    return {
+      skipped: false,
+      refused: true,
+      warning: refused,
+      backup: null,
+      installedEvents: [],
+      path,
+      preExecTimeoutS,
     };
   }
   mkdirSync(dirname(path), { recursive: true });
