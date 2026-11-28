@@ -6,7 +6,12 @@ import {
   readConfig,
   type AgentConfig,
 } from "../config.js";
-import { inspectCursorPreExecHooks } from "../cursor/hooks-install.js";
+import {
+  inspectCursorPreExecHooks,
+  inspectSystemCursorHooks,
+  systemCursorHooksPath,
+  type SystemCursorHooksState,
+} from "../cursor/hooks-install.js";
 import { inspectClaudePreExecHook } from "../hooks/install.js";
 import {
   claudeSettingsPath,
@@ -45,6 +50,8 @@ export interface DoctorInspectOptions {
   guardConfigPath?: string;
   claudeSettingsPath?: string;
   cursorHooksPath?: string;
+  /** System Cursor hooks file (default /etc/cursor/hooks.json); injectable for tests. */
+  systemCursorHooksPath?: string;
   config?: AgentConfig;
   now?: number;
 }
@@ -91,6 +98,13 @@ export interface DoctorReport {
     recordedTimeoutS: number | null;
     effectiveInstalledTimeoutS: number;
     needsReinitForApproval: boolean;
+    /**
+     * True when the system Cursor hooks file has AgentReel entries, or exists
+     * but cannot be read (fail-safe: treated as managed).
+     */
+    managed: boolean;
+    managedPath: string;
+    managedState: SystemCursorHooksState;
   };
 }
 
@@ -143,10 +157,6 @@ export function inspectDoctorState(opts: DoctorInspectOptions = {}): DoctorRepor
 
   const cursorRecordedTimeoutS = getRecordedPreExecTimeoutS(cfg, "cursor");
   const cursorEffectiveTimeoutS = getInstalledPreExecTimeoutS(cfg, "cursor");
-  const cursorNeedsReinit =
-    maxPolicyApprovalExpiresS !== null &&
-    maxPolicyApprovalExpiresS > cursorEffectiveTimeoutS - HOOK_DEADLINE_MARGIN_S;
-
   const claudeRaw = inspectClaudePreExecHook(
     opts.claudeSettingsPath ?? claudeSettingsPath(),
   );
@@ -155,8 +165,16 @@ export function inspectDoctorState(opts: DoctorInspectOptions = {}): DoctorRepor
     claudeRaw.preToolUseTimeoutS !== null &&
     claudeRaw.preToolUseTimeoutS >= expectedPreExecTimeoutS;
 
+  const managedPath = opts.systemCursorHooksPath ?? systemCursorHooksPath();
+  const managedState = inspectSystemCursorHooks(managedPath);
+  const cursorManaged = managedState === "owned" || managedState === "unreadable";
+  // When the managed pack owns the hooks, report the system file, not the
+  // (possibly empty or stale) per-user file, so doctor does not tell the
+  // user to run `agentreel init`.
   const cursorRaw = inspectCursorPreExecHooks(
-    opts.cursorHooksPath ?? cursorHooksPath(),
+    cursorManaged && managedState === "owned"
+      ? managedPath
+      : (opts.cursorHooksPath ?? cursorHooksPath()),
   );
   const cursorHooks = cursorRaw.hooks.map((h) => ({
     ...h,
@@ -165,6 +183,10 @@ export function inspectDoctorState(opts: DoctorInspectOptions = {}): DoctorRepor
       h.timeoutS !== null &&
       h.timeoutS >= expectedPreExecTimeoutS,
   }));
+  const cursorNeedsReinit =
+    !cursorManaged &&
+    maxPolicyApprovalExpiresS !== null &&
+    maxPolicyApprovalExpiresS > cursorEffectiveTimeoutS - HOOK_DEADLINE_MARGIN_S;
 
   return {
     policyLoaded: policy !== null,
@@ -199,6 +221,9 @@ export function inspectDoctorState(opts: DoctorInspectOptions = {}): DoctorRepor
       recordedTimeoutS: cursorRecordedTimeoutS,
       effectiveInstalledTimeoutS: cursorEffectiveTimeoutS,
       needsReinitForApproval: cursorNeedsReinit,
+      managed: cursorManaged,
+      managedPath,
+      managedState,
     },
   };
 }
@@ -242,8 +267,13 @@ export function formatDoctorReport(report: DoctorReport): string {
           `PreToolUse timeout ${formatTimeoutLabel(report.claude.preToolUseTimeoutS)} < expected ${report.expectedPreExecTimeoutS}s (run \`agentreel init\`)`,
         );
 
-  const cursorSummary =
-    report.cursor.allInstalled && !report.cursor.allFailClosed
+  const cursorSummary = report.cursor.managed
+    ? report.cursor.managedState === "unreadable"
+      ? pc.yellow(
+          `managed pack at ${report.cursor.managedPath} is unreadable; treated as managed (not installing per-user hooks)`,
+        )
+      : pc.green(`owned by the managed pack (${report.cursor.managedPath})`)
+    : report.cursor.allInstalled && !report.cursor.allFailClosed
       ? pc.yellow("pre-exec hooks fail open: failClosed not set (run `agentreel init`)")
       : report.cursor.allInstalled && report.cursor.allTimeoutsOk
       ? pc.green(
@@ -269,15 +299,17 @@ export function formatDoctorReport(report: DoctorReport): string {
     `  cursor hooks:   ${cursorSummary}`,
   ];
 
-  for (const h of report.cursor.hooks) {
-    const status = !h.installed
-      ? pc.yellow("missing")
-      : !h.failClosed
-        ? pc.yellow("fails open (failClosed not set)")
-      : h.timeoutOk
-        ? pc.green(`ok (${h.timeoutS}s)`)
-        : pc.yellow(`timeout ${formatTimeoutLabel(h.timeoutS)} < ${report.expectedPreExecTimeoutS}s`);
-    lines.push(`    - ${h.event.padEnd(21)} ${status}`);
+  if (!(report.cursor.managed && report.cursor.managedState === "unreadable")) {
+    for (const h of report.cursor.hooks) {
+      const status = !h.installed
+        ? pc.yellow("missing")
+        : !h.failClosed
+          ? pc.yellow("fails open (failClosed not set)")
+        : h.timeoutOk
+          ? pc.green(`ok (${h.timeoutS}s)`)
+          : pc.yellow(`timeout ${formatTimeoutLabel(h.timeoutS)} < ${report.expectedPreExecTimeoutS}s`);
+      lines.push(`    - ${h.event.padEnd(21)} ${status}`);
+    }
   }
 
   if (report.lastRejection) {

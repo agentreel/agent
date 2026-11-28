@@ -61,20 +61,86 @@ export function systemCursorHooksPath(platform: NodeJS.Platform = process.platfo
   return "/etc/cursor/hooks.json";
 }
 
-/** True when the system hooks file already carries AgentReel entries. Never throws. */
-export function systemCursorHooksOwnedByAgentreel(path: string = systemCursorHooksPath()): boolean {
+export type SystemCursorHooksState = "absent" | "owned" | "not_owned" | "unreadable";
+
+/**
+ * Ownership of the system Cursor hooks file. Never throws.
+ *
+ * Fail-safe: if the file exists but cannot be read or parsed, the state is
+ * `unreadable`, which is treated as managed. That way a permission error or
+ * a truncated file cannot cause `agentreel init` to write a second copy of
+ * the hooks under the user.
+ */
+export function inspectSystemCursorHooks(path: string = systemCursorHooksPath()): SystemCursorHooksState {
+  try {
+    if (!existsSync(path)) return "absent";
+  } catch {
+    return "unreadable";
+  }
   try {
     const file = read(path);
-    return Object.values(file.hooks ?? {}).some((defs) => Array.isArray(defs) && defs.some(isOurs));
+    const owned = Object.values(file.hooks ?? {}).some(
+      (defs) => Array.isArray(defs) && defs.some(isOurs),
+    );
+    return owned ? "owned" : "not_owned";
   } catch {
-    return false;
+    return "unreadable";
+  }
+}
+
+/** True when the system hooks file already carries AgentReel entries, or cannot be read. */
+export function systemCursorHooksOwnedByAgentreel(path: string = systemCursorHooksPath()): boolean {
+  const state = inspectSystemCursorHooks(path);
+  return state === "owned" || state === "unreadable";
+}
+
+/**
+ * Remove this user's AgentReel entries from a per-user hooks file, leaving
+ * everyone else's hooks, unknown keys, and the rest of the file intact.
+ * Writes a backup first. No-ops (no backup, no write) when there is nothing
+ * of ours to remove, or the file is missing or unreadable. Never throws.
+ */
+export function removeUserAgentreelCursorHooks(
+  path: string = cursorHooksPath(),
+): { backup: string | null; removed: number } {
+  try {
+    if (!existsSync(path)) return { backup: null, removed: 0 };
+    const file = read(path);
+    let removed = 0;
+    for (const ev of Object.keys(file.hooks ?? {})) {
+      const before = file.hooks![ev]!;
+      const kept = before.filter((d) => !isOurs(d));
+      removed += before.length - kept.length;
+      if (kept.length === 0) delete file.hooks![ev];
+      else file.hooks![ev] = kept;
+    }
+    if (removed === 0) return { backup: null, removed: 0 };
+    const b = backup(path);
+    writeFileSync(path, JSON.stringify(file, null, 2) + "\n", "utf8");
+    return { backup: b, removed };
+  } catch {
+    return { backup: null, removed: 0 };
   }
 }
 
 export type InstallCursorHooksResult =
   | { skipped: false; backup: string | null; installedEvents: string[]; path: string; preExecTimeoutS: number }
-  /** The managed pack owns the Cursor hooks; nothing was written (avoids double capture). */
-  | { skipped: true; managedPath: string; installedEvents: []; path: string; preExecTimeoutS: number };
+  /**
+   * The managed pack owns the Cursor hooks (or the system file is
+   * unreadable, which we treat as managed). Per-user hooks are not
+   * written. Stale AgentReel entries in the user file, if any, are
+   * removed after a backup; other tools' hooks are left intact.
+   */
+  | {
+      skipped: true;
+      managedPath: string;
+      managedState: SystemCursorHooksState;
+      installedEvents: [];
+      path: string;
+      preExecTimeoutS: number;
+      backup: string | null;
+      removed: number;
+    };
 
 /**
  * Add `<prefix> cursor-hook <event>` to ~/.cursor/hooks.json for every hook.
@@ -88,8 +154,19 @@ export function installCursorHooks(
 ): InstallCursorHooksResult {
   const preExecTimeoutS = opts.preExecTimeoutS ?? DEFAULT_PRE_EXEC_HOOK_TIMEOUT_S;
   const managedPath = opts.systemHooksPath ?? systemCursorHooksPath();
-  if (systemCursorHooksOwnedByAgentreel(managedPath)) {
-    return { skipped: true, managedPath, installedEvents: [], path, preExecTimeoutS };
+  const managedState = inspectSystemCursorHooks(managedPath);
+  if (managedState === "owned" || managedState === "unreadable") {
+    const cleaned = removeUserAgentreelCursorHooks(path);
+    return {
+      skipped: true,
+      managedPath,
+      managedState,
+      installedEvents: [],
+      path,
+      preExecTimeoutS,
+      backup: cleaned.backup,
+      removed: cleaned.removed,
+    };
   }
   mkdirSync(dirname(path), { recursive: true });
   const b = backup(path);

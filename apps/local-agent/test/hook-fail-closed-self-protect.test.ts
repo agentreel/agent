@@ -1,7 +1,7 @@
 import { mkdirSync, mkdtempSync, readFileSync, rmSync, writeFileSync, existsSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
-import { beforeEach, describe, expect, it, vi } from "vitest";
+import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import type { Policy } from "../src/policy/types.js";
 
 const testHome = mkdtempSync(join(tmpdir(), "agentreel-selfprotect-"));
@@ -58,7 +58,7 @@ describe("(c) pre-exec hooks fail closed, lifecycle hooks stay fail-open", () =>
       cursorHooks,
       JSON.stringify({ version: 1, hooks: Object.fromEntries(["preToolUse", "beforeShellExecution", "beforeMCPExecution", "beforeReadFile"].map((e) => [e, [{ command: `agentreel cursor-hook ${e}`, timeout: 130 }]])) }),
     );
-    const report = doctor.inspectDoctorState({ claudeSettingsPath: claudeSettings, cursorHooksPath: cursorHooks, cachePath, guardConfigPath, config: { apiBaseUrl: "x", schemaVersion: 1 } as never });
+    const report = doctor.inspectDoctorState({ claudeSettingsPath: claudeSettings, cursorHooksPath: cursorHooks, systemCursorHooksPath: join(work, "no-system-hooks.json"), cachePath, guardConfigPath, config: { apiBaseUrl: "x", schemaVersion: 1 } as never });
     expect(report.claude.preToolUseFailClosed).toBe(false);
     expect(report.cursor.allFailClosed).toBe(false);
     const text = doctor.formatDoctorReport(report);
@@ -76,14 +76,69 @@ describe("per-user Cursor install defers to the managed pack", () => {
     expect(existsSync(cursorHooks)).toBe(false);
   });
 
-  it("still installs when the system file has only other hooks, or is missing or unreadable", () => {
+  it("still installs when the system file has only other hooks, or is missing", () => {
     writeFileSync(systemCursorHooks, JSON.stringify({ version: 1, hooks: { beforeShellExecution: [{ command: "/opt/other/audit-hook" }] } }));
     expect(cursorInstall.installCursorHooks("agentreel", cursorHooks, { systemHooksPath: systemCursorHooks }).skipped).toBe(false);
     rmSync(cursorHooks);
-    writeFileSync(systemCursorHooks, "{not json");
-    expect(cursorInstall.installCursorHooks("agentreel", cursorHooks, { systemHooksPath: systemCursorHooks }).skipped).toBe(false);
-    rmSync(cursorHooks);
     expect(cursorInstall.installCursorHooks("agentreel", cursorHooks, { systemHooksPath: join(work, "nope.json") }).skipped).toBe(false);
+  });
+
+  it("treats an unreadable or malformed system file as managed (fail-safe) and does not install per-user hooks", () => {
+    writeFileSync(systemCursorHooks, "{not json");
+    const res = cursorInstall.installCursorHooks("agentreel", cursorHooks, { systemHooksPath: systemCursorHooks });
+    expect(res.skipped).toBe(true);
+    expect(res.skipped && res.managedState).toBe("unreadable");
+    expect(existsSync(cursorHooks)).toBe(false);
+  });
+
+  it("removes stale AgentReel entries from ~/.cursor/hooks.json when skipping, leaving other hooks", () => {
+    writeFileSync(systemCursorHooks, JSON.stringify({ version: 1, hooks: { beforeShellExecution: [{ command: "/usr/local/bin/agentreel cursor-hook beforeShellExecution", failClosed: true }] } }));
+    writeFileSync(cursorHooks, JSON.stringify({
+      version: 1,
+      hooks: {
+        beforeShellExecution: [
+          { command: "agentreel cursor-hook beforeShellExecution", failClosed: true },
+          { command: "/opt/other/audit-hook" },
+        ],
+        preToolUse: [{ command: "agentreel cursor-hook preToolUse", failClosed: true }],
+      },
+    }));
+    const res = cursorInstall.installCursorHooks("agentreel", cursorHooks, { systemHooksPath: systemCursorHooks });
+    expect(res.skipped).toBe(true);
+    expect(res.skipped && res.removed).toBe(2);
+    expect(res.skipped && res.backup).toBeTruthy();
+    const file = JSON.parse(readFileSync(cursorHooks, "utf8"));
+    expect(file.hooks.beforeShellExecution).toEqual([{ command: "/opt/other/audit-hook" }]);
+    expect(file.hooks.preToolUse).toBeUndefined();
+    expect(JSON.stringify(file)).not.toContain("cursor-hook");
+  });
+
+  it("doctor reports managed hooks instead of telling the user to run agentreel init", () => {
+    writeFileSync(systemCursorHooks, JSON.stringify({
+      version: 1,
+      hooks: Object.fromEntries(
+        ["preToolUse", "beforeShellExecution", "beforeMCPExecution", "beforeReadFile"].map((e) => [
+          e,
+          [{ command: `/usr/local/bin/agentreel cursor-hook ${e}`, timeout: 130, failClosed: true }],
+        ]),
+      ),
+    }));
+    const report = doctor.inspectDoctorState({
+      claudeSettingsPath: join(work, "no-claude.json"),
+      cursorHooksPath: cursorHooks,
+      systemCursorHooksPath: systemCursorHooks,
+      cachePath,
+      guardConfigPath,
+      config: { apiBaseUrl: "x", schemaVersion: 1 } as never,
+    });
+    expect(report.cursor.managed).toBe(true);
+    expect(report.cursor.allInstalled).toBe(true);
+    expect(report.cursor.allFailClosed).toBe(true);
+    const text = doctor.formatDoctorReport(report);
+    expect(text).toContain("owned by the managed pack");
+    expect(text).not.toMatch(/Cursor[^\n]*(missing|not installed|run `agentreel init`)/i);
+    const cursorLine = text.split("\n").find((l) => l.includes("cursor hooks:"));
+    expect(cursorLine ?? "").not.toContain("agentreel init");
   });
 
   it("agentreel init prints that the managed pack owns the Cursor hooks", async () => {
@@ -118,9 +173,30 @@ const DENIED: Array<[string, string]> = [
   ["SELF001", "python3 -c \"open('/home/u/.cursor/hooks.json','w').write('{}')\""],
   ["SELF001", "echo x | sudo tee /etc/claude-code/managed-settings.json"],
   ["SELF001", "sudo rm /etc/cursor/hooks.json"],
+  ["SELF001", "sudo rm -rf /etc/cursor"],
+  ["SELF001", "sudo rm -rf /etc/cursor/"],
+  ["SELF001", "mv /etc/cursor x"],
+  ["SELF001", "rm /etc/cursor/*"],
+  ["SELF001", "cd /etc/cursor && rm hooks.json"],
   ["SELF001", "sudo rm -rf /etc/claude-code"],
   ["SELF001", "sudo rm '/Library/Application Support/Cursor/hooks.json'"],
+  ["SELF001", "sudo rm -rf '/Library/Application Support/Cursor'"],
+  ["SELF001", "sudo rm -rf /Library/APPLICATION\\ Support/CURSOR"],
   ["SELF001", "sudo rm /Library/Application\\ Support/ClaudeCode/managed-settings.json"],
+  ["SELF001", "sudo rm -rf /Library/Application\\ Support/ClaudeCode"],
+  ["SELF001", "rm /usr/local/bin/agentreel"],
+  ["SELF001", "sudo rm $(which agentreel)"],
+  ["SELF001", "sudo rm -rf /usr/local/lib/node_modules/@agentreel/agent"],
+  ["SELF001", "sudo sh -c 'echo x > /usr/local/lib/node_modules/@agentreel/agent/dist/cli.js'"],
+  ["SELF001", "sudo chmod -x /usr/local/bin/agentreel"],
+  ["SELF001", "cp /tmp/evil.js /opt/agentreel/bin/agentreel"],
+  ["SELF003", "sudo agentreel managed install --hook-command /tmp/evil"],
+  ["SELF005", "env -u CLAUDECODE -u CLAUDE_CODE_CHILD_SESSION -u CURSOR_AGENT sudo agentreel managed install --hook-command /tmp/evil"],
+  ["SELF005", "unset CLAUDECODE; sudo agentreel managed install --allow-user-writable-hook"],
+  ["SELF003", "sudo /usr/local/bin/agentreel managed install --root /"],
+  ["SELF005", "unset CLAUDECODE"],
+  ["SELF005", "unset CURSOR_AGENT"],
+  ["SELF005", "env -u CLAUDE_CODE_CHILD_SESSION sudo agentreel managed install --dry-run"],
   ["SELF001", "cp /tmp/x '.claude/settings.local.json'"],
   ["SELF001", "r''m ~/.agentreel/policy.json"],
   ["SELF003", "npx @agentreel/agent uninstall"],
@@ -156,6 +232,13 @@ const ALLOWED = [
   "claude -p 'summarize'",
   "rm -rf node_modules",
   "cat ./my.agentreel.txt",
+  "ls /etc/cursor",
+  "cat /etc/cursor/hooks.json",
+  "agentreel managed install --dry-run",
+  "sudo agentreel managed install --dry-run",
+  "rm ./my-agentreel-notes.txt",
+  "agentreel init",
+  "agentreel status",
 ];
 
 describe("(d) self-protect matcher", () => {
@@ -249,5 +332,28 @@ describe("(d) self-protect in enforcePreExec", () => {
     const p = policy("observe");
     cache.writeCachedPolicyAtomic({ policy: p, etag: p.etag, fetched_at: Date.now() }, cachePath);
     expect((await run("rm ~/.agentreel/policy.json")).permitted).toBe(true);
+  });
+});
+
+describe("hook binary discovered from the managed hook command", () => {
+  afterEach(() => selfProtect._setHookConfigPathsForTests(null));
+
+  it("denies writes to a custom binary named in the hook file, and chmod -x on it", () => {
+    const hooks = join(work, "managed-hooks.json");
+    const bin = join(work, "custom-bin");
+    writeFileSync(hooks, JSON.stringify({
+      version: 1,
+      hooks: { beforeShellExecution: [{ command: `${bin} cursor-hook beforeShellExecution`, failClosed: true }] },
+    }));
+    selfProtect._setHookConfigPathsForTests([hooks]);
+    expect(selfProtect.matchSelfProtect({ toolName: "Bash", command: `rm ${bin}` })?.rule_id).toBe("SELF001");
+    expect(selfProtect.matchSelfProtect({ toolName: "Bash", command: `chmod -x ${bin}` })?.rule_id).toBe("SELF001");
+    expect(selfProtect.matchSelfProtect({ toolName: "Write", file_path: bin })?.rule_id).toBe("SELF002");
+  });
+
+  it("is graceful when the hook file is unreadable and still blocks the standard binary name", () => {
+    selfProtect._setHookConfigPathsForTests([join(work, "missing-hooks.json")]);
+    expect(selfProtect.matchSelfProtect({ toolName: "Bash", command: "rm /usr/local/bin/agentreel" })?.rule_id).toBe("SELF001");
+    expect(selfProtect.matchSelfProtect({ toolName: "Bash", command: "ls /usr/local/bin/agentreel" })).toBeNull();
   });
 });

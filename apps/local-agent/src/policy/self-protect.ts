@@ -1,3 +1,8 @@
+import { readFileSync } from "node:fs";
+import { systemCursorHooksPath } from "../cursor/hooks-install.js";
+import { hookCommandBinaryPath } from "../managed/hook-path.js";
+import { claudeSettingsPath, cursorHooksPath } from "../paths.js";
+
 /**
  * Self-protection: while an org policy is enforcing, block the agent from
  * turning AgentReel off. These checks are not Guard rules (the Guard catalog
@@ -7,13 +12,20 @@
  *   settings (`.claude/settings.json`, `.claude/settings.local.json`), Cursor
  *   hooks (`.cursor/hooks.json`), and the managed files
  *   (`/etc/claude-code/managed-settings.json`, `/etc/cursor/hooks.json`, and
- *   the macOS and Windows equivalents).
+ *   `/etc/cursor/`, `/etc/claude-code/`, and the macOS and Windows
+ *   equivalents, as whole directories). The hook binary (basename
+ *   `agentreel`, `node_modules/@agentreel/agent`, and the path taken from
+ *   the managed hook command at match time) is also protected.
  * - SELF002: Write/Edit-style tool calls to any of those paths.
  * - SELF003: `agentreel uninstall`, `logout` or `pause` (also through npx,
- *   pnpm dlx, bunx), and removing the @agentreel/agent package.
+ *   pnpm dlx, bunx), removing the @agentreel/agent package, and
+ *   `agentreel managed ...` other than `--dry-run`. This match is on the
+ *   command text only; it does not depend on CLAUDECODE or CURSOR_AGENT
+ *   being set, so it still holds when sudo has stripped them.
  * - SELF004: `disableAllHooks`, and `claude --settings` / `--setting-sources`.
- * - SELF005: unsetting or overriding HOME, CLAUDE_CONFIG_DIR or AGENTREEL_*
- *   (`unset`, `env -u`, `env -i`, `export HOME=`, `HOME=... claude`).
+ * - SELF005: unsetting or overriding HOME, CLAUDE_CONFIG_DIR, CLAUDECODE,
+ *   CLAUDE_CODE_CHILD_SESSION, CURSOR_AGENT or AGENTREEL_* (`unset`,
+ *   `env -u`, `env -i`, `export HOME=`, `HOME=... claude`).
  *
  * Best effort against string tricks: input is NFKC-normalized and quotes and
  * backslashes are stripped before matching. Every check is a single linear
@@ -28,22 +40,27 @@ export interface SelfProtectMatch {
 export const SELF_PROTECT_NAMES: Record<SelfProtectMatch["rule_id"], string> = {
   SELF001: "changes to AgentReel, Claude Code or Cursor hook and policy files",
   SELF002: "edits to AgentReel, Claude Code or Cursor hook and policy files",
-  SELF003: "uninstalling, pausing or logging out of AgentReel",
+  SELF003: "uninstalling, pausing, logging out of AgentReel, or running agentreel managed",
   SELF004: "disabling hooks (disableAllHooks or claude --settings)",
-  SELF005: "unsetting or overriding HOME, CLAUDE_CONFIG_DIR or AGENTREEL_* variables",
+  SELF005: "unsetting or overriding HOME, CLAUDE_CONFIG_DIR, CLAUDECODE, CURSOR_AGENT or AGENTREEL_* variables",
 };
 
-/** Lowercased path fragments that mark a protected file. */
+/** Lowercased path fragments that mark a protected file or directory.
+ * Directory fragments end with "/" and match with or without a trailing
+ * slash on the input (`isProtectedPath` appends one before searching).
+ * Matching is case-insensitive (required for macOS paths).
+ */
 const PROTECTED_FRAGMENTS = [
   ".claude/settings.json",
   ".claude/settings.local.json",
   ".cursor/hooks.json",
   "/etc/claude-code/",
-  "/etc/cursor/hooks.json",
+  "/etc/cursor/",
   "/library/application support/claudecode/",
-  "/library/application support/cursor/hooks.json",
-  "programdata/cursor/hooks.json",
+  "/library/application support/cursor/",
+  "programdata/cursor/",
   "program files/claudecode/",
+  "node_modules/@agentreel/agent",
 ];
 
 /** Programs that only read, so naming a protected path with them is fine. */
@@ -59,7 +76,7 @@ const WRAPPERS = new Set(["sudo", "doas", "command", "exec", "nohup", "time", "n
 
 const READ_TOOLS = /^(read|read_file|readfile|view|cat|beforereadfile|grep|glob|ls|list_dir|search)$/i;
 
-const ENV_NAMES = /^(HOME|CLAUDE_CONFIG_DIR|AGENTREEL_[A-Z0-9_]*)$/;
+const ENV_NAMES = /^(HOME|CLAUDE_CONFIG_DIR|CLAUDECODE|CLAUDE_CODE_CHILD_SESSION|CURSOR_AGENT|AGENTREEL_[A-Z0-9_]*)$/;
 
 /** NFKC, then drop quotes and backslash escapes (keeping the escaped char). */
 export function dequoteShell(s: string): string {
@@ -139,12 +156,136 @@ function programIndex(toks: string[]): number {
   return -1;
 }
 
+/** Default hook-config files whose `command` values name the hook binary. */
+function defaultHookConfigPaths(): string[] {
+  return [
+    systemCursorHooksPath(),
+    cursorHooksPath(),
+    claudeSettingsPath(),
+    "/etc/claude-code/managed-settings.json",
+    "/Library/Application Support/ClaudeCode/managed-settings.json",
+  ];
+}
+
+let hookConfigPathsOverride: string[] | null = null;
+
+/** Test hook: replace the hook-config files used to discover the binary. */
+export function _setHookConfigPathsForTests(paths: string[] | null): void {
+  hookConfigPathsOverride = paths;
+}
+
+function hookConfigPaths(): string[] {
+  return hookConfigPathsOverride ?? defaultHookConfigPaths();
+}
+
+/** Walk a JSON value and collect every string `command` field, depth-capped. */
+function collectCommandStrings(value: unknown, out: string[], depth = 0): void {
+  if (depth > 8 || value === null || value === undefined) return;
+  if (Array.isArray(value)) {
+    for (const item of value) collectCommandStrings(item, out, depth + 1);
+    return;
+  }
+  if (typeof value === "object") {
+    const rec = value as Record<string, unknown>;
+    if (typeof rec.command === "string") out.push(rec.command);
+    for (const item of Object.values(rec)) collectCommandStrings(item, out, depth + 1);
+  }
+}
+
+/**
+ * Hook binary paths taken from managed and user hook files at match time.
+ * An unreadable file is skipped (the other sources and the fixed fragments
+ * still apply). Never throws.
+ */
+let cachedHookBinaries: string[] | null = null;
+
+function hookBinariesFromConfig(): string[] {
+  if (cachedHookBinaries) return cachedHookBinaries;
+  const out: string[] = [];
+  for (const path of hookConfigPaths()) {
+    try {
+      const raw = readFileSync(path, "utf8");
+      const commands: string[] = [];
+      collectCommandStrings(JSON.parse(raw) as unknown, commands);
+      for (const cmd of commands) {
+        const bin = hookCommandBinaryPath(cmd);
+        if (bin) out.push(bin);
+      }
+    } catch {
+      // Unreadable or invalid: ignore this file.
+    }
+  }
+  cachedHookBinaries = out;
+  return out;
+}
+
+function resetHookBinaryCache(): void {
+  cachedHookBinaries = null;
+}
+
+/** True when the path's final component is the `agentreel` binary. */
+function isAgentreelBasename(lower: string): boolean {
+  // Require a path separator so running `agentreel doctor` is not a write
+  // to the binary; `rm /usr/local/bin/agentreel` still matches.
+  if (!lower.includes("/") && !lower.includes("~")) return false;
+  const base = (lower.split("/").pop() ?? "").split("?")[0]!;
+  return base === "agentreel" || base === "agentreel.exe";
+}
+
+/** Replace `$(which agentreel)` and `` `which agentreel` `` with a dummy path. */
+export function rewriteWhichAgentreel(s: string): string {
+  let out = "";
+  let i = 0;
+  const n = s.length;
+  while (i < n) {
+    if (s.startsWith("$(", i)) {
+      const end = s.indexOf(")", i + 2);
+      if (end >= 0 && isWhichAgentreel(s.slice(i + 2, end))) {
+        out += "/bin/agentreel";
+        i = end + 1;
+        continue;
+      }
+    } else if (s[i] === "`") {
+      const end = s.indexOf("`", i + 1);
+      if (end >= 0 && isWhichAgentreel(s.slice(i + 1, end))) {
+        out += "/bin/agentreel";
+        i = end + 1;
+        continue;
+      }
+    }
+    out += s[i];
+    i++;
+  }
+  return out;
+}
+
+function isWhichAgentreel(inner: string): boolean {
+  const t = inner.trim().split(/\s+/).filter(Boolean);
+  return t.length === 2 && t[0] === "which" && t[1]!.toLowerCase() === "agentreel";
+}
+
 export function isProtectedPath(p: string): boolean {
   const lower = p.replace(/\\/g, "/").toLowerCase();
   if (hasAgentreelDir(lower)) return true;
-  // Trailing "/" so a bare directory (/etc/claude-code) matches its fragment.
+  if (isAgentreelBasename(lower)) return true;
+  // Trailing "/" so a bare directory (/etc/cursor) matches its fragment.
   const withSlash = `${lower}/`;
-  return PROTECTED_FRAGMENTS.some((f) => withSlash.includes(f));
+  if (PROTECTED_FRAGMENTS.some((f) => withSlash.includes(f) || lower.includes(f))) return true;
+  for (const bin of hookBinariesFromConfig()) {
+    const b = bin.replace(/\\/g, "/").toLowerCase();
+    if (lower === b || withSlash.startsWith(`${b}/`)) return true;
+  }
+  return false;
+}
+
+function spacedProtectedHit(seg: string): boolean {
+  const segSlash = `${seg.toLowerCase()}/`;
+  if (PROTECTED_FRAGMENTS.some((f) => f.includes(" ") && segSlash.includes(f))) return true;
+  for (const bin of hookBinariesFromConfig()) {
+    const b = bin.replace(/\\/g, "/").toLowerCase();
+    if (b.includes(" ") && segSlash.includes(b)) return true;
+  }
+  return false;
 }
 
 /** `.agentreel` as a whole path component (~/.agentreel, $HOME/.agentreel/x). */
@@ -179,7 +320,7 @@ function segmentHasOutputRedirect(seg: string): boolean {
 }
 
 function checkCommand(command: string): SelfProtectMatch | null {
-  const clean = dequoteShell(command);
+  const clean = rewriteWhichAgentreel(dequoteShell(command));
   const segs = shellSegments(clean);
   for (const seg of segs) {
     const toks = tokens(seg);
@@ -218,6 +359,11 @@ function checkCommand(command: string): SelfProtectMatch | null {
     if (agentIdx >= 0) {
       const rest = toks.slice(agentIdx + 1).map((t) => t.toLowerCase());
       if (rest.some((t) => t === "uninstall" || t === "logout" || t === "pause")) return m("SELF003");
+      // `managed` is blocked unless the invocation is a dry run. The check
+      // is on the command text, so it still holds when sudo has stripped
+      // CLAUDECODE / CURSOR_AGENT (the installer's own session refusal
+      // would otherwise miss).
+      if (rest[0] === "managed" && !rest.includes("--dry-run")) return m("SELF003");
       if (["npm", "pnpm", "yarn", "bun"].includes(prog) && args.some((a) => ["uninstall", "un", "remove", "rm", "r", "unlink"].includes(a))) {
         return m("SELF003");
       }
@@ -229,12 +375,26 @@ function checkCommand(command: string): SelfProtectMatch | null {
       return m("SELF004");
     }
 
-    // SELF001: a protected path in a segment that may write.
-    if (!readOnly && toks.some((t) => isProtectedPath(stripRedirectAndFlag(t)))) {
+    // SELF001: a protected path in a segment that may write. Running
+    // `agentreel doctor` is not a write to the binary, so skip a program
+    // token whose basename is agentreel. Other tokens, and a path that is
+    // the only word in a segment (`open(.../.cursor/hooks.json...)` after
+    // splitting on parentheses), are still checked.
+    if (
+      !readOnly &&
+      toks.some((t, i) => {
+        if (i === pi) {
+          const b = basename(t);
+          if (b === "agentreel" || b === "agentreel.exe") return false;
+        }
+        return isProtectedPath(stripRedirectAndFlag(t));
+      })
+    ) {
       return m("SELF001");
     }
     // Paths with spaces (macOS "Application Support") survive as one string only on the segment.
-    if (!readOnly && PROTECTED_FRAGMENTS.some((f) => f.includes(" ") && seg.toLowerCase().includes(f))) return m("SELF001");
+    // Append "/" so `/Library/Application Support/Cursor` matches the directory fragment.
+    if (!readOnly && spacedProtectedHit(seg)) return m("SELF001");
   }
   return null;
 }
@@ -252,6 +412,7 @@ export interface SelfProtectInput {
 
 /** Returns the self-protect check that matches, or null. Never throws. */
 export function matchSelfProtect(input: SelfProtectInput): SelfProtectMatch | null {
+  resetHookBinaryCache();
   try {
     if (input.command) {
       const hit = checkCommand(input.command);
