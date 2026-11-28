@@ -5,6 +5,6 @@ export default defineConfig({
   test: {
     include: ["test/**/*.test.ts"],
     environment: "node",
-    setupFiles: ["test/setup-home.ts"],
+    setupFiles: ["test/setup-home.ts", "test/setup-policy-signing.ts"],
   },
 });

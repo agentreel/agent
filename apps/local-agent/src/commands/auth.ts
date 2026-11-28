@@ -85,7 +85,12 @@ async function replacePolicyCacheForAuth(
     const staged = await fetchPolicy({ config: cfg, cachePath: stagingPath });
     if (staged.status === "updated") {
       writeCachedPolicyAtomic(
-        { policy: staged.policy, etag: staged.etag, fetched_at: staged.fetchedAt },
+        {
+          policy: staged.policy,
+          etag: staged.etag,
+          fetched_at: staged.fetchedAt,
+          ...(staged.signedBody ? { signed_body: staged.signedBody } : {}),
+        },
         cachePath,
       );
       clearPolicyRejection(cachePath);

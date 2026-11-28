@@ -12,10 +12,12 @@ import { dirname } from "node:path";
 import { RULES } from "../guard/rules.js";
 import type { GuardConfig } from "../guard/types.js";
 import { guardConfigPath as defaultGuardConfigPath, policyPath } from "../paths.js";
+import { checkPolicyTrust } from "./trust.js";
 import {
   isNoOrgPolicy,
   isValidSeverity,
   validateCachedPolicyFile,
+  validatePolicy,
   type BuiltinRuleOverride,
   type CachedPolicyFile,
   type Policy,
@@ -51,7 +53,8 @@ export type PolicyRejectionReason =
   | "unsupported_regex"
   | "invalid_policy"
   | "no_org_ignored"
-  | "org_mismatch_ignored";
+  | "org_mismatch_ignored"
+  | "invalid_signature";
 
 export interface PolicyRejectionRecord {
   ts: number;
@@ -68,6 +71,7 @@ const POLICY_REJECTION_REASONS = new Set<string>([
   "invalid_policy",
   "no_org_ignored",
   "org_mismatch_ignored",
+  "invalid_signature",
 ]);
 
 export function policyRejectionPath(cachePath: string = policyPath()): string {
@@ -332,7 +336,8 @@ export function readCachedPolicy(
     const raw = readFileSync(cachePath, "utf8");
     const parsed: unknown = JSON.parse(raw);
     const validated = validateCachedPolicyFile(parsed);
-    return validated.ok ? validated.value : null;
+    if (!validated.ok) return null;
+    return verifyCachedPolicy(validated.value, cachePath);
   } catch {
     return null;
   }
@@ -345,6 +350,47 @@ function rawCachedPolicy(cachePath: string): unknown {
     return parsed?.policy;
   } catch {
     return undefined;
+  }
+}
+
+/**
+ * Re-verifies a cached policy on every load. With a stored signed body the
+ * policy is rebuilt from that body (the normalized `policy` copy is not
+ * trusted) and its signature checked, so an edited cache fails. An enforcing
+ * org policy with no signed body is rejected. Returns null on any failure.
+ */
+function verifyCachedPolicy(entry: CachedPolicyFile, cachePath: string): CachedPolicyFile | null {
+  const reject = (policy: Policy, raw: unknown): null => {
+    rememberEnforcingOrg(policy, raw, cachePath);
+    return null;
+  };
+  if (entry.signed_body !== undefined) {
+    const rebuilt = validatePolicy(entry.signed_body, { skipRegexValidation: true });
+    if (!rebuilt.ok) return reject(entry.policy, entry.signed_body);
+    const trust = checkPolicyTrust(rebuilt.value, entry.signed_body);
+    if (!trust.ok) return reject(rebuilt.value, entry.signed_body);
+    return { ...entry, policy: rebuilt.value };
+  }
+  const trust = checkPolicyTrust(entry.policy, undefined);
+  if (!trust.ok) return reject(entry.policy, entry.policy);
+  return entry;
+}
+
+/**
+ * If `policy` is an enforcing org policy, write the enforced-org marker
+ * so a rejected fetch or a rejected cache locks down instead of failing
+ * open. Never throws.
+ */
+export function rememberEnforcingOrg(
+  policy: Policy,
+  rawPolicy: unknown,
+  cachePath: string,
+): void {
+  if (!isEnforcingOrgPolicy(policy)) return;
+  try {
+    writeEnforcementMarkerAtomic(policy, rawPolicy ?? policy, cachePath);
+  } catch {
+    // Marker write must not hide the rejection.
   }
 }
 

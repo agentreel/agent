@@ -6,23 +6,74 @@ import {
   POLICY_REFRESH_INTERVAL_MS,
   readCachedPolicy,
   shouldRefreshPolicy,
+  rememberEnforcingOrg,
   writeCachedPolicyAtomic,
   writePolicyRejectionAtomic,
 } from "./cache.js";
+import { hasSignatureField } from "./signature.js";
+import { checkPolicyTrust, signedAtOf } from "./trust.js";
 import {
   getPolicyOrgId,
   repoSlugFromRemoteUrl,
   validatePolicy,
+  type CachedPolicyFile,
   type Policy,
 } from "./types.js";
 
 export { POLICY_REFRESH_INTERVAL_MS, repoSlugFromRemoteUrl, shouldRefreshPolicy };
 
+/**
+ * Contract steps 2 to 5 for a 200 body: signature against a pinned key
+ * (required for an enforcing org policy), body etag equal to the ETag
+ * header, and no rollback to an older signed_at for the same org. Returns
+ * an error string, or null when the policy may be installed.
+ */
+function signedPolicyError(
+  policy: Policy,
+  body: unknown,
+  res: Response,
+  cached: CachedPolicyFile | null,
+): string | null {
+  const trust = checkPolicyTrust(policy, body);
+  if (!trust.ok) return `${trust.reason}: ${trust.detail}`;
+  if (!trust.signed) return null;
+  const header = normalizeEtagToken(res.headers.get("etag"));
+  if (header !== policy.etag) {
+    return `etag_mismatch: body etag ${policy.etag} does not match ETag header ${header ?? "(missing)"}`;
+  }
+  const cachedSignedAt = cached?.signed_body ? signedAtOf(cached.signed_body) : null;
+  if (
+    cachedSignedAt &&
+    trust.signedAt &&
+    getPolicyOrgId(cached?.policy) === getPolicyOrgId(policy) &&
+    Date.parse(trust.signedAt) < Date.parse(cachedSignedAt)
+  ) {
+    return `rollback: signed_at ${trust.signedAt} is older than the cached ${cachedSignedAt}`;
+  }
+  return null;
+}
+
+/** Strips a weak validator and quotes, as the web contract's normalizeEtagToken. */
+export function normalizeEtagToken(raw: string | null | undefined): string | null {
+  if (typeof raw !== "string") return null;
+  let t = raw.trim();
+  if (t.startsWith("W/")) t = t.slice(2);
+  if (t.length >= 2 && t.startsWith('"') && t.endsWith('"')) t = t.slice(1, -1);
+  return t.length > 0 ? t : null;
+}
+
 export const POLICY_FETCH_TIMEOUT_MS = 10_000;
 
 export type FetchPolicyResult =
   | { status: "unlinked" }
-  | { status: "updated"; policy: Policy; etag: string; fetchedAt: number }
+  | {
+      status: "updated";
+      policy: Policy;
+      etag: string;
+      fetchedAt: number;
+      /** Raw signed body, when the server signed it (stored for re-verification). */
+      signedBody?: Record<string, unknown>;
+    }
   | { status: "not_modified"; policy: Policy; etag: string; fetchedAt: number }
   | { status: "invalid_policy"; error: string; keptCache: boolean }
   | {
@@ -125,6 +176,7 @@ export async function fetchPolicy(
           policy: cached.policy,
           etag: cached.etag,
           fetched_at: fetchedAt,
+          ...(cached.signed_body ? { signed_body: cached.signed_body } : {}),
         },
         cachePath,
       );
@@ -259,6 +311,32 @@ export async function fetchPolicy(
         };
       }
 
+      const trustError = signedPolicyError(policy, body, res, cached);
+      if (trustError) {
+        rememberEnforcingOrg(policy, body, cachePath);
+        log(
+          cached
+            ? `rejected policy signature (${trustError}); keeping last verified cache`
+            : `rejected policy signature (${trustError}); writing an enforcement marker so the org stays locked down until a verified policy is cached`,
+        );
+        try {
+          writePolicyRejectionAtomic(
+            { ts: nowFn(), error: trustError, reason: "invalid_signature" },
+            cachePath,
+          );
+        } catch {
+          // Never fail fetch on sidecar write error.
+        }
+        return {
+          status: "invalid_policy",
+          error: trustError,
+          keptCache: cached !== null,
+        };
+      }
+      const signedBody = hasSignatureField(body)
+        ? (body as Record<string, unknown>)
+        : undefined;
+
       const etag = policy.etag;
       const fetchedAt = nowFn();
       writeCachedPolicyAtomic(
@@ -266,6 +344,7 @@ export async function fetchPolicy(
           policy,
           etag,
           fetched_at: fetchedAt,
+          ...(signedBody ? { signed_body: signedBody } : {}),
         },
         cachePath,
       );
@@ -275,6 +354,7 @@ export async function fetchPolicy(
         policy,
         etag,
         fetchedAt,
+        ...(signedBody ? { signedBody } : {}),
       };
     }
 
