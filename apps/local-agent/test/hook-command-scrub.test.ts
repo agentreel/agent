@@ -3,9 +3,11 @@ import { tmpdir } from "node:os";
 import { dirname, join } from "node:path";
 import { afterAll, beforeEach, describe, expect, it } from "vitest";
 import {
+  applyNpxNodeOptionsFlag,
   buildHookCommand,
   buildHookInvocation,
   isScrubbedHookCommand,
+  psSingleQuote,
   stripHookScrubWrapper,
 } from "../src/hooks/hook-command.js";
 import {
@@ -40,7 +42,7 @@ describe("quotePath", () => {
 });
 
 describe("buildHookCommand", () => {
-  const posixScrub = "env -u NODE_OPTIONS -u npm_config_node_options ";
+  const posixScrub = "env -u NODE_OPTIONS -u npm_config_node_options -u NPM_CONFIG_NODE_OPTIONS ";
 
   it("POSIX: drops NODE_OPTIONS and npm_config_node_options with env -u before the program", () => {
     expect(buildHookCommand(BIN, "hook", "PreToolUse", "linux")).toBe(
@@ -50,6 +52,7 @@ describe("buildHookCommand", () => {
       posixScrub + "/usr/local/bin/agentreel cursor-hook beforeShellExecution",
     );
     expect(isScrubbedHookCommand(`env -u NODE_OPTIONS ${BIN} hook Stop`)).toBe(false);
+    expect(isScrubbedHookCommand(`env -u NODE_OPTIONS -u npm_config_node_options ${BIN} hook Stop`)).toBe(false);
   });
 
   it("Claude on Windows uses the POSIX env -u form and sets shell bash (Git Bash is the default host shell)", () => {
@@ -64,8 +67,10 @@ describe("buildHookCommand", () => {
 
   it("Cursor on Windows uses PowerShell to drop NODE_OPTIONS, not cmd or env -u", () => {
     const cmd = buildHookCommand('"C:\\Program Files\\agentreel\\cli.js"', "cursor-hook", "beforeShellExecution", "win32");
+    expect(cmd).toContain("$OutputEncoding = [Console]::InputEncoding = [Console]::OutputEncoding = New-Object System.Text.UTF8Encoding $false;");
     expect(cmd).toContain("Remove-Item Env:NODE_OPTIONS");
     expect(cmd).toContain("Remove-Item Env:npm_config_node_options");
+    expect(cmd).toContain("Remove-Item Env:NPM_CONFIG_NODE_OPTIONS");
     expect(cmd).toContain("$input | & 'C:\\Program Files\\agentreel\\cli.js'");
     expect(cmd).toContain("cursor-hook beforeShellExecution");
     expect(cmd).not.toContain("cmd /d");
@@ -87,6 +92,29 @@ describe("buildHookCommand", () => {
       posixScrub + "npx --node-options= -y @agentreel/agent hook Stop",
     );
     expect(isScrubbedHookCommand(posixScrub + "npx -y @agentreel/agent hook Stop")).toBe(false);
+  });
+
+  it("keeps quoting when inserting --node-options= into an npx prefix with spaces", () => {
+    expect(applyNpxNodeOptionsFlag('"C:\\Program Files\\nodejs\\npx.cmd" -y @agentreel/agent')).toBe(
+      '"C:\\Program Files\\nodejs\\npx.cmd" --node-options= -y @agentreel/agent',
+    );
+    expect(applyNpxNodeOptionsFlag('"/tmp/np dir/npx" -y @agentreel/agent')).toBe(
+      '"/tmp/np dir/npx" --node-options= -y @agentreel/agent',
+    );
+    expect(buildHookCommand('"/tmp/np dir/npx" -y @agentreel/agent', "hook", "Stop", "linux")).toBe(
+      posixScrub + '"/tmp/np dir/npx" --node-options= -y @agentreel/agent hook Stop',
+    );
+  });
+
+  it("psSingleQuote doubles ASCII and typographic single quotes, including in O’Brien paths", () => {
+    expect(psSingleQuote("O'Brien")).toBe("'O''Brien'");
+    expect(psSingleQuote("O\u2018Brien")).toBe("'O\u2018\u2018Brien'");
+    expect(psSingleQuote("O\u2019Brien")).toBe("'O\u2019\u2019Brien'");
+    expect(psSingleQuote("O\u201ABrien")).toBe("'O\u201A\u201ABrien'");
+    expect(psSingleQuote("O\u201BBrien")).toBe("'O\u201B\u201BBrien'");
+    const path = "C:\\Users\\O\u2019Brien\\agentreel\\cli.js";
+    const cmd = buildHookCommand(path, "cursor-hook", "beforeShellExecution", "win32");
+    expect(cmd).toContain("$input | & 'C:\\Users\\O\u2019\u2019Brien\\agentreel\\cli.js'");
   });
 
   it("does not wrap a command twice", () => {

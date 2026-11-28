@@ -40,11 +40,17 @@
 export const SCRUBBED_ENV_VAR = "NODE_OPTIONS";
 export const SCRUBBED_NPM_CONFIG_VAR = "npm_config_node_options";
 
-const POSIX_WRAPPER = `env -u ${SCRUBBED_ENV_VAR} -u ${SCRUBBED_NPM_CONFIG_VAR} `;
+const POSIX_WRAPPER = `env -u ${SCRUBBED_ENV_VAR} -u ${SCRUBBED_NPM_CONFIG_VAR} -u NPM_CONFIG_NODE_OPTIONS `;
 const POSIX_WRAPPER_LEGACY = `env -u ${SCRUBBED_ENV_VAR} `;
 const WINDOWS_CMD_WRAPPER_HEAD = `cmd /d /s /c "set ${SCRUBBED_ENV_VAR}=&& `;
+/** UTF-8 with no BOM, so non-ASCII hook JSON is not decoded as the system ANSI code page. */
+const PS_ENCODING =
+  "$OutputEncoding = [Console]::InputEncoding = [Console]::OutputEncoding = New-Object System.Text.UTF8Encoding $false; ";
 const PS_UNSET =
+  "Remove-Item Env:NODE_OPTIONS -ErrorAction SilentlyContinue; Remove-Item Env:npm_config_node_options -ErrorAction SilentlyContinue; Remove-Item Env:NPM_CONFIG_NODE_OPTIONS -ErrorAction SilentlyContinue; ";
+const PS_UNSET_LEGACY =
   "Remove-Item Env:NODE_OPTIONS -ErrorAction SilentlyContinue; Remove-Item Env:npm_config_node_options -ErrorAction SilentlyContinue; ";
+const PS_WRAPPER = `${PS_ENCODING}${PS_UNSET}`;
 
 export type HookPlatform = NodeJS.Platform;
 export type HookHost = "claude" | "cursor";
@@ -60,13 +66,40 @@ export function hookHostForSubcommand(subcommand: string): HookHost {
   return subcommand === "cursor-hook" ? "cursor" : "claude";
 }
 
-function applyNpxNodeOptionsFlag(prefix: string): string {
+/** End index of the first prefix token in the original string, including quotes. */
+function firstTokenEnd(input: string): number {
+  let i = 0;
+  while (i < input.length && /\s/.test(input[i]!)) i++;
+  let inQuote = false;
+  let escaped = false;
+  for (; i < input.length; i++) {
+    const ch = input[i]!;
+    if (escaped) {
+      escaped = false;
+      continue;
+    }
+    if (ch === "\\") {
+      escaped = true;
+      continue;
+    }
+    if (ch === '"') {
+      inQuote = !inQuote;
+      continue;
+    }
+    if (!inQuote && /\s/.test(ch)) break;
+  }
+  return i;
+}
+
+/** Insert `--node-options=` after the first token, keeping that token's quoting. */
+export function applyNpxNodeOptionsFlag(prefix: string): string {
   const tokens = tokenize(prefix);
   if (tokens.length === 0) return prefix;
   if (tokens.some((t) => t === "--node-options=" || t.startsWith("--node-options="))) return prefix;
   const base = basename(tokens[0]!);
   if (!/^(npx|bunx)(\.cmd|\.exe)?$/i.test(base)) return prefix;
-  return [tokens[0], "--node-options=", ...tokens.slice(1)].join(" ");
+  const end = firstTokenEnd(prefix);
+  return `${prefix.slice(0, end)} --node-options=${prefix.slice(end)}`;
 }
 
 function basename(p: string): string {
@@ -111,27 +144,31 @@ export function tokenize(input: string): string[] {
   return out;
 }
 
-function psSingleQuote(s: string): string {
-  return `'${s.replace(/'/g, "''")}'`;
+/** PowerShell single-quote a string. ASCII and typographic single quotes
+ * (U+2018, U+2019, U+201A, U+201B) are doubled because PowerShell treats
+ * them all as string delimiters. */
+export function psSingleQuote(s: string): string {
+  return `'${s.replace(/['\u2018\u2019\u201A\u201B]/g, (ch) => ch + ch)}'`;
 }
 
 function toPowerShellCommand(prefix: string, subcommand: string, event: string): string {
   const launched = applyNpxNodeOptionsFlag(prefix);
   const tokens = tokenize(launched);
-  if (tokens.length === 0) return `${PS_UNSET}$input | ${subcommand} ${event}`;
+  if (tokens.length === 0) return `${PS_WRAPPER}$input | ${subcommand} ${event}`;
   const base = basename(tokens[0]!);
   const isLauncher = /^(npx|bunx)(\.cmd|\.exe)?$/i.test(base);
   // Launchers stay a command line; everything else is invoked with & and
   // single-quoted so spaces and PowerShell metacharacters are literal.
   // `& node` does not inherit PowerShell's stdin, so pipe `$input` into
-  // the process. Run this string with `powershell -File` (or a runspace)
-  // and a real stdin (the windows-latest job opens the hook JSON as a
-  // file descriptor). `powershell -Command` and Node `spawnSync` `input`
-  // do not bind `$input` reliably and hang.
+  // the process. Run this string with pwsh 7 -File (or a runspace) and
+  // a real stdin (the windows-latest job opens the hook JSON as a file
+  // descriptor). Windows PowerShell 5.1 hangs when stdin is redirected
+  // until the hook timeout (130s for pre-exec), then fails closed.
+  // `powershell -Command` and Node `spawnSync` `input` hang too.
   const head = isLauncher
     ? tokens.map((t) => (/^[A-Za-z0-9_./:=@-]+$/.test(t) ? t : psSingleQuote(t))).join(" ")
     : tokens.map((t, i) => (i === 0 ? `& ${psSingleQuote(t)}` : psSingleQuote(t))).join(" ");
-  return `${PS_UNSET}$input | ${head} ${subcommand} ${event}`;
+  return `${PS_WRAPPER}$input | ${head} ${subcommand} ${event}`;
 }
 
 function toPosixCommand(prefix: string, subcommand: string, event: string): string {
@@ -179,6 +216,8 @@ export function buildHookCommand(
 function isPowerShellScrub(command: string): boolean {
   const c = command.replace(/^\s+/, "");
   return (
+    c.startsWith(PS_ENCODING) &&
+    c.includes("UTF8Encoding") &&
     c.includes("Remove-Item Env:NODE_OPTIONS") &&
     c.includes("Remove-Item Env:npm_config_node_options")
   );
@@ -186,13 +225,10 @@ function isPowerShellScrub(command: string): boolean {
 
 function isPosixScrub(command: string): boolean {
   const c = command.trimStart();
-  // Must drop both variables. The legacy `env -u NODE_OPTIONS ` form (no
-  // npm_config_node_options) is not enough: npx would still inject from
-  // ~/.npmrc or the env var.
-  return (
-    c.startsWith(POSIX_WRAPPER) ||
-    c.startsWith(`env -u ${SCRUBBED_NPM_CONFIG_VAR} -u ${SCRUBBED_ENV_VAR} `)
-  );
+  // Must drop NODE_OPTIONS, npm_config_node_options, and the uppercase
+  // NPM_CONFIG_NODE_OPTIONS form. Legacy wrappers without the uppercase
+  // unset are not enough on case-sensitive hosts.
+  return c.startsWith(POSIX_WRAPPER);
 }
 
 function isNpxPrefixCommand(command: string): boolean {
@@ -222,6 +258,9 @@ export function isScrubbedHookCommand(command: string): boolean {
 export function stripHookScrubWrapper(command: string): string {
   const raw = command.trimStart();
   if (raw.startsWith(POSIX_WRAPPER)) return raw.slice(POSIX_WRAPPER.length);
+  if (raw.startsWith(`env -u ${SCRUBBED_ENV_VAR} -u ${SCRUBBED_NPM_CONFIG_VAR} `)) {
+    return raw.slice(`env -u ${SCRUBBED_ENV_VAR} -u ${SCRUBBED_NPM_CONFIG_VAR} `.length);
+  }
   if (raw.startsWith(`env -u ${SCRUBBED_NPM_CONFIG_VAR} -u ${SCRUBBED_ENV_VAR} `)) {
     return raw.slice(`env -u ${SCRUBBED_NPM_CONFIG_VAR} -u ${SCRUBBED_ENV_VAR} `.length);
   }
@@ -230,9 +269,12 @@ export function stripHookScrubWrapper(command: string): string {
     const rest = raw.slice(WINDOWS_CMD_WRAPPER_HEAD.length);
     return rest.endsWith('"') ? rest.slice(0, -1) : rest;
   }
-  if (raw.startsWith(PS_UNSET)) {
-    return raw
-      .slice(PS_UNSET.length)
+  let rest = raw;
+  if (rest.startsWith(PS_ENCODING)) rest = rest.slice(PS_ENCODING.length);
+  if (rest.startsWith(PS_UNSET) || rest.startsWith(PS_UNSET_LEGACY)) {
+    const head = rest.startsWith(PS_UNSET) ? PS_UNSET : PS_UNSET_LEGACY;
+    return rest
+      .slice(head.length)
       .replace(/^\$input\s*\|\s*/, "")
       .replace(/^&\s+/, "");
   }

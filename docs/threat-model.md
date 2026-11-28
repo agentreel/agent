@@ -59,9 +59,9 @@ would otherwise inject `NODE_OPTIONS` from `~/.npmrc` or
 
 | Host | Installed command |
 | --- | --- |
-| macOS, Linux | `env -u NODE_OPTIONS -u npm_config_node_options <agentreel> hook <Event>` (Cursor: `cursor-hook <event>`). An `npx` or `bunx` prefix also gets `--node-options=`. |
+| macOS, Linux | `env -u NODE_OPTIONS -u npm_config_node_options -u NPM_CONFIG_NODE_OPTIONS <agentreel> hook <Event>` (Cursor: `cursor-hook <event>`). An `npx` or `bunx` prefix also gets `--node-options=`. |
 | Windows, Claude Code | The same POSIX `env -u` form, with the hook entry's `shell` field set to `"bash"`. Claude Code's default host shell on Windows is Git Bash when Git is installed. The older `cmd /d /s /c "set NODE_OPTIONS=&& ..."` form is mis-tokenized there: a path with spaces breaks the command, and `/d` `/s` `/c` can be path-mangled, which would block every PreToolUse and stop lifecycle capture. If bash is missing, PreToolUse fails closed via `onFailure: "block"`. |
-| Windows, Cursor | PowerShell: `Remove-Item Env:NODE_OPTIONS` and `Env:npm_config_node_options`, then `$input |` the prefix and `cursor-hook` event. `& node` does not inherit PowerShell's stdin, so `$input` has to be piped. This is run through `powershell -File` (or an equivalent runspace) with a real stdin. `powershell -Command` and Node `spawnSync` `input` do not bind `$input` reliably. Cursor has no hook `shell` field; the desktop app runs hooks through PowerShell. |
+| Windows, Cursor | PowerShell 7 (`pwsh`) via `-File`: set `$OutputEncoding` and `[Console]::InputEncoding` / `OutputEncoding` to UTF-8 with no BOM, `Remove-Item Env:NODE_OPTIONS`, `Env:npm_config_node_options` and `Env:NPM_CONFIG_NODE_OPTIONS`, then `$input |` the prefix and `cursor-hook` event. `& node` does not inherit PowerShell's stdin, so `$input` has to be piped. Cursor has no hook `shell` field; the desktop app runs hooks through PowerShell. The windows-latest job proves this form with `pwsh -File` and the hook JSON opened as stdin. Windows PowerShell 5.1 hangs when stdin is redirected, until the hook timeout (130s for pre-exec), then fails closed. `powershell -Command` and Node `spawnSync` `input` also hang. No real Cursor-on-Windows launch was tested. |
 
 A preload set in `NODE_OPTIONS` never loads in the hook process. If `env`
 or PowerShell cannot be started the command fails: Claude Code PreToolUse
@@ -79,15 +79,22 @@ Limits:
   `agentreel managed install` itself still supports only Linux, WSL and
   macOS.
 - The windows-latest CI job runs the installed command through Git Bash
-  `bash.exe` (Claude) and Windows PowerShell (Cursor), including a prefix
-  path with spaces. A custom `AGENTREEL_HOOK_COMMAND` is still untested as
-  a host integration.
-- Only `NODE_OPTIONS` and `npm_config_node_options` are scrubbed (plus
-  `--node-options=` for `npx` / `bunx`). A shell rc file (`bashrc` and
-  friends) or `launchctl setenv` can put `NODE_OPTIONS` back depending on
-  how the host starts the shell; that is a known follow-up, not claimed
-  coverage. Other ways to run code in a process the agent starts, such as
-  a modified `PATH` or `node` binary, are out of scope.
+  `bash.exe` (Claude) and PowerShell 7 `pwsh -File` (Cursor), including a
+  prefix path with spaces and a non-ASCII hook JSON payload. A custom
+  `AGENTREEL_HOOK_COMMAND` is still untested as a host integration. No
+  real Cursor-on-Windows launch was tested. Windows PowerShell 5.1 hangs
+  when stdin is redirected, until the hook timeout (130s for pre-exec),
+  then fails closed, so it is not used in that job.
+- Only `NODE_OPTIONS`, `npm_config_node_options` and
+  `NPM_CONFIG_NODE_OPTIONS` are scrubbed (plus `--node-options=` for
+  `npx` / `bunx`). A shell rc file (`bashrc` and friends) or
+  `launchctl setenv` can put `NODE_OPTIONS` back depending on how the
+  host starts the shell; that is a known follow-up, not claimed coverage.
+  `LD_PRELOAD`, `DYLD_INSERT_LIBRARIES` and `BASH_ENV` are out of scope
+  for this wrapper: they can still inject code into `env` or the hook
+  process, and are not unset. Other ways to run code in a process the
+  agent starts, such as a modified `PATH` or `node` binary, are also out
+  of scope.
 
 ## The runtime self-check is detection only
 

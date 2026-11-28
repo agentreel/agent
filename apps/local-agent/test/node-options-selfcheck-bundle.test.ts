@@ -133,11 +133,20 @@ function isPowerShellHookCommand(command: string): boolean {
 function runHost(
   command: string,
   home: string,
-  opts: { nodeOptions?: string; npmConfigNodeOptions?: string; input?: string; path?: string } = {},
+  opts: {
+    nodeOptions?: string;
+    npmConfigNodeOptions?: string;
+    uppercaseNpmConfigNodeOptions?: string;
+    input?: string;
+    path?: string;
+  } = {},
 ) {
   const env = baseEnv(home);
   if (opts.nodeOptions !== undefined) env.NODE_OPTIONS = opts.nodeOptions;
   if (opts.npmConfigNodeOptions !== undefined) env.npm_config_node_options = opts.npmConfigNodeOptions;
+  if (opts.uppercaseNpmConfigNodeOptions !== undefined) {
+    env.NPM_CONFIG_NODE_OPTIONS = opts.uppercaseNpmConfigNodeOptions;
+  }
   if (opts.path !== undefined) env.PATH = opts.path;
   const input = opts.input ?? "";
   let r;
@@ -187,8 +196,9 @@ function expectScrubbed(command: string): void {
   expect(command).not.toContain("cmd /d");
   if (isPowerShellHookCommand(command)) {
     expect(command).toContain("Remove-Item Env:npm_config_node_options");
+    expect(command).toContain("New-Object System.Text.UTF8Encoding $false");
   } else {
-    expect(command.startsWith("env -u NODE_OPTIONS -u npm_config_node_options ")).toBe(true);
+    expect(command.startsWith("env -u NODE_OPTIONS -u npm_config_node_options -u NPM_CONFIG_NODE_OPTIONS ")).toBe(true);
   }
 }
 
@@ -219,6 +229,13 @@ const CURSOR_SHELL = JSON.stringify({
   generation_id: "g1",
   command: "git push --force origin main",
   cwd: "/tmp",
+});
+const CURSOR_SHELL_UNICODE = JSON.stringify({
+  hook_event_name: "beforeShellExecution",
+  conversation_id: "c1-é-日本-😀",
+  generation_id: "g1",
+  command: "git push --force origin main",
+  cwd: "/tmp/é-日本-😀",
 });
 
 function enforcingPolicy(): Policy {
@@ -462,8 +479,8 @@ describe("built bundle: npm injects NODE_OPTIONS after env -u unless the command
         'const hasEmpty = args.some((a) => a === "--node-options=" || a.startsWith("--node-options="));',
         'const rest = args.filter((a) => a !== "--node-options=" && !a.startsWith("--node-options="));',
         "if (!hasEmpty) {",
-        "  if (process.env.npm_config_node_options) {",
-        "    process.env.NODE_OPTIONS = process.env.npm_config_node_options;",
+        "  if (process.env.npm_config_node_options || process.env.NPM_CONFIG_NODE_OPTIONS) {",
+        "    process.env.NODE_OPTIONS = process.env.npm_config_node_options || process.env.NPM_CONFIG_NODE_OPTIONS;",
         "  } else {",
         '    const home = process.env.HOME || process.env.USERPROFILE || "";',
         '    const npmrc = join(home, ".npmrc");',
@@ -541,6 +558,47 @@ describe("built bundle: npm injects NODE_OPTIONS after env -u unless the command
     expect(JSON.parse(r.stdout).hookSpecificOutput.permissionDecision).toBe("deny");
     expect(JSON.parse(r.stdout).hookSpecificOutput.permissionDecisionReason).not.toContain("SELF005");
   });
+
+  it("uppercase NPM_CONFIG_NODE_OPTIONS never reaches the hook under the installed npx command", () => {
+    const home = freshHome();
+    cachePolicy(home);
+    const mockDir = writeMockNpx(join(home, "mock-bin"));
+    const command = installNpxClaude(home);
+    const r = runHost(command, home, {
+      path: npxPath(mockDir),
+      uppercaseNpmConfigNodeOptions: `--require=${deleteCjs}`,
+      input: PRE_TOOL_USE,
+    });
+    expect(existsSync(marker), r.detail).toBe(false);
+    expect(r.status, r.detail).toBe(0);
+    expect(JSON.parse(r.stdout).hookSpecificOutput.permissionDecision).toBe("deny");
+    expect(JSON.parse(r.stdout).hookSpecificOutput.permissionDecisionReason).not.toContain("SELF005");
+  });
+
+  it("a quoted npx path with spaces keeps its quotes and runs through the host shell", () => {
+    const home = freshHome();
+    cachePolicy(home);
+    const mockDir = writeMockNpx(join(home, "np dir"));
+    const prefix = `${quotePath(join(mockDir, "npx"))} -y @agentreel/agent`;
+    expect(prefix).toContain("np dir");
+    const settingsPath = join(home, ".claude", "settings.json");
+    installClaudeCodeHooks(prefix, { settingsPath });
+    const settings = JSON.parse(readFileSync(settingsPath, "utf8")) as {
+      hooks: Record<string, Array<{ hooks: Array<{ command: string; shell?: string }> }>>;
+    };
+    const command = settings.hooks.PreToolUse![0]!.hooks[0]!.command;
+    expect(command).toContain(quotePath(join(mockDir, "npx")));
+    expect(command).toContain("--node-options=");
+    expectScrubbed(command);
+    const r = runHost(command, home, {
+      path: npxPath(mockDir),
+      npmConfigNodeOptions: `--require=${deleteCjs}`,
+      input: PRE_TOOL_USE,
+    });
+    expect(existsSync(marker), r.detail).toBe(false);
+    expect(r.status, r.detail).toBe(0);
+    expect(JSON.parse(r.stdout).hookSpecificOutput.permissionDecision).toBe("deny");
+  });
 });
 
 describe("built bundle: installed commands run through the host shell, including a path with spaces", () => {
@@ -591,5 +649,53 @@ describe("built bundle: installed commands run through the host shell, including
     expect(existsSync(marker), r.detail).toBe(false);
     expect(r.status, r.detail).toBe(0);
     expect(JSON.parse(r.stdout).permission).toBe("deny");
+  });
+});
+
+describe("built bundle: encoding and shell-literal paths", () => {
+  it("Cursor hook accepts non-ASCII hook JSON (é 日本 😀)", () => {
+    const home = freshHome();
+    cachePolicy(home);
+    const hooksPath = join(home, ".cursor", "hooks.json");
+    installCursorHooks(hookPrefix(), hooksPath, { systemHooksPath: join(home, "no-system-hooks.json") });
+    const file = JSON.parse(readFileSync(hooksPath, "utf8")) as { hooks: Record<string, Array<{ command: string }>> };
+    const command = file.hooks.beforeShellExecution![0]!.command;
+    expectScrubbed(command);
+    const r = runHost(command, home, { nodeOptions: `--require=${deleteCjs}`, input: CURSOR_SHELL_UNICODE });
+    expect(existsSync(marker), r.detail).toBe(false);
+    expect(r.status, r.detail).toBe(0);
+    const body = JSON.parse(r.stdout) as { permission: string };
+    expect(body.permission).toBe("deny");
+  });
+
+  it("a path containing $ and backticks is not expanded; the right file runs", () => {
+    const home = freshHome();
+    cachePolicy(home);
+    const root = join(buildDir, "x$(id)y`id`z");
+    mkdirSync(root, { recursive: true });
+    const cliPath = join(root, "cli.js");
+    copyFileSync(cli, cliPath);
+    const nodeDir = join(buildDir, "node-literal");
+    mkdirSync(nodeDir, { recursive: true });
+    const node = join(nodeDir, process.platform === "win32" ? "node.exe" : "node");
+    copyFileSync(process.execPath, node);
+    const prefix = hookPrefix(node, cliPath);
+    expect(cliPath).toContain("$(id)");
+    expect(cliPath).toContain("`id`");
+    expect(prefix).toContain("\\$(id)");
+    expect(prefix).toContain("\\`id\\`");
+    const settingsPath = join(home, ".claude", "settings.json");
+    installClaudeCodeHooks(prefix, { settingsPath });
+    const settings = JSON.parse(readFileSync(settingsPath, "utf8")) as {
+      hooks: Record<string, Array<{ hooks: Array<{ command: string; shell?: string }> }>>;
+    };
+    const entry = settings.hooks.PreToolUse![0]!.hooks[0]!;
+    expect(entry.command).toContain("\\$(id)");
+    expect(entry.command).toContain("\\`id\\`");
+    expectScrubbed(entry.command);
+    const r = runHost(entry.command, home, { nodeOptions: `--require=${deleteCjs}`, input: PRE_TOOL_USE });
+    expect(existsSync(marker), r.detail).toBe(false);
+    expect(r.status, r.detail).toBe(0);
+    expect(JSON.parse(r.stdout).hookSpecificOutput.permissionDecision).toBe("deny");
   });
 });
