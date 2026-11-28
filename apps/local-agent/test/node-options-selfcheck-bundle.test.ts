@@ -116,9 +116,13 @@ function windowsGitBash(): string {
 }
 
 function windowsPowerShell(): string {
-  const p = join(process.env.SystemRoot || "C:\\Windows", "System32", "WindowsPowerShell", "v1.0", "powershell.exe");
-  if (existsSync(p)) return p;
-  return "powershell.exe";
+  // Prefer PowerShell 7. Windows PowerShell 5.1 often hangs when stdin is
+  // redirected (including powershell -File with a file-descriptor stdin).
+  const pwsh = join(process.env.ProgramFiles || "C:\\Program Files", "PowerShell", "7", "pwsh.exe");
+  if (existsSync(pwsh)) return pwsh;
+  const legacy = join(process.env.SystemRoot || "C:\\Windows", "System32", "WindowsPowerShell", "v1.0", "powershell.exe");
+  if (existsSync(legacy)) return legacy;
+  return "pwsh.exe";
 }
 
 function isPowerShellHookCommand(command: string): boolean {
