@@ -369,12 +369,15 @@ function checkCommand(command: string): SelfProtectMatch | null {
     const readOnly = READ_ONLY_PROGRAMS.has(prog) && !segmentHasOutputRedirect(seg);
     // `node .../@agentreel/agent/dist/cli.js doctor` runs the CLI; it does not
     // write to the package. Its script path is skipped for SELF001 only.
-    // Not when a NODE_OPTIONS= prefix (bare or via env) is present: it can load
-    // code (--require, --import) into the CLI, so the script path is checked.
-    const nodeOptionsPrefix = pi > 0 && toks.slice(0, pi).some((t) => /^NODE_OPTIONS=/i.test(t));
-    const cliIdx = nodeOptionsPrefix ? -1 : nodeAgentreelScriptIndex(toks, pi);
+    const cliIdx = nodeAgentreelScriptIndex(toks, pi);
 
     // SELF005: env tampering.
+    // Any NODE_OPTIONS= assignment before the program (bare, env, sudo,
+    // sudo -E env) is SELF005, whatever the program: it can preload
+    // (--require, --import) into agentreel, npx, node and the rest.
+    if (pi >= 0 && toks.slice(0, pi).some((t) => /^NODE_OPTIONS=/i.test(t))) {
+      return m("SELF005");
+    }
     if (prog === "unset" && args.some((a) => ENV_NAMES.test(a))) return m("SELF005");
     if (prog === "export" || prog === "declare" || prog === "typeset") {
       if (args.some((a) => ENV_NAMES.test(a.split("=")[0]!) && a.includes("="))) return m("SELF005");
