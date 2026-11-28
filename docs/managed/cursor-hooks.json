@@ -1,0 +1,93 @@
+{
+  "version": 1,
+  "hooks": {
+    "sessionStart": [
+      {
+        "command": "/usr/local/bin/agentreel cursor-hook sessionStart",
+        "timeout": 5
+      }
+    ],
+    "sessionEnd": [
+      {
+        "command": "/usr/local/bin/agentreel cursor-hook sessionEnd",
+        "timeout": 5
+      }
+    ],
+    "beforeSubmitPrompt": [
+      {
+        "command": "/usr/local/bin/agentreel cursor-hook beforeSubmitPrompt",
+        "timeout": 5
+      }
+    ],
+    "preToolUse": [
+      {
+        "command": "/usr/local/bin/agentreel cursor-hook preToolUse",
+        "timeout": 130,
+        "failClosed": true
+      }
+    ],
+    "beforeShellExecution": [
+      {
+        "command": "/usr/local/bin/agentreel cursor-hook beforeShellExecution",
+        "timeout": 130,
+        "failClosed": true
+      }
+    ],
+    "beforeMCPExecution": [
+      {
+        "command": "/usr/local/bin/agentreel cursor-hook beforeMCPExecution",
+        "timeout": 130,
+        "failClosed": true
+      }
+    ],
+    "beforeReadFile": [
+      {
+        "command": "/usr/local/bin/agentreel cursor-hook beforeReadFile",
+        "timeout": 130,
+        "failClosed": true
+      }
+    ],
+    "postToolUse": [
+      {
+        "command": "/usr/local/bin/agentreel cursor-hook postToolUse",
+        "timeout": 5
+      }
+    ],
+    "postToolUseFailure": [
+      {
+        "command": "/usr/local/bin/agentreel cursor-hook postToolUseFailure",
+        "timeout": 5
+      }
+    ],
+    "afterShellExecution": [
+      {
+        "command": "/usr/local/bin/agentreel cursor-hook afterShellExecution",
+        "timeout": 5
+      }
+    ],
+    "afterMCPExecution": [
+      {
+        "command": "/usr/local/bin/agentreel cursor-hook afterMCPExecution",
+        "timeout": 5
+      }
+    ],
+    "afterFileEdit": [
+      {
+        "command": "/usr/local/bin/agentreel cursor-hook afterFileEdit",
+        "timeout": 5
+      }
+    ],
+    "subagentStop": [
+      {
+        "command": "/usr/local/bin/agentreel cursor-hook subagentStop",
+        "timeout": 5
+      }
+    ],
+    "stop": [
+      {
+        "command": "/usr/local/bin/agentreel cursor-hook stop",
+        "timeout": 5
+      }
+    ]
+  }
+}
