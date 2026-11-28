@@ -10,7 +10,7 @@
  *    installers and the managed pack write that command.
  */
 import { execFileSync, spawnSync } from "node:child_process";
-import { copyFileSync, existsSync, mkdirSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from "node:fs";
+import { closeSync, copyFileSync, existsSync, mkdirSync, mkdtempSync, openSync, readFileSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { dirname, join } from "node:path";
 import { fileURLToPath, pathToFileURL } from "node:url";
@@ -141,23 +141,22 @@ function runHost(
     if (isPowerShellHookCommand(command)) {
       // Do not use spawnSync's `input` option or `powershell -Command` here:
       // both hang on Windows waiting for stdin. Write the installed command
-      // to a script and feed the hook JSON through cmd `type | powershell
-      // -File`, which inherits stdin to the child.
+      // to a script and open the hook JSON as the child's stdin so
+      // powershell -File inherits a real file (EOF is well-defined).
       const ps1 = join(home, "agentreel-hook-command.ps1");
       const payload = join(home, "agentreel-hook-input.json");
       writeFileSync(ps1, `\uFEFF${command}`, "utf8");
       writeFileSync(payload, input, "utf8");
-      const q = (p: string) => `"${p.replace(/"/g, '\\"')}"`;
-      r = spawnSync(
-        process.env.ComSpec || "cmd.exe",
-        [
-          "/d",
-          "/s",
-          "/c",
-          `type ${q(payload)} | ${q(windowsPowerShell())} -NoProfile -NonInteractive -NoLogo -ExecutionPolicy Bypass -File ${q(ps1)}`,
-        ],
-        { env, encoding: "utf8", timeout: 15_000 },
-      );
+      const fd = openSync(payload, "r");
+      try {
+        r = spawnSync(
+          windowsPowerShell(),
+          ["-NoProfile", "-NonInteractive", "-NoLogo", "-ExecutionPolicy", "Bypass", "-File", ps1],
+          { env, encoding: "utf8", timeout: 15_000, stdio: [fd, "pipe", "pipe"] },
+        );
+      } finally {
+        closeSync(fd);
+      }
     } else {
       const bash = windowsGitBash();
       const gitRoot = dirname(dirname(bash));
