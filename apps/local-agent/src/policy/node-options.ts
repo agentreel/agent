@@ -445,10 +445,10 @@ const NESTED = /[\s;|&()<>]/;
 const WRAPPERS = new Set(["sudo", "doas", "env", "command", "exec", "nohup", "nice", "time", "builtin"]);
 
 /** Programs whose string argument is run as shell code. */
-const SHELLS = new Set(["sh", "bash", "zsh", "dash", "ksh", "eval", "su"]);
+const SHELLS = new Set(["sh", "bash", "zsh", "dash", "ksh", "mksh", "ash", "eval", "su"]);
 
 /** Shells that will run stdin as a script when there is no -c. */
-const STDIN_SHELLS = new Set(["sh", "bash", "zsh", "dash"]);
+const STDIN_SHELLS = new Set(["sh", "bash", "zsh", "dash", "ksh", "mksh", "ash"]);
 
 /**
  * Programs whose arguments are never run or assigned, so `echo NODE_OPTIONS=x`
@@ -497,7 +497,7 @@ interface ProgramView {
   program: string | null;
   setter: boolean;
   textOnly: boolean;
-  /** True when the program is sh/bash/zsh/dash and has no -c. */
+  /** True when the program is a stdin shell (including busybox sh/ash) and has no -c. */
   bareStdinShell: boolean;
   args: Word[];
 }
@@ -525,7 +525,8 @@ function viewOf(stmt: Statement): ProgramView {
     }
     args.push(w);
   }
-  const bareStdinShell = program !== null && STDIN_SHELLS.has(program) && !hasC;
+  const busyboxSh = program === "busybox" && (args[0]?.text === "sh" || args[0]?.text === "ash");
+  const bareStdinShell = program !== null && !hasC && (STDIN_SHELLS.has(program) || busyboxSh);
   return { program, setter, textOnly, bareStdinShell, args };
 }
 
@@ -633,17 +634,41 @@ function nestedDisallowed(text: string | null, depth: number): boolean {
 }
 
 /**
- * When a TEXT_ONLY command (printf, echo, cat, ...) pipes into a bare
- * sh/bash/zsh/dash with no -c, its argument or heredoc text is the script.
+ * Stages that pipe into `shellIndex` (not including the shell). Empty when
+ * the shell is not fed by `|` or `|&`.
  */
-function pipedTextIsDisallowed(stmts: Statement[], index: number, depth: number): boolean {
-  const stmt = stmts[index]!;
-  const next = stmts[index + 1];
-  if (!next) return false;
-  if (stmt.after !== "|" && stmt.after !== "|&") return false;
-  if (!viewOf(stmt).textOnly) return false;
-  if (!viewOf(next).bareStdinShell) return false;
-  return nestedDisallowed(textOnlyOutput(stmt), depth);
+function pipelineSources(stmts: Statement[], shellIndex: number): Statement[] | null {
+  if (shellIndex <= 0) return null;
+  const prev = stmts[shellIndex - 1]!;
+  if (prev.after !== "|" && prev.after !== "|&") return null;
+  let start = shellIndex - 1;
+  while (start > 0 && (stmts[start - 1]!.after === "|" || stmts[start - 1]!.after === "|&")) start--;
+  return stmts.slice(start, shellIndex);
+}
+
+/** True when anything sits between the text source and the shell. */
+function hasIntermediatePipeStage(sources: Statement[]): boolean {
+  return sources.length !== 1;
+}
+
+/**
+ * A bare stdin shell (sh, bash, zsh, dash, ksh, mksh, ash, busybox sh/ash)
+ * with no -c runs its stdin as a script. Allow only when exactly one
+ * TEXT_ONLY source stage with fully scannable text is piped directly into
+ * the shell and that text passes the allow list. Any stage between the
+ * text source and the shell is SELF005.
+ */
+function pipelineIntoShellIsDisallowed(stmts: Statement[], shellIndex: number, depth: number): boolean {
+  if (!viewOf(stmts[shellIndex]!).bareStdinShell) return false;
+  const sources = pipelineSources(stmts, shellIndex);
+  if (!sources) return false;
+  if (hasIntermediatePipeStage(sources)) return true;
+  // Intermediate stages are handled only by the rule above. A single source
+  // that is not a scannable TEXT_ONLY command fails closed.
+  if (sources.length !== 1) return false;
+  const src = sources[0]!;
+  if (!viewOf(src).textOnly) return true;
+  return nestedDisallowed(textOnlyOutput(src), depth);
 }
 
 /**
@@ -671,9 +696,10 @@ function shellHereInputIsDisallowed(stmt: Statement, depth: number): boolean {
  * in a way that cannot be checked. Every statement is checked (after ; && ||
  * & | and newlines), including a lone assignment with no program, export and
  * the other setters, the inner command of sh/bash/zsh/dash -c and eval, a
- * TEXT_ONLY command piped into a bare sh/bash/zsh/dash with no -c, and a
- * here-string or inline heredoc on those shells, up to a fixed depth. Never
- * throws.
+ * TEXT_ONLY command piped directly into a bare stdin shell with no -c (also
+ * ksh, mksh, ash, and busybox sh/ash), a pipeline that places any stage
+ * between that text and the shell, and a here-string or inline heredoc on
+ * those shells, up to a fixed depth. Never throws.
  */
 export function hasDisallowedNodeOptions(cmd: string, depth = 0): boolean {
   if (!cmd.includes("NODE_OPTIONS")) return false;
@@ -686,7 +712,7 @@ export function hasDisallowedNodeOptions(cmd: string, depth = 0): boolean {
   }
   for (let s = 0; s < statements.length; s++) {
     const stmt = statements[s]!;
-    if (pipedTextIsDisallowed(statements, s, depth)) return true;
+    if (pipelineIntoShellIsDisallowed(statements, s, depth)) return true;
     if (shellHereInputIsDisallowed(stmt, depth)) return true;
     let program: string | null = null;
     let setter = false;
