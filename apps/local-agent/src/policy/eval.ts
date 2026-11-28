@@ -1,4 +1,4 @@
-import { matchRule } from "../guard/matcher.js";
+import { matchRuleNormalized } from "../guard/matcher.js";
 import { RULES } from "../guard/rules.js";
 import type { MatchContext, Rule, Severity } from "../guard/types.js";
 import {
@@ -38,6 +38,8 @@ export interface PolicyEvalInput {
   repo?: string;
   branch?: string;
   member?: string;
+  /** Contents of SQL script files the command runs (psql -f, mysql <). */
+  referencedSqlContent?: string;
 }
 
 export interface PolicyRuleMatch {
@@ -489,6 +491,9 @@ function buildBuiltinMatchContext(input: PolicyEvalInput): MatchContext {
   if (input.url !== undefined) payload.url = input.url;
   if (input.mcp_tool !== undefined) payload.mcp_tool = input.mcp_tool;
   if (input.toolInput !== undefined) payload.tool_input = input.toolInput;
+  if (input.referencedSqlContent !== undefined) {
+    payload.referenced_sql = input.referencedSqlContent;
+  }
 
   return {
     command: input.command,
@@ -699,7 +704,7 @@ export function evaluatePolicy(
         return;
       }
       const entry = enabledBuiltins[builtinIndex]!;
-      const finding = matchRule(entry.effectiveRule, ctx);
+      const finding = matchRuleNormalized(entry.effectiveRule, ctx);
       if (finding) {
         const severity: Severity = entry.override?.severity ?? finding.severity;
         const effectiveApproval =

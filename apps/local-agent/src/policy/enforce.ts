@@ -10,6 +10,7 @@ import { insertEvent } from "../db.js";
 import { RULES } from "../guard/rules.js";
 import { ensureAgentreelDir, logPath } from "../paths.js";
 import { scrubAny, scrubString } from "../redact/scrubber.js";
+import { readSqlFileReferences } from "./sql-file-refs.js";
 import { isPolicyCacheStale, loadEffectivePolicy } from "./cache.js";
 import {
   EVAL_TIMEOUT_REASON,
@@ -376,6 +377,8 @@ export async function enforcePreExec(
       branch: req.branch,
       member: req.member,
     };
+    const referencedSql = readSqlFileReferences(req.command, req.cwd);
+    if (referencedSql !== undefined) evalInput.referencedSqlContent = referencedSql;
 
     const evalResult = evaluateFn(evalInput, loaded.policy, RULES, {
       deadlineMs: deps.evalDeadlineMs ?? POLICY_EVAL_DEADLINE_MS,
