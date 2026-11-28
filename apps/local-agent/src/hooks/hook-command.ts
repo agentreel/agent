@@ -70,10 +70,15 @@ export function hookHostForSubcommand(subcommand: string): HookHost {
 function firstTokenEnd(input: string): number {
   let i = 0;
   while (i < input.length && /\s/.test(input[i]!)) i++;
-  let inQuote = false;
+  let inSingle = false;
+  let inDouble = false;
   let escaped = false;
   for (; i < input.length; i++) {
     const ch = input[i]!;
+    if (inSingle) {
+      if (ch === "'") inSingle = false;
+      continue;
+    }
     if (escaped) {
       escaped = false;
       continue;
@@ -82,11 +87,15 @@ function firstTokenEnd(input: string): number {
       escaped = true;
       continue;
     }
-    if (ch === '"') {
-      inQuote = !inQuote;
+    if (ch === "'" && !inDouble) {
+      inSingle = true;
       continue;
     }
-    if (!inQuote && /\s/.test(ch)) break;
+    if (ch === '"') {
+      inDouble = !inDouble;
+      continue;
+    }
+    if (!inDouble && /\s/.test(ch)) break;
   }
   return i;
 }
@@ -108,18 +117,50 @@ function basename(p: string): string {
   return i >= 0 ? cleaned.slice(i + 1) : cleaned;
 }
 
-/** Split a hook prefix on whitespace, respecting double quotes and backslash escapes. */
-export function tokenize(input: string): string[] {
+export type TokenizeSingleQuotes = "posix" | "powershell";
+
+/** True when a command uses PowerShell '' doubling inside a single-quoted
+ * token, not POSIX '\'' concatenation. Existing Cursor-on-Windows installs
+ * use the PowerShell form; new quotePath output uses the POSIX form. */
+export function usesPowerShellSingleQuotes(input: string): boolean {
+  const t = input.trimStart();
+  if (t.includes("'\\''")) return false;
+  return t.startsWith("'") && t.includes("''");
+}
+
+/** Split a hook prefix on whitespace, respecting quotes and escapes.
+ * POSIX single quotes (including '\''), legacy double quotes with
+ * backslash escapes, and optional PowerShell '' doubling are all
+ * understood so doctor, path inspection and wrappers still recognize
+ * existing and new installs. */
+export function tokenize(input: string, opts?: { singleQuotes?: TokenizeSingleQuotes }): string[] {
+  const powershell = opts?.singleQuotes === "powershell";
   const out: string[] = [];
   let cur = "";
-  let inQuote = false;
+  let inSingle = false;
+  let inDouble = false;
   let escaped = false;
-  for (const ch of input) {
+  for (let i = 0; i < input.length; i++) {
+    const ch = input[i]!;
+    if (inSingle) {
+      if (ch === "'") {
+        if (powershell && input[i + 1] === "'") {
+          cur += "'";
+          i++;
+        } else {
+          inSingle = false;
+        }
+      } else {
+        cur += ch;
+      }
+      continue;
+    }
     if (escaped) {
       // Keep a backslash that is not escaping a quoting character so
-      // Windows paths like "C:\Program Files\..." stay intact. quotePath
-      // writes \\ for a real backslash, which still collapses to \.
-      if (ch !== "\\" && ch !== '"' && ch !== "$" && ch !== "`") cur += "\\";
+      // Windows paths like "C:\Program Files\..." stay intact. Legacy
+      // quotePath wrote \\ for a real backslash, which still collapses
+      // to \. \' is used in POSIX '\'' concatenation.
+      if (ch !== "\\" && ch !== '"' && ch !== "$" && ch !== "`" && ch !== "'") cur += "\\";
       cur += ch;
       escaped = false;
       continue;
@@ -128,11 +169,15 @@ export function tokenize(input: string): string[] {
       escaped = true;
       continue;
     }
-    if (ch === '"') {
-      inQuote = !inQuote;
+    if (ch === "'" && !inDouble) {
+      inSingle = true;
       continue;
     }
-    if (!inQuote && /\s/.test(ch)) {
+    if (ch === '"') {
+      inDouble = !inDouble;
+      continue;
+    }
+    if (!inDouble && /\s/.test(ch)) {
       if (cur) out.push(cur);
       cur = "";
       continue;
@@ -165,8 +210,11 @@ function toPowerShellCommand(prefix: string, subcommand: string, event: string):
   // descriptor). Windows PowerShell 5.1 hangs when stdin is redirected
   // until the hook timeout (130s for pre-exec), then fails closed.
   // `powershell -Command` and Node `spawnSync` `input` hang too.
+  // Always single-quote every token. Leaving "safe" characters unquoted
+  // is the same class of bug as quotePath's old conditional quoting:
+  // ; & * | and other PowerShell metacharacters can still split or expand.
   const head = isLauncher
-    ? tokens.map((t) => (/^[A-Za-z0-9_./:=@-]+$/.test(t) ? t : psSingleQuote(t))).join(" ")
+    ? tokens.map((t) => psSingleQuote(t)).join(" ")
     : tokens.map((t, i) => (i === 0 ? `& ${psSingleQuote(t)}` : psSingleQuote(t))).join(" ");
   return `${PS_WRAPPER}$input | ${head} ${subcommand} ${event}`;
 }
@@ -231,14 +279,20 @@ function isPosixScrub(command: string): boolean {
   return c.startsWith(POSIX_WRAPPER);
 }
 
+function commandTokens(command: string): string[] {
+  const inner = stripHookScrubWrapper(command);
+  const style = usesPowerShellSingleQuotes(inner) ? "powershell" : "posix";
+  return tokenize(inner, { singleQuotes: style });
+}
+
 function isNpxPrefixCommand(command: string): boolean {
-  const tokens = tokenize(stripHookScrubWrapper(command));
+  const tokens = commandTokens(command);
   const base = tokens[0] ? basename(tokens[0]) : "";
   return /^(npx|bunx)(\.cmd|\.exe)?$/i.test(base);
 }
 
 function hasNodeOptionsFlag(command: string): boolean {
-  return tokenize(stripHookScrubWrapper(command)).some(
+  return commandTokens(command).some(
     (t) => t === "--node-options=" || t.startsWith("--node-options="),
   );
 }

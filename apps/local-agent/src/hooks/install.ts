@@ -90,17 +90,13 @@ function buildHookEntry(
 }
 
 export function quotePath(p: string): string {
-  // Quote when the path would be split or expanded by a POSIX shell (Git
-  // Bash included). Escape backslash, double quote, $ and backtick so
-  // $(...) and backticks in a path cannot run.
-  if (!/[\s'"$`\\]/.test(p)) return p;
-  const escaped = p
-    .replace(/\\/g, "\\\\")
-    .replace(/"/g, '\\"')
-    .replace(/\$/g, "\\$")
-    .replace(/`/g, "\\`");
-  return `"${escaped}"`;
+  // Always single-quote for POSIX shells (including Git Bash on Windows).
+  // A path with no spaces can still contain ; & * | $ ` " ' globs or
+  // newlines, which would split or expand if left unquoted. A single
+  // quote in the path is escaped as '\''.
+  return "'" + p.replace(/'/g, "'\\''") + "'";
 }
+
 
 export interface InstallClaudeHooksOptions {
   settingsPath?: string;

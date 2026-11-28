@@ -15,6 +15,7 @@ import {
   type StatPath,
 } from "../src/managed/hook-path.js";
 import { buildHookCommand } from "../src/hooks/hook-command.js";
+import { quotePath } from "../src/hooks/install.js";
 import { defaultHookCommand, managedInstallCommand } from "../src/commands/managed.js";
 
 const BIN = "/usr/local/bin/agentreel";
@@ -180,11 +181,28 @@ describe("inspectHookCommandPath", () => {
     expect(
       hookCommandBinaryPath(buildHookCommand("/usr/local/bin/agentreel", "cursor-hook", "beforeShellExecution", "win32")),
     ).toBe("/usr/local/bin/agentreel");
+  
+    expect(hookCommandBinaryPath(buildHookCommand(quotePath("/usr/local/bin/agentreel"), "hook", "PreToolUse", "linux"))).toBe(
+      "/usr/local/bin/agentreel",
+    );
+    expect(hookCommandBinaryPath(buildHookCommand(quotePath("/tmp/agentreel;true"), "hook", "PreToolUse", "linux"))).toBe(
+      "/tmp/agentreel;true",
+    );
+    expect(hookCommandBinaryPath(buildHookCommand(quotePath("/tmp/O'Brien/bin"), "hook", "PreToolUse", "linux"))).toBe(
+      "/tmp/O'Brien/bin",
+    );
+    expect(
+      hookCommandBinaryPath(
+        buildHookCommand(quotePath("/usr/local/bin/agentreel"), "cursor-hook", "beforeShellExecution", "win32"),
+      ),
+    ).toBe("/usr/local/bin/agentreel");
   });
 });
 
 describe("agentreel managed install hook-path guard", () => {
-  const defaultBin = defaultHookCommand();
+  const defaultCommand = defaultHookCommand();
+  const defaultBin = hookCommandBinaryPath(defaultCommand) ?? defaultCommand;
+
   const safe = chainEntries(defaultBin, ROOT_FILE, ROOT_DIR);
 
   function run(
