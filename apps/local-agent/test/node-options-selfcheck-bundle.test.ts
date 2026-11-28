@@ -143,15 +143,16 @@ function runHost(
         env,
         input,
         encoding: "utf8",
+        timeout: 15_000,
       });
     } else {
       const bash = windowsGitBash();
       const gitRoot = dirname(dirname(bash));
       env.PATH = [join(gitRoot, "usr", "bin"), join(gitRoot, "bin"), env.PATH ?? ""].join(";");
-      r = spawnSync(bash, ["-c", command], { env, input, encoding: "utf8" });
+      r = spawnSync(bash, ["-c", command], { env, input, encoding: "utf8", timeout: 15_000 });
     }
   } else {
-    r = spawnSync("/bin/sh", ["-c", command], { env, input, encoding: "utf8" });
+    r = spawnSync("/bin/sh", ["-c", command], { env, input, encoding: "utf8", timeout: 15_000 });
   }
   return { status: r.status, stdout: r.stdout ?? "", stderr: r.stderr ?? "" };
 }

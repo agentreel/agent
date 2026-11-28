@@ -118,15 +118,18 @@ function psSingleQuote(s: string): string {
 function toPowerShellCommand(prefix: string, subcommand: string, event: string): string {
   const launched = applyNpxNodeOptionsFlag(prefix);
   const tokens = tokenize(launched);
-  if (tokens.length === 0) return `${PS_UNSET}${subcommand} ${event}`;
+  if (tokens.length === 0) return `${PS_UNSET}$input | ${subcommand} ${event}`;
   const base = basename(tokens[0]!);
   const isLauncher = /^(npx|bunx)(\.cmd|\.exe)?$/i.test(base);
   // Launchers stay a command line; everything else is invoked with & and
   // single-quoted so spaces and PowerShell metacharacters are literal.
+  // `$input |` forwards the hook JSON: `powershell -Command` (Cursor's host
+  // on Windows, and the windows-latest CI harness) does not pass stdin
+  // through to the child unless it is piped.
   const head = isLauncher
     ? tokens.map((t) => (/^[A-Za-z0-9_./:=@-]+$/.test(t) ? t : psSingleQuote(t))).join(" ")
     : tokens.map((t, i) => (i === 0 ? `& ${psSingleQuote(t)}` : psSingleQuote(t))).join(" ");
-  return `${PS_UNSET}${head} ${subcommand} ${event}`;
+  return `${PS_UNSET}$input | ${head} ${subcommand} ${event}`;
 }
 
 function toPosixCommand(prefix: string, subcommand: string, event: string): string {
@@ -225,6 +228,11 @@ export function stripHookScrubWrapper(command: string): string {
     const rest = raw.slice(WINDOWS_CMD_WRAPPER_HEAD.length);
     return rest.endsWith('"') ? rest.slice(0, -1) : rest;
   }
-  if (raw.startsWith(PS_UNSET)) return raw.slice(PS_UNSET.length).replace(/^&\s+/, "");
+  if (raw.startsWith(PS_UNSET)) {
+    return raw
+      .slice(PS_UNSET.length)
+      .replace(/^\$input\s*\|\s*/, "")
+      .replace(/^&\s+/, "");
+  }
   return command;
 }
