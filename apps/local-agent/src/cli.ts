@@ -179,9 +179,10 @@ managed
   .option("--root <dir>", "write under this directory instead of / (staging, images, tests)")
   .option("--hook-command <path>", "absolute path to a root-owned agentreel binary (default: this binary)")
   .option("--platform <name>", "linux or darwin (default: this machine)")
+  .option("--user-home <dir>", "home whose ~/.cursor/hooks.json loses AgentReel's entries (default: the sudo user's home)")
   .option("--no-claude", "skip the Claude Code managed settings file")
   .option("--no-cursor", "skip the Cursor enterprise hooks file")
-  .action((opts: { dryRun?: boolean; root?: string; hookCommand?: string; platform?: string; claude?: boolean; cursor?: boolean }) => {
+  .action((opts: { dryRun?: boolean; root?: string; hookCommand?: string; platform?: string; userHome?: string; claude?: boolean; cursor?: boolean }) => {
     const code = managedInstallCommand(opts);
     if (code !== 0) process.exitCode = code;
   });

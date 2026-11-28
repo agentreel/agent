@@ -1,5 +1,7 @@
+import { execFileSync } from "node:child_process";
 import { realpathSync } from "node:fs";
-import { sep } from "node:path";
+import { homedir } from "node:os";
+import { isAbsolute, join, resolve, sep } from "node:path";
 import { fileURLToPath } from "node:url";
 import pc from "picocolors";
 import { quotePath } from "../hooks/install.js";
@@ -9,6 +11,7 @@ import {
   ManagedInstallError,
   planManagedInstall,
   resolveManagedPlatform,
+  underRoot,
 } from "../managed/install.js";
 import type { ManagedPlatform } from "../managed/pack.js";
 
@@ -17,6 +20,8 @@ export interface ManagedInstallCliOptions {
   root?: string;
   hookCommand?: string;
   platform?: string;
+  /** Home directory whose ~/.cursor/hooks.json loses AgentReel's entries. Used as given, not placed under --root. */
+  userHome?: string;
   /** commander maps --no-claude / --no-cursor to claude:false / cursor:false */
   claude?: boolean;
   cursor?: boolean;
@@ -30,6 +35,62 @@ export interface ManagedInstallDeps {
   now?: Date;
   /** Test seam: replaces the writer so a test can prove nothing is written. */
   apply?: typeof applyManagedInstall;
+  /** Test seam: looks up a user's home directory (default: getent on Linux, dscl on macOS). */
+  lookupHome?: (user: string, platform: ManagedPlatform) => string | null;
+}
+
+const SAFE_USER = /^[A-Za-z0-9_][A-Za-z0-9_.-]{0,63}$/;
+
+function systemLookupHome(user: string, platform: ManagedPlatform): string | null {
+  try {
+    if (platform === "darwin") {
+      const out = execFileSync("/usr/bin/dscl", [".", "-read", `/Users/${user}`, "NFSHomeDirectory"], {
+        encoding: "utf8",
+        timeout: 3000,
+        stdio: ["ignore", "pipe", "ignore"],
+      });
+      return out.match(/NFSHomeDirectory:\s*(\S.*)$/m)?.[1]?.trim() ?? null;
+    }
+    const out = execFileSync("getent", ["passwd", user], {
+      encoding: "utf8",
+      timeout: 3000,
+      stdio: ["ignore", "pipe", "ignore"],
+    });
+    return out.trim().split(":")[5] ?? null;
+  } catch {
+    return null;
+  }
+}
+
+/**
+ * The invoking user's home. Under sudo that is SUDO_USER's home from the
+ * account database, never root's. With a staging root the home is placed under it.
+ */
+export function resolveInvokingUserHome(
+  opts: { root: string; userHome?: string; platform: ManagedPlatform },
+  env: NodeJS.ProcessEnv,
+  uid: number | null,
+  lookup: (user: string, platform: ManagedPlatform) => string | null,
+): { home: string | null; warning?: string } {
+  if (opts.userHome !== undefined) {
+    if (!isAbsolute(opts.userHome)) throw new ManagedInstallError(`--user-home must be an absolute path, got ${opts.userHome}`);
+    return { home: resolve(opts.userHome) };
+  }
+  let home: string | null;
+  const sudoUser = env.SUDO_USER;
+  if (uid === 0 && sudoUser && sudoUser !== "root") {
+    if (!SAFE_USER.test(sudoUser)) {
+      return { home: null, warning: "SUDO_USER is not a valid user name, so ~/.cursor/hooks.json was left alone. Use --user-home." };
+    }
+    home = lookup(sudoUser, opts.platform);
+    if (!home || !isAbsolute(home) || resolve(home) === "/") {
+      return { home: null, warning: `Could not find ${sudoUser}'s home directory, so ~/.cursor/hooks.json was left alone. Use --user-home.` };
+    }
+  } else {
+    home = env.HOME || homedir();
+  }
+  home = resolve(home);
+  return { home: opts.root === "/" ? home : underRoot(opts.root, home) };
 }
 
 /** Environment variables that mean we are running inside an agent's tool call. */
@@ -85,18 +146,33 @@ export function managedInstallCommand(opts: ManagedInstallCliOptions, deps: Mana
 
     const platform = parsePlatform(opts.platform);
     const hookCommand = opts.hookCommand ?? defaultHookCommand();
+    const warnings: string[] = [];
+    let cursorUserHooksPath: string | undefined;
+    if (opts.cursor !== false) {
+      const user = resolveInvokingUserHome(
+        { root, userHome: opts.userHome, platform },
+        env,
+        uid,
+        deps.lookupHome ?? systemLookupHome,
+      );
+      if (user.warning) warnings.push(user.warning);
+      if (user.home) cursorUserHooksPath = join(user.home, ".cursor", "hooks.json");
+    }
     const plans = planManagedInstall({
       root,
       platform,
       hookCommand,
       claude: opts.claude,
       cursor: opts.cursor,
+      cursorUserHooksPath,
+      onWarning: (w) => warnings.push(w),
     });
 
     log(pc.bold(dryRun ? "agentreel managed install (dry run, nothing is written)" : "agentreel managed install"));
     log(pc.dim(`  Hook command: ${hookCommand}`));
     if (root !== "/") log(pc.dim(`  Root: ${root}`));
 
+    for (const w of warnings) log(pc.yellow(`  Warning: ${w}`));
     const owner = hookBinaryOwnerUid(hookCommand);
     if (owner === null) {
       log(pc.yellow(`  Warning: ${hookCommand} was not found. Hooks that block on failure will block every tool call until it exists.`));
@@ -117,7 +193,13 @@ export function managedInstallCommand(opts: ManagedInstallCliOptions, deps: Mana
               ? "created"
               : "updated";
       log("");
-      log(`${pc.bold(r.target === "claude" ? "Claude Code" : "Cursor")}: ${r.systemPath} ${pc.dim(`(${verb})`)}`);
+      const label =
+        r.target === "claude"
+          ? "Claude Code"
+          : r.target === "cursor"
+            ? "Cursor"
+            : "Cursor user hooks (removing AgentReel's entries; the managed file replaces them)";
+      log(`${pc.bold(label)}: ${r.systemPath} ${pc.dim(`(${verb})`)}`);
       if (r.path !== r.systemPath) log(pc.dim(`  written at ${r.path}`));
       if (r.backup) log(pc.dim(`  backup: ${r.backup}`));
       if (r.diff) log(r.diff.trimEnd());
@@ -126,7 +208,6 @@ export function managedInstallCommand(opts: ManagedInstallCliOptions, deps: Mana
     if (!dryRun && results.some((r) => r.action !== "unchanged")) {
       log("");
       log(pc.dim("Next: open a new Claude Code session and run /status. Setting sources should list Enterprise managed settings (file)."));
-      log(pc.dim("Cursor still runs AgentReel's entries in ~/.cursor/hooks.json too. Remove them so events are not captured twice: `agentreel uninstall` as your own user (no sudo), then `agentreel daemon --detach`, because uninstall also stops the uploader."));
     }
     return 0;
   } catch (err) {

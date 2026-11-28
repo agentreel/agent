@@ -128,7 +128,8 @@ function isOurClaudeGroup(g: unknown): boolean {
   return isObject(g) && g.__agentreel === CLAUDE_HOOK_MARKER;
 }
 
-function isOurCursorDef(d: unknown): boolean {
+/** Same test the per-user installer and uninstaller use: the command runs `cursor-hook`. */
+export function isOurCursorDef(d: unknown): boolean {
   return isObject(d) && typeof d.command === "string" && d.command.includes(` ${CURSOR_HOOK_SUBCOMMAND} `);
 }
 
@@ -177,6 +178,27 @@ export function mergeCursorManagedHooks(existing: JsonObject, opts: BuildOptions
   }
   out.hooks = hooks;
   return out;
+}
+
+/**
+ * Remove only AgentReel-owned entries from a user-level ~/.cursor/hooks.json
+ * object, matching `agentreel uninstall`: other tools' hooks and unknown keys
+ * stay, an event left with no entries is dropped, and `hooks` stays an object
+ * so the file remains valid. Returns how many entries were removed.
+ */
+export function removeCursorUserHooks(existing: JsonObject): { value: JsonObject; removed: number } {
+  if (!isObject(existing.hooks)) return { value: existing, removed: 0 };
+  const hooks: JsonObject = { ...existing.hooks };
+  let removed = 0;
+  for (const [event, defs] of Object.entries(hooks)) {
+    if (!Array.isArray(defs)) continue;
+    const kept = defs.filter((d) => !isOurCursorDef(d));
+    removed += defs.length - kept.length;
+    if (kept.length === defs.length) continue;
+    if (kept.length === 0) delete hooks[event];
+    else hooks[event] = kept;
+  }
+  return removed === 0 ? { value: existing, removed } : { value: { ...existing, hooks }, removed };
 }
 
 export function serializeJson(value: unknown): string {

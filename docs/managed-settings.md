@@ -33,7 +33,15 @@ The sandbox needs its dependencies on Linux (`bubblewrap` and `socat`). With `fa
 
 All 14 events `agentreel init` installs, with the same commands and timeouts. The four pre-exec hooks (`preToolUse`, `beforeShellExecution`, `beforeMCPExecution`, `beforeReadFile`) set `"failClosed": true`, so a crash, timeout or missing binary blocks the action instead of letting it through. Enterprise hooks rank above team, project and user hooks.
 
-Cursor runs every hooks file, not just the highest one, so remove AgentReel's entries from `~/.cursor/hooks.json` after installing the managed file, or each event is captured twice. `agentreel uninstall` does that (it also stops the uploader; start it again with `agentreel daemon --detach`).
+Cursor runs every hooks file, not just the highest one, so AgentReel's per-user entries would capture each event a second time. The installer therefore also cleans the **invoking user's** `~/.cursor/hooks.json`:
+
+- it removes only AgentReel's entries, found the same way `agentreel uninstall` finds them (the command runs `agentreel cursor-hook`); other tools' hooks and any other keys stay exactly as they were;
+- it backs the file up first, keeps its owner and mode, and leaves a valid file (`{"version": 1, "hooks": {}}`) if AgentReel's were the only hooks;
+- it does nothing when the file is missing, has no AgentReel entries, isn't valid JSON, or is a symlink;
+- `--dry-run` shows the removal in its diff;
+- under `sudo`, the user is `SUDO_USER` and the home comes from the account database (`getent passwd` on Linux, `dscl` on macOS), never root's own home. If that lookup fails it warns and skips the user file; pass `--user-home <dir>` instead.
+
+Claude Code needs no cleanup: `allowManagedHooksOnly` already ignores user-level hooks. The uploader keeps running.
 
 ## Install
 
@@ -64,6 +72,7 @@ Cursor runs every hooks file, not just the highest one, so remove AgentReel's en
    The installer:
    - needs root to write the system paths, and says so if it isn't root;
    - backs up any file it changes to `<file>.agentreel-backup-<timestamp>`;
+   - removes AgentReel's own entries from your `~/.cursor/hooks.json` (see [Cursor](#cursor-hooksjson));
    - writes atomically (temporary file, then rename), mode `0644`;
    - leaves a file alone, with no backup, when it already matches, so re-running is safe;
    - refuses to touch a file that isn't valid JSON;
@@ -78,8 +87,9 @@ Cursor runs every hooks file, not just the highest one, so remove AgentReel's en
 | `--dry-run` | Print the diff and write nothing. Works without root. |
 | `--hook-command <path>` | Absolute path to a root-owned `agentreel` binary. Default: the binary you ran. The installer warns if it isn't owned by root or doesn't exist. |
 | `--root <dir>` | Write under `<dir>` instead of `/`, for example to stage files into an OS image or for MDM packaging. Works without root. |
+| `--user-home <dir>` | Home whose `~/.cursor/hooks.json` loses AgentReel's entries, used as given. Default: the sudo user's home (or `HOME` without sudo), placed under `--root` when one is set. |
 | `--platform linux\|darwin` | Choose the path layout. Default: this machine. |
-| `--no-claude`, `--no-cursor` | Skip one of the two files. |
+| `--no-claude`, `--no-cursor` | Skip one of the two files. `--no-cursor` also leaves `~/.cursor/hooks.json` alone. |
 
 ## Templates
 

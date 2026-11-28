@@ -8,23 +8,29 @@ import {
   copyFileSync,
   existsSync,
   mkdirSync,
+  chownSync,
+  constants as fsConstants,
+  lstatSync,
   readFileSync,
   renameSync,
   statSync,
   writeFileSync,
 } from "node:fs";
+import { randomBytes } from "node:crypto";
 import { dirname, isAbsolute, join, resolve } from "node:path";
 import { createTwoFilesPatch } from "diff";
 import {
   MANAGED_PATHS,
   mergeClaudeManagedSettings,
   mergeCursorManagedHooks,
+  removeCursorUserHooks,
   serializeJson,
   type BuildOptions,
   type ManagedPlatform,
 } from "./pack.js";
 
-export type ManagedTarget = "claude" | "cursor";
+/** `cursor-user` is the invoking user's ~/.cursor/hooks.json, where AgentReel's own entries are removed. */
+export type ManagedTarget = "claude" | "cursor" | "cursor-user";
 
 export interface ManagedInstallOptions extends BuildOptions {
   /** Directory the system paths are written under. "/" means the real system. */
@@ -32,6 +38,13 @@ export interface ManagedInstallOptions extends BuildOptions {
   platform?: ManagedPlatform;
   claude?: boolean;
   cursor?: boolean;
+  /**
+   * Absolute path of the invoking user's ~/.cursor/hooks.json (already placed
+   * under the staging root when one is used). AgentReel-owned entries are
+   * removed from it so Cursor does not run AgentReel twice. Skipped when unset.
+   */
+  cursorUserHooksPath?: string;
+  onWarning?: (message: string) => void;
 }
 
 export interface ManagedFilePlan {
@@ -90,7 +103,7 @@ export function planManagedInstall(opts: ManagedInstallOptions): ManagedFilePlan
   if (opts.claude !== false) targets.push({ target: "claude", systemPath: paths.claudeManagedSettings });
   if (opts.cursor !== false) targets.push({ target: "cursor", systemPath: paths.cursorHooks });
 
-  return targets.map(({ target, systemPath }) => {
+  const plans: ManagedFilePlan[] = targets.map(({ target, systemPath }) => {
     const path = underRoot(root, systemPath);
     const { raw, value } = readJsonObject(path);
     const merged =
@@ -103,6 +116,45 @@ export function planManagedInstall(opts: ManagedInstallOptions): ManagedFilePlan
         : createTwoFilesPatch(systemPath, systemPath, raw ?? "", after, raw === null ? "(new file)" : "current", "agentreel");
     return { target, systemPath, path, action, before: raw, after, diff };
   });
+
+  const userPath = opts.cursor !== false ? opts.cursorUserHooksPath : undefined;
+  if (userPath !== undefined) {
+    if (!isAbsolute(userPath)) throw new ManagedInstallError(`user hooks path must be absolute, got ${userPath}`);
+    const plan = planCursorUserCleanup(userPath, opts.onWarning);
+    if (plan) plans.push(plan);
+  }
+  return plans;
+}
+
+/** Plan removal of AgentReel's entries from a user-level Cursor hooks file. Null when there is nothing to do. */
+function planCursorUserCleanup(path: string, onWarning?: (message: string) => void): ManagedFilePlan | null {
+  if (!existsSync(path)) return null;
+  // Root may be editing a file in a user-writable directory: refuse symlinks so
+  // the backup copy and the rename can't be pointed at another file.
+  if (lstatSync(dirname(path)).isSymbolicLink() || !lstatSync(path).isFile()) {
+    onWarning?.(`${path} or its directory is a symlink or not a regular file, so AgentReel's entries were not removed from it.`);
+    return null;
+  }
+  let parsed: { raw: string | null; value: Record<string, unknown> };
+  try {
+    parsed = readJsonObject(path);
+  } catch (err) {
+    // A broken user file must not block the system install; leave it alone.
+    onWarning?.(`${path} could not be read as JSON, so AgentReel's entries were not removed from it. ${(err as Error).message}`);
+    return null;
+  }
+  const { value, removed } = removeCursorUserHooks(parsed.value);
+  if (removed === 0) return null;
+  const after = serializeJson(value);
+  return {
+    target: "cursor-user",
+    systemPath: path,
+    path,
+    action: "update",
+    before: parsed.raw,
+    after,
+    diff: createTwoFilesPatch(path, path, parsed.raw ?? "", after, "current", "agentreel"),
+  };
 }
 
 function backupPath(path: string, now: Date): string {
@@ -115,17 +167,31 @@ export function applyManagedInstall(plans: ManagedFilePlan[], now: Date = new Da
     if (plan.action === "unchanged") return { ...plan, backup: null };
     const dir = dirname(plan.path);
     mkdirSync(dir, { recursive: true, mode: 0o755 });
+    // An existing file keeps its owner and mode, so a user's ~/.cursor/hooks.json
+    // edited under sudo stays owned by that user.
+    const prior = plan.before !== null && existsSync(plan.path) ? statSync(plan.path) : null;
+    const mode = prior ? prior.mode & 0o777 : 0o644;
     let backup: string | null = null;
-    if (plan.before !== null) {
+    if (prior) {
       backup = backupPath(plan.path, now);
-      copyFileSync(plan.path, backup);
+      copyFileSync(plan.path, backup, fsConstants.COPYFILE_EXCL);
+      keepOwner(backup, prior.uid, prior.gid);
     }
-    const tmp = `${plan.path}.agentreel-tmp-${process.pid}`;
-    writeFileSync(tmp, plan.after, { encoding: "utf8", mode: 0o644 });
-    chmodSync(tmp, 0o644);
+    const tmp = `${plan.path}.agentreel-tmp-${process.pid}-${randomBytes(6).toString("hex")}`;
+    // "wx" fails if anything, including a symlink, already sits at the temp path.
+    writeFileSync(tmp, plan.after, { encoding: "utf8", mode, flag: "wx" });
+    chmodSync(tmp, mode);
+    if (prior) keepOwner(tmp, prior.uid, prior.gid);
     renameSync(tmp, plan.path);
     return { ...plan, backup };
   });
+}
+
+function keepOwner(path: string, uid: number, gid: number): void {
+  const st = statSync(path);
+  if (st.uid === uid && st.gid === gid) return;
+  if (typeof process.getuid !== "function" || process.getuid() !== 0) return;
+  chownSync(path, uid, gid);
 }
 
 /** Owner uid of the file a hook command points at, or null when it can't be read. */
