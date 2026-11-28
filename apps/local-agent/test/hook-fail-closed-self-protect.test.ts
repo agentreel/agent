@@ -491,16 +491,44 @@ describe("per-user Cursor install defers to the managed pack", () => {
         const userFile = join(dir, "hooks.json");
         const original = regularBody();
         writeFileSync(userFile, original);
-        vi.useFakeTimers({ toFake: ["Date"] });
+        // The directory is not writable, so a new backup file cannot be created,
+        // but the existing hooks file can still be opened for write. The helper
+        // must abort rather than write without a backup.
+        fs.chmodSync(dir, 0o500);
         try {
-          const when = new Date("2026-11-27T12:00:00.000Z");
-          vi.setSystemTime(when);
-          // Occupy the backup name so the copy (flag wx) cannot be made.
-          writeFileSync(`${userFile}.agentreel-backup-${when.toISOString().replace(/[:.]/g, "-")}`, "occupied");
           const res = cursorInstall.installCursorHooks("agentreel", userFile, { systemHooksPath: join(work, "none.json") });
           expect(res.refused).toBe(true);
+          expect(res.warning).toMatch(/backed up|untouched/);
           expect(res.installedEvents).toEqual([]);
           expect(readFileSync(userFile, "utf8")).toBe(original);
+        } finally {
+          fs.chmodSync(dir, 0o755);
+        }
+      });
+
+      it("two writes in the same millisecond both succeed and leave two distinct backups", () => {
+        const dir = join(work, "same-ms-backup");
+        mkdirSync(dir);
+        const userFile = join(dir, "hooks.json");
+        writeFileSync(
+          userFile,
+          JSON.stringify({ version: 1, hooks: { preToolUse: [{ command: "agentreel cursor-hook preToolUse" }, { command: "/opt/other" }] } }),
+        );
+        vi.useFakeTimers({ toFake: ["Date"] });
+        try {
+          vi.setSystemTime(new Date("2026-11-27T12:00:00.000Z"));
+          const installed = cursorInstall.installCursorHooks("agentreel", userFile, { systemHooksPath: join(work, "none.json") });
+          expect(installed.skipped).toBe(false);
+          expect(installed.refused).toBeFalsy();
+          expect(installed.backup).toBeTruthy();
+          const uninstalled = cursorInstall.uninstallCursorHooks(userFile);
+          expect(uninstalled.refused).toBeUndefined();
+          expect(uninstalled.removed).toBeGreaterThan(0);
+          expect(uninstalled.backup).toBeTruthy();
+          expect(uninstalled.backup).not.toBe(installed.backup);
+          const backups = readdirSync(dir).filter((f) => f.includes("agentreel-backup")).sort();
+          expect(backups).toHaveLength(2);
+          expect(backups[0]).not.toBe(backups[1]);
         } finally {
           vi.useRealTimers();
         }
