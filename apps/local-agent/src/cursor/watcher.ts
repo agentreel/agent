@@ -61,7 +61,6 @@ export function startCursorWatcher(
       await processSnapshot(folder, ctx, skipFirst, onSnapshot);
     } catch (err) {
       // The watcher must never crash the host process.
-      // eslint-disable-next-line no-console
       console.error("[agentreel] cursor watcher: error processing", path, err);
     }
   });
