@@ -280,6 +280,13 @@ const SECRET_ENV_EXAMPLE = /(^|\/)\.env\.(example|sample|template|dist)$/i;
 
 /** True for paths that hold credentials (.env, SSH keys, AWS credentials, ...). */
 export function isSecretPath(raw: string): boolean {
+  // Every pattern below needs a literal "." (.env, .ssh/, .aws/, .gnupg/,
+  // .pem and friends, .netrc, .kube/config, credentials.json), and trimming,
+  // stripping "@" or "-flag=" and mapping backslashes to "/" never add or
+  // remove one. Reject the common case (plain words, flags, URLs without a
+  // dot) before allocating anything: this runs on every word of every
+  // pipeline segment.
+  if (raw.indexOf(".") < 0) return false;
   let p = raw.trim();
   if (p.startsWith("@")) p = p.slice(1);
   if (p.startsWith("-")) {
@@ -508,13 +515,12 @@ function computeVariants(cmd: string, depth = 0): string[] {
     const prog = programOf(seg);
     const name = prog?.name ?? "";
     const args = prog?.args ?? [];
-    const segText = seg.words.join(" ");
-    const local = LOCAL_TARGET.test(segText);
 
     if (SHELLS.has(name) || INTERPRETERS.test(name)) shellAnywhere = true;
 
-    // Network sends of secret files or values.
-    if (NETWORK_PROGRAMS.has(name) && !local) {
+    // Network sends of secret files or values. The localhost test joins the
+    // segment's words, so only do it for programs that can reach the network.
+    if (NETWORK_PROGRAMS.has(name) && !LOCAL_TARGET.test(seg.words.join(" "))) {
       if (
         seg.inputs.some(isSecretPath) ||
         secretUpstream ||
