@@ -1,5 +1,6 @@
 import {
   collectAttribution,
+  collectGit,
   gitHead,
   mergeAttribution,
   type Attribution,
@@ -40,4 +41,25 @@ export function recordSessionEndGit(sessionId: string, cwd: string | undefined):
   const { branch, head } = gitHead(base.git?.root ?? cwd);
   if (!head) return;
   setSessionAttribution(sessionId, mergeAttribution(base, { git: { branch_end: branch, head_end: head } }));
+}
+
+/**
+ * Attribution for a pre-exec policy check. Reads the stored snapshot, and when
+ * there is none yet (first event of a session) or the DB can't be read,
+ * collects git info in memory. It never writes, so the policy check can run
+ * before any DB write and still apply repo and branch scoped rules.
+ */
+export function preExecAttribution(sessionId: string, cwd: string | undefined): Attribution | null {
+  try {
+    const stored = getSessionAttribution<Attribution>(sessionId);
+    if (stored) return stored;
+  } catch {
+    // Corrupt or unusable sessions.db: fall through to the live snapshot.
+  }
+  try {
+    const git = collectGit(cwd);
+    return git ? { v: 1, git } : null;
+  } catch {
+    return null;
+  }
 }
