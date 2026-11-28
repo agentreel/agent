@@ -182,7 +182,8 @@ managed
   .option("--user-home <dir>", "home whose ~/.cursor/hooks.json loses AgentReel's entries (default: the sudo user's home)")
   .option("--no-claude", "skip the Claude Code managed settings file")
   .option("--no-cursor", "skip the Cursor enterprise hooks file")
-  .action((opts: { dryRun?: boolean; root?: string; hookCommand?: string; platform?: string; userHome?: string; claude?: boolean; cursor?: boolean }) => {
+  .option("--allow-user-writable-hook", "install even if the hook binary or a parent directory is writable by a non-root user (prints a warning)")
+  .action((opts: { dryRun?: boolean; root?: string; hookCommand?: string; platform?: string; userHome?: string; allowUserWritableHook?: boolean; claude?: boolean; cursor?: boolean }) => {
     const code = managedInstallCommand(opts);
     if (code !== 0) process.exitCode = code;
   });

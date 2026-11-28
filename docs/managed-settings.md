@@ -55,6 +55,10 @@ Claude Code needs no cleanup: `allowManagedHooksOnly` already ignores user-level
 
    Don't point managed hooks at an `npx` cache; the installer refuses that.
 
+   If you run the installer from a user-owned copy (for example `sudo` of an npm prefix under your home), it refuses to write: the hook command would point at a binary you or an agent can replace. Pass `--hook-command /usr/local/bin/agentreel` (or another root-owned path), or `--allow-user-writable-hook` to accept the risk. `--dry-run` warns and continues. An explicit `--hook-command` is always allowed, with a warning if the path fails the same check.
+
+   The check walks the resolved real path of the binary and every parent directory up to `/` (or up to `--root`, not including the staging directory itself). It refuses when the binary is not root-owned, is group- or world-writable, or a parent directory is writable by a non-root user. On macOS, a binary owned by the `admin` group is accepted when it is not group-writable, which covers a root:admin `0755` `/usr/local`. With `--root`, the check looks at the path as it will be on the target (`<root>/usr/local/bin/agentreel` for `--hook-command /usr/local/bin/agentreel`).
+
 2. Preview the change. Nothing is written:
 
    ```bash
@@ -85,7 +89,8 @@ Claude Code needs no cleanup: `allowManagedHooksOnly` already ignores user-level
 | Option | Effect |
 | --- | --- |
 | `--dry-run` | Print the diff and write nothing. Works without root. |
-| `--hook-command <path>` | Absolute path to a root-owned `agentreel` binary. Default: the binary you ran. The installer warns if it isn't owned by root or doesn't exist. |
+| `--hook-command <path>` | Absolute path to a root-owned `agentreel` binary. Default: the binary you ran, which is refused on a real run if it or a parent directory is writable by a non-root user. An explicit path gets the same check as a warning only. The installer also warns if the file is missing. |
+| `--allow-user-writable-hook` | On a real run with the default hook binary, accept a user-writable path and print a loud warning. |
 | `--root <dir>` | Write under `<dir>` instead of `/`, for example to stage files into an OS image or for MDM packaging. Works without root. |
 | `--user-home <dir>` | Home whose `~/.cursor/hooks.json` loses AgentReel's entries, used as given. Default: the sudo user's home (or `HOME` without sudo), placed under `--root` when one is set. |
 | `--platform linux\|darwin` | Choose the path layout. Default: this machine. |

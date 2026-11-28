@@ -194,12 +194,3 @@ function keepOwner(path: string, uid: number, gid: number): void {
   chownSync(path, uid, gid);
 }
 
-/** Owner uid of the file a hook command points at, or null when it can't be read. */
-export function hookBinaryOwnerUid(hookCommand: string): number | null {
-  const unquoted = hookCommand.startsWith('"') ? hookCommand.slice(1, hookCommand.indexOf('"', 1)) : hookCommand.split(" ")[0]!;
-  try {
-    return statSync(unquoted).uid;
-  } catch {
-    return null;
-  }
-}

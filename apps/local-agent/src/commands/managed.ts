@@ -7,13 +7,19 @@ import pc from "picocolors";
 import { quotePath } from "../hooks/install.js";
 import {
   applyManagedInstall,
-  hookBinaryOwnerUid,
   ManagedInstallError,
   planManagedInstall,
   resolveManagedPlatform,
   underRoot,
 } from "../managed/install.js";
 import type { ManagedPlatform } from "../managed/pack.js";
+import {
+  hookPathRefusalMessage,
+  hookPathWarningMessage,
+  inspectHookCommandPath,
+  type RealpathFn,
+  type StatPath,
+} from "../managed/hook-path.js";
 
 export interface ManagedInstallCliOptions {
   dryRun?: boolean;
@@ -22,6 +28,7 @@ export interface ManagedInstallCliOptions {
   platform?: string;
   /** Home directory whose ~/.cursor/hooks.json loses AgentReel's entries. Used as given, not placed under --root. */
   userHome?: string;
+  allowUserWritableHook?: boolean;
   /** commander maps --no-claude / --no-cursor to claude:false / cursor:false */
   claude?: boolean;
   cursor?: boolean;
@@ -37,6 +44,9 @@ export interface ManagedInstallDeps {
   apply?: typeof applyManagedInstall;
   /** Test seam: looks up a user's home directory (default: getent on Linux, dscl on macOS). */
   lookupHome?: (user: string, platform: ManagedPlatform) => string | null;
+  /** Test seam: ownership checks must not touch the real filesystem. */
+  stat?: StatPath;
+  realpath?: RealpathFn;
 }
 
 const SAFE_USER = /^[A-Za-z0-9_][A-Za-z0-9_.-]{0,63}$/;
@@ -101,7 +111,7 @@ export function agentSessionMarker(env: NodeJS.ProcessEnv): string | null {
   return null;
 }
 
-function defaultHookCommand(): string {
+export function defaultHookCommand(): string {
   const real = realpathSync(fileURLToPath(import.meta.url));
   if (real.includes(`${sep}_npx${sep}`) || real.includes("/_npx/")) {
     throw new ManagedInstallError(
@@ -145,8 +155,37 @@ export function managedInstallCommand(opts: ManagedInstallCliOptions, deps: Mana
     }
 
     const platform = parsePlatform(opts.platform);
+    const hookCommandExplicit = opts.hookCommand !== undefined;
     const hookCommand = opts.hookCommand ?? defaultHookCommand();
     const warnings: string[] = [];
+    const inspection = inspectHookCommandPath(hookCommand, {
+      platform,
+      root,
+      stat: deps.stat,
+      realpath: deps.realpath,
+    });
+    if (inspection.missing && inspection.issues.length === 0) {
+      warnings.push(
+        `${inspection.checkedPath ?? hookCommand} was not found. Hooks that block on failure will block every tool call until it exists.`,
+      );
+    }
+    if (inspection.issues.length > 0) {
+      const allowed = hookCommandExplicit || opts.allowUserWritableHook === true || dryRun;
+      if (!allowed) {
+        throw new ManagedInstallError(hookPathRefusalMessage(inspection.issues));
+      }
+      const detail = hookPathWarningMessage(inspection.issues);
+      warnings.push(
+        opts.allowUserWritableHook
+          ? `WARNING: installing a hook binary a non-root user can replace (--allow-user-writable-hook).
+${detail}`
+          : hookCommandExplicit
+            ? `${detail}
+The path was set with --hook-command, so install continues. Point it at a root-owned binary to silence this.`
+            : `${detail}
+This is a dry run, so install was not refused. A real run needs --hook-command <root-owned path>, or --allow-user-writable-hook to accept the risk.`,
+      );
+    }
     let cursorUserHooksPath: string | undefined;
     if (opts.cursor !== false) {
       const user = resolveInvokingUserHome(
@@ -173,12 +212,6 @@ export function managedInstallCommand(opts: ManagedInstallCliOptions, deps: Mana
     if (root !== "/") log(pc.dim(`  Root: ${root}`));
 
     for (const w of warnings) log(pc.yellow(`  Warning: ${w}`));
-    const owner = hookBinaryOwnerUid(hookCommand);
-    if (owner === null) {
-      log(pc.yellow(`  Warning: ${hookCommand} was not found. Hooks that block on failure will block every tool call until it exists.`));
-    } else if (owner !== 0) {
-      log(pc.yellow(`  Warning: ${hookCommand} is not owned by root (uid ${owner}), so an agent running as the user could replace it. Install agentreel as root.`));
-    }
 
     const results = dryRun ? plans.map((p) => ({ ...p, backup: null })) : (deps.apply ?? applyManagedInstall)(plans, deps.now);
     for (const r of results) {
