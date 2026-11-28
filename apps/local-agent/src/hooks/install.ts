@@ -27,6 +27,12 @@ type HookEntry = {
   type: "command";
   command: string;
   timeout?: number;
+  /**
+   * "block" on pre-exec hooks only (Claude Code v2.1.295+): a crash, timeout
+   * or missing binary blocks the tool call instead of letting it run.
+   * Lifecycle hooks stay fail-open so a broken agent never stalls a session.
+   */
+  onFailure?: "block";
 };
 
 type HookGroup = {
@@ -73,6 +79,7 @@ function buildHookEntry(
     type: "command",
     command: `${hookCommandPrefix} hook ${event}`,
     timeout: claudeHookTimeoutForEvent(event, preExecTimeoutS),
+    ...(CLAUDE_PRE_EXEC_SET.has(event) ? { onFailure: "block" as const } : {}),
   };
 }
 
@@ -149,6 +156,8 @@ export interface ClaudePreExecHookCheck {
   fileExists: boolean;
   preToolUseInstalled: boolean;
   preToolUseTimeoutS: number | null;
+  /** True when our PreToolUse entry has onFailure "block". */
+  preToolUseFailClosed: boolean;
 }
 
 export function inspectClaudePreExecHook(
@@ -159,6 +168,7 @@ export function inspectClaudePreExecHook(
       fileExists: false,
       preToolUseInstalled: false,
       preToolUseTimeoutS: null,
+      preToolUseFailClosed: false,
     };
   }
   try {
@@ -171,6 +181,7 @@ export function inspectClaudePreExecHook(
         fileExists: true,
         preToolUseInstalled: false,
         preToolUseTimeoutS: null,
+        preToolUseFailClosed: false,
       };
     }
     return {
@@ -180,12 +191,14 @@ export function inspectClaudePreExecHook(
         typeof entry.timeout === "number" && Number.isFinite(entry.timeout)
           ? entry.timeout
           : null,
+      preToolUseFailClosed: entry.onFailure === "block",
     };
   } catch {
     return {
       fileExists: true,
       preToolUseInstalled: false,
       preToolUseTimeoutS: null,
+      preToolUseFailClosed: false,
     };
   }
 }

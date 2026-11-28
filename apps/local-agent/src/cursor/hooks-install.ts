@@ -47,7 +47,34 @@ export function cursorHookTimeoutForEvent(
 
 export interface InstallCursorHooksOptions {
   preExecTimeoutS?: number;
+  /** System (enterprise) hooks file to check first; injectable for tests. */
+  systemHooksPath?: string;
 }
+
+/**
+ * Cursor's enterprise hooks file, written by `agentreel managed install` (or
+ * MDM). Hooks there run for every user and rank above user hooks.
+ */
+export function systemCursorHooksPath(platform: NodeJS.Platform = process.platform): string {
+  if (platform === "darwin") return "/Library/Application Support/Cursor/hooks.json";
+  if (platform === "win32") return "C:\\ProgramData\\Cursor\\hooks.json";
+  return "/etc/cursor/hooks.json";
+}
+
+/** True when the system hooks file already carries AgentReel entries. Never throws. */
+export function systemCursorHooksOwnedByAgentreel(path: string = systemCursorHooksPath()): boolean {
+  try {
+    const file = read(path);
+    return Object.values(file.hooks ?? {}).some((defs) => Array.isArray(defs) && defs.some(isOurs));
+  } catch {
+    return false;
+  }
+}
+
+export type InstallCursorHooksResult =
+  | { skipped: false; backup: string | null; installedEvents: string[]; path: string; preExecTimeoutS: number }
+  /** The managed pack owns the Cursor hooks; nothing was written (avoids double capture). */
+  | { skipped: true; managedPath: string; installedEvents: []; path: string; preExecTimeoutS: number };
 
 /**
  * Add `<prefix> cursor-hook <event>` to ~/.cursor/hooks.json for every hook.
@@ -58,8 +85,12 @@ export function installCursorHooks(
   prefix: string,
   path = cursorHooksPath(),
   opts: InstallCursorHooksOptions = {},
-): { backup: string | null; installedEvents: string[]; path: string; preExecTimeoutS: number } {
+): InstallCursorHooksResult {
   const preExecTimeoutS = opts.preExecTimeoutS ?? DEFAULT_PRE_EXEC_HOOK_TIMEOUT_S;
+  const managedPath = opts.systemHooksPath ?? systemCursorHooksPath();
+  if (systemCursorHooksOwnedByAgentreel(managedPath)) {
+    return { skipped: true, managedPath, installedEvents: [], path, preExecTimeoutS };
+  }
   mkdirSync(dirname(path), { recursive: true });
   const b = backup(path);
   const file = read(path);
@@ -70,11 +101,14 @@ export function installCursorHooks(
     kept.push({
       command: `${prefix} ${CURSOR_HOOK_SUBCOMMAND} ${ev}`,
       timeout: cursorHookTimeoutForEvent(ev, preExecTimeoutS),
+      // Pre-exec hooks only: a crash, timeout or missing binary denies the
+      // action instead of allowing it (Cursor defaults to fail-open).
+      ...(isCursorPreExecHook(ev) ? { failClosed: true } : {}),
     });
     file.hooks[ev] = kept;
   }
   writeFileSync(path, JSON.stringify(file, null, 2) + "\n", "utf8");
-  return { backup: b, installedEvents: [...CURSOR_HOOK_EVENTS], path, preExecTimeoutS };
+  return { skipped: false, backup: b, installedEvents: [...CURSOR_HOOK_EVENTS], path, preExecTimeoutS };
 }
 
 export function uninstallCursorHooks(path = cursorHooksPath()): { backup: string | null; removed: number } {
@@ -97,6 +131,8 @@ export interface CursorPreExecHookEntryStatus {
   event: string;
   installed: boolean;
   timeoutS: number | null;
+  /** True when our entry has failClosed: true. */
+  failClosed: boolean;
 }
 
 export interface CursorPreExecHooksCheck {
@@ -114,6 +150,7 @@ export function inspectCursorPreExecHooks(
         event,
         installed: false,
         timeoutS: null,
+        failClosed: false,
       })),
     };
   }
@@ -128,6 +165,7 @@ export function inspectCursorPreExecHooks(
           entry && typeof entry.timeout === "number" && Number.isFinite(entry.timeout)
             ? entry.timeout
             : null,
+        failClosed: entry?.failClosed === true,
       };
     });
     return { fileExists: true, hooks };
@@ -138,6 +176,7 @@ export function inspectCursorPreExecHooks(
         event,
         installed: false,
         timeoutS: null,
+        failClosed: false,
       })),
     };
   }

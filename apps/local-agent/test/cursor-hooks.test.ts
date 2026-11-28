@@ -180,7 +180,7 @@ describe("hooks.json install", () => {
     // pre-exec hooks get the long approval timeout (130s); other hooks keep 5s
     for (const k of ["preToolUse", "beforeShellExecution", "beforeMCPExecution", "beforeReadFile"]) {
       expect(f.hooks[k]).toEqual([
-        { command: `/usr/local/bin/agentreel cursor-hook ${k}`, timeout: 130 },
+        { command: `/usr/local/bin/agentreel cursor-hook ${k}`, timeout: 130, failClosed: true },
       ]);
     }
     expect(f.hooks.beforeSubmitPrompt).toEqual([

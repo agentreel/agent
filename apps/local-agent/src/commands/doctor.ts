@@ -70,6 +70,7 @@ export interface DoctorReport {
     fileExists: boolean;
     preToolUseInstalled: boolean;
     preToolUseTimeoutS: number | null;
+    preToolUseFailClosed: boolean;
     timeoutOk: boolean;
     recordedTimeoutS: number | null;
     effectiveInstalledTimeoutS: number;
@@ -81,10 +82,12 @@ export interface DoctorReport {
       event: string;
       installed: boolean;
       timeoutS: number | null;
+      failClosed: boolean;
       timeoutOk: boolean;
     }>;
     allInstalled: boolean;
     allTimeoutsOk: boolean;
+    allFailClosed: boolean;
     recordedTimeoutS: number | null;
     effectiveInstalledTimeoutS: number;
     needsReinitForApproval: boolean;
@@ -192,6 +195,7 @@ export function inspectDoctorState(opts: DoctorInspectOptions = {}): DoctorRepor
       hooks: cursorHooks,
       allInstalled: cursorHooks.every((h) => h.installed),
       allTimeoutsOk: cursorHooks.every((h) => h.timeoutOk),
+      allFailClosed: cursorHooks.every((h) => h.failClosed),
       recordedTimeoutS: cursorRecordedTimeoutS,
       effectiveInstalledTimeoutS: cursorEffectiveTimeoutS,
       needsReinitForApproval: cursorNeedsReinit,
@@ -230,6 +234,8 @@ export function formatDoctorReport(report: DoctorReport): string {
 
   const claudeLine = !report.claude.preToolUseInstalled
     ? pc.yellow("PreToolUse not installed (run `agentreel init`)")
+    : !report.claude.preToolUseFailClosed
+      ? pc.yellow('PreToolUse fails open: onFailure "block" not set (run `agentreel init`)')
     : report.claude.timeoutOk
       ? pc.green(`PreToolUse installed (timeout ${report.claude.preToolUseTimeoutS}s)`)
       : pc.yellow(
@@ -237,7 +243,9 @@ export function formatDoctorReport(report: DoctorReport): string {
         );
 
   const cursorSummary =
-    report.cursor.allInstalled && report.cursor.allTimeoutsOk
+    report.cursor.allInstalled && !report.cursor.allFailClosed
+      ? pc.yellow("pre-exec hooks fail open: failClosed not set (run `agentreel init`)")
+      : report.cursor.allInstalled && report.cursor.allTimeoutsOk
       ? pc.green(
           `all ${report.cursor.hooks.length} pre-exec hooks installed (timeout >= ${report.expectedPreExecTimeoutS}s)`,
         )
@@ -264,6 +272,8 @@ export function formatDoctorReport(report: DoctorReport): string {
   for (const h of report.cursor.hooks) {
     const status = !h.installed
       ? pc.yellow("missing")
+      : !h.failClosed
+        ? pc.yellow("fails open (failClosed not set)")
       : h.timeoutOk
         ? pc.green(`ok (${h.timeoutS}s)`)
         : pc.yellow(`timeout ${formatTimeoutLabel(h.timeoutS)} < ${report.expectedPreExecTimeoutS}s`);
