@@ -220,3 +220,69 @@ describe("NODE_OPTIONS round 5 cases", () => {
     it(`allows ${JSON.stringify(cmd)}`, () => expect(rule(cmd)).toBeNull());
   }
 });
+
+describe("TEXT_ONLY piped into a bare shell, here-strings and heredocs", () => {
+  const requireEq = "--require=/tmp/evil.js";
+  const requireSp = "--require /tmp/evil.js";
+  const importEq = "--import=/tmp/evil.mjs";
+  const importSp = "--import /tmp/evil.mjs";
+  const allowed = "--max-old-space-size=4096";
+
+  const deniedPipes = [
+    `printf 'NODE_OPTIONS=${requireEq} agentreel doctor' | sh`,
+    `printf 'NODE_OPTIONS=${requireSp} agentreel doctor' | sh`,
+    `printf 'NODE_OPTIONS=${importEq} agentreel doctor' | bash`,
+    `printf 'NODE_OPTIONS=${importSp} agentreel doctor' | bash`,
+    `echo 'NODE_OPTIONS=${requireEq} agentreel doctor' | bash`,
+    `echo 'NODE_OPTIONS=${requireSp} agentreel doctor' | bash`,
+    `echo 'NODE_OPTIONS=${importEq} agentreel doctor' | sh`,
+    `echo 'NODE_OPTIONS=${importSp} agentreel doctor' | sh`,
+    `printf 'NODE_OPTIONS=${requireEq} agentreel doctor' | /bin/sh`,
+    // printf escapes and %s: expand or fail closed, either way deny the preload.
+    `printf 'NODE_OPTIONS=${requireEq}\nagentreel doctor' | sh`,
+    `printf 'NODE_OPTIONS=%s agentreel doctor' ${requireEq} | sh`,
+  ];
+  for (const cmd of deniedPipes) {
+    it(`denies pipe: ${JSON.stringify(cmd)}`, () => expect(rule(cmd)).toBe("SELF005"));
+  }
+
+  it("allows a harmless echo | sh of an allowed value", () => {
+    expect(rule(`echo 'NODE_OPTIONS=${allowed} agentreel doctor' | sh`)).toBeNull();
+  });
+  it("allows a harmless printf | bash of an allowed value", () => {
+    expect(rule(`printf 'NODE_OPTIONS=${allowed} agentreel doctor' | bash`)).toBeNull();
+  });
+  it("echo of a bad value without a pipe is still just text", () => {
+    expect(rule(`echo 'NODE_OPTIONS=${requireEq} agentreel doctor'`)).toBeNull();
+  });
+
+  const deniedHere = [
+    `bash <<< 'NODE_OPTIONS=${requireEq} agentreel doctor'`,
+    `sh <<< 'NODE_OPTIONS=${requireSp} agentreel doctor'`,
+    `zsh <<< 'NODE_OPTIONS=${importEq} agentreel doctor'`,
+    `dash <<< "NODE_OPTIONS=${importSp} agentreel doctor"`,
+    `sh <<'EOF'\nNODE_OPTIONS=${requireEq} agentreel doctor\nEOF`,
+    `bash <<EOF\nNODE_OPTIONS=${importEq} agentreel doctor\nEOF`,
+    `sh <<'EOF'\nNODE_OPTIONS=${requireSp} agentreel doctor\nEOF`,
+    `bash <<'END'\nNODE_OPTIONS=${importSp} agentreel doctor\nEND`,
+  ];
+  for (const cmd of deniedHere) {
+    it(`denies here input: ${JSON.stringify(cmd)}`, () => expect(rule(cmd)).toBe("SELF005"));
+  }
+
+  it("allows a here-string with an allowed value", () => {
+    expect(rule(`bash <<< 'NODE_OPTIONS=${allowed} agentreel doctor'`)).toBeNull();
+  });
+  it("allows an inline heredoc with an allowed value", () => {
+    expect(rule(`sh <<'EOF'\nNODE_OPTIONS=${allowed} agentreel doctor\nEOF`)).toBeNull();
+  });
+  it("cat of a heredoc (not piped to a shell) is not executed, so it stays allowed", () => {
+    expect(rule(`cat <<'EOF'\nNODE_OPTIONS=${requireEq}\nEOF`)).toBeNull();
+  });
+  it("cat file | sh is out of scope when the command text has no assignment", () => {
+    expect(rule("cat /tmp/evil.sh | sh")).toBeNull();
+  });
+  it("source file is out of scope", () => {
+    expect(rule("source /tmp/evil.sh")).toBeNull();
+  });
+});
