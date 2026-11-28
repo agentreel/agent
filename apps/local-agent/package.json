@@ -1,6 +1,6 @@
 {
   "name": "@agentreel/agent",
-  "version": "0.2.4",
+  "version": "0.2.5",
   "description": "The local agent for AgentReel. It captures coding-agent sessions on your machine, scrubs PII before anything leaves it, and ships replays you can share and scrub.",
   "keywords": [
     "ai",
