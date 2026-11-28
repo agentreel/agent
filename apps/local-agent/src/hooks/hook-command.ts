@@ -118,19 +118,20 @@ function psSingleQuote(s: string): string {
 function toPowerShellCommand(prefix: string, subcommand: string, event: string): string {
   const launched = applyNpxNodeOptionsFlag(prefix);
   const tokens = tokenize(launched);
-  if (tokens.length === 0) return `${PS_UNSET}$input | ${subcommand} ${event}`;
+  if (tokens.length === 0) return `${PS_UNSET}${subcommand} ${event}`;
   const base = basename(tokens[0]!);
   const isLauncher = /^(npx|bunx)(\.cmd|\.exe)?$/i.test(base);
   // Launchers stay a command line; everything else is invoked with & and
   // single-quoted so spaces and PowerShell metacharacters are literal.
-  // `$input |` forwards the hook JSON. Run the command through
-  // `powershell -File` (or an equivalent runspace). `powershell -Command`
-  // does not bind `$input` or inherit stdin reliably, and hangs waiting
-  // for the payload.
+  // The hook JSON arrives on the PowerShell process stdin and is inherited
+  // by the child. Do not use `powershell -Command` to launch this string;
+  // it does not inherit stdin reliably. `powershell -File` (or a runspace)
+  // does. The windows-latest job feeds stdin with `type payload | powershell
+  // -File`.
   const head = isLauncher
     ? tokens.map((t) => (/^[A-Za-z0-9_./:=@-]+$/.test(t) ? t : psSingleQuote(t))).join(" ")
     : tokens.map((t, i) => (i === 0 ? `& ${psSingleQuote(t)}` : psSingleQuote(t))).join(" ");
-  return `${PS_UNSET}$input | ${head} ${subcommand} ${event}`;
+  return `${PS_UNSET}${head} ${subcommand} ${event}`;
 }
 
 function toPosixCommand(prefix: string, subcommand: string, event: string): string {
