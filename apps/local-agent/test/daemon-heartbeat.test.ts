@@ -249,7 +249,7 @@ describe("postHeartbeat", () => {
 describe("HeartbeatScheduler", () => {
   function sched(send: (c: AgentConfig, b: HeartbeatBody) => Promise<HeartbeatResponseBody>, extra: Partial<ConstructorParameters<typeof HeartbeatScheduler>[0]> = {}) {
     const logs: string[] = [];
-    const s = new HeartbeatScheduler({ now: () => clock, random: () => 0, config: () => cfg(), send, log: (l) => logs.push(l), ...extra });
+    const s = new HeartbeatScheduler({ now: () => clock, random: () => 0, config: () => cfg(), enabled: () => true, send, log: (l) => logs.push(l), ...extra });
     return { s, logs };
   }
 
@@ -437,7 +437,7 @@ describe("stale heartbeat and a dead daemon", () => {
 
   it("when the daemon dies the beats stop and status says stale, with the daemon not running", async () => {
     const { s } = (() => {
-      const s = new HeartbeatScheduler({ now: () => clock, config: () => cfg(), send: async () => okRes(60), log: () => {} });
+      const s = new HeartbeatScheduler({ now: () => clock, config: () => cfg(), enabled: () => true, send: async () => okRes(60), log: () => {} });
       return { s };
     })();
     await s.tick();
@@ -453,11 +453,11 @@ describe("stale heartbeat and a dead daemon", () => {
   });
 
   it("status shows the last error and the failure count after the server went away", async () => {
-    const s = new HeartbeatScheduler({ now: () => clock, config: () => cfg(), send: async () => okRes(60), log: () => {} });
+    const s = new HeartbeatScheduler({ now: () => clock, config: () => cfg(), enabled: () => true, send: async () => okRes(60), log: () => {} });
     await s.tick();
     const down = new HeartbeatScheduler({
       now: () => clock + 5 * 60_000,
-      config: () => cfg(),
+      config: () => cfg(), enabled: () => true,
       send: async () => { throw new HeartbeatError("network error", 0); },
       log: () => {},
     });
@@ -482,7 +482,7 @@ describe("gaps reported through the scheduler are the watcher's gaps", () => {
     const sent: string[] = [];
     const s = new HeartbeatScheduler({
       now: () => clock,
-      config: () => cfg(),
+      config: () => cfg(), enabled: () => true,
       send: async (_c, b) => { sent.push(...b.hook_gaps.map((g) => g.tool_use_id)); return okRes(60); },
       log: () => {},
     });

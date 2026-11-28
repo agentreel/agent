@@ -28,6 +28,10 @@ export interface AgentConfig {
   /** How the machine name is recorded on sessions: "plain" (default),
    *  "hash" (salted SHA-256, stable per install) or "omit". */
   hostnameMode?: HostnameMode;
+  /** Daemon heartbeat choice. `true` opts a personal install in, `false` opts
+   *  out. Unset means the default: on only when linked to an org workspace.
+   *  `AGENTREEL_HEARTBEAT=0` always wins. See docs/heartbeat.md. */
+  heartbeat?: boolean;
   /** Set false to stop recording who/where (user, host, git) entirely. */
   attribution?: boolean;
   /** Random per-install salt used when hostnameMode is "hash". */

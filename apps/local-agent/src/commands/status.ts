@@ -11,7 +11,7 @@ import { countEvents, getMeta, listHeldSessions, listRecentSessions, pendingByte
 import { isCaptureDisabledByEnv, readConfig } from "../config.js";
 import { nativeCursorHooksInstalled } from "../cursor/hook-runner.js";
 import { resolveHostnameMode } from "../attribution.js";
-import { heartbeatHealth } from "../heartbeat/heartbeat.js";
+import { describeHeartbeatReason, heartbeatDecision, heartbeatHealth } from "../heartbeat/heartbeat.js";
 import { countUnreportedGaps, getWatcherTotals, watcherHealth } from "../watcher/transcript.js";
 import {
   META_LAST_ERROR_AT,
@@ -202,6 +202,10 @@ export function watcherStatusLines(daemonRunning: boolean, now = Date.now()): st
 export function heartbeatStatusLines(daemonRunning: boolean, now = Date.now()): string[] {
   const h = heartbeatHealth(now);
   const label = "  heartbeat:        ";
+  const decision = heartbeatDecision();
+  if (!decision.enabled && decision.reason !== "not_linked") {
+    return [label + pc.dim(describeHeartbeatReason(decision))];
+  }
   if (h.liveness === "never") {
     return [label + pc.dim(daemonRunning ? "none sent yet" : "never sent (start the daemon)")];
   }

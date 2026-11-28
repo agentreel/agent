@@ -18,6 +18,7 @@ import { countEvents, getMeta, setMeta } from "../db.js";
 import { nativeCursorHooksInstalled } from "../cursor/hook-runner.js";
 import { inspectClaudePreExecHook } from "../hooks/install.js";
 import { readCachedPolicy } from "../policy/cache.js";
+import { getPolicyOrgId } from "../policy/types.js";
 import { META_LAST_SYNC_AT, consecutiveFailures } from "../upload/flush.js";
 import {
   countUnreportedGaps,
@@ -81,9 +82,75 @@ export interface HeartbeatBody {
   }>;
 }
 
+/** The env switch only: `AGENTREEL_HEARTBEAT=0|false|no|off` turns the heartbeat off, always. */
 export function heartbeatEnabled(env: NodeJS.ProcessEnv = process.env): boolean {
   const v = env.AGENTREEL_HEARTBEAT;
   return !(v === "0" || v === "false" || v === "no" || v === "off");
+}
+
+export type HeartbeatReason =
+  /** AGENTREEL_HEARTBEAT=0 (or false, no, off). Beats everything else. */
+  | "disabled_by_env"
+  /** No API key: nothing to send to. */
+  | "not_linked"
+  /** The user ran `agentreel heartbeat off`. */
+  | "opted_out"
+  /** On because the device is linked to an org workspace. */
+  | "org_default"
+  /** On because the user ran `agentreel heartbeat on` (personal or unlinked install). */
+  | "opt_in"
+  /** Personal install, nothing chosen: off. */
+  | "off_by_default";
+
+export interface HeartbeatDecision {
+  enabled: boolean;
+  reason: HeartbeatReason;
+  orgLinked: boolean;
+}
+
+/**
+ * True when this device belongs to an org workspace: the cached policy came
+ * from an org (`org_id` set), or the config records an org. A personal key has
+ * an `org_id: null` policy or none at all.
+ */
+export function isOrgLinked(cfg: AgentConfig = readConfig()): boolean {
+  if (typeof cfg.orgSlug === "string" && cfg.orgSlug.length > 0) return true;
+  return safe(() => getPolicyOrgId(readCachedPolicy()?.policy) !== null, false);
+}
+
+/**
+ * Whether the heartbeat runs, and why. Order: the env switch, then no key,
+ * then an explicit `heartbeat off`, then the org default, then an explicit
+ * `heartbeat on`, else off.
+ */
+export function heartbeatDecision(
+  cfg: AgentConfig = readConfig(),
+  env: NodeJS.ProcessEnv = process.env,
+  orgLinked: boolean = isOrgLinked(cfg),
+): HeartbeatDecision {
+  if (!heartbeatEnabled(env)) return { enabled: false, reason: "disabled_by_env", orgLinked };
+  if (!cfg.apiKey) return { enabled: false, reason: "not_linked", orgLinked };
+  if (cfg.heartbeat === false) return { enabled: false, reason: "opted_out", orgLinked };
+  if (orgLinked) return { enabled: true, reason: "org_default", orgLinked };
+  if (cfg.heartbeat === true) return { enabled: true, reason: "opt_in", orgLinked };
+  return { enabled: false, reason: "off_by_default", orgLinked };
+}
+
+export function describeHeartbeatReason(d: HeartbeatDecision): string {
+  switch (d.reason) {
+    case "disabled_by_env":
+      return "off (AGENTREEL_HEARTBEAT=0 is set)";
+    case "not_linked":
+      return "off (not linked; run `agentreel link`)";
+    case "opted_out":
+      return "off (you ran `agentreel heartbeat off`)";
+    case "org_default":
+      return "on (org default: this device is linked to an org workspace)";
+    case "opt_in":
+      return "on (you opted in with `agentreel heartbeat on`)";
+    case "off_by_default":
+      return "off (personal install; opt in with `agentreel heartbeat on`)";
+  }
 }
 
 /** Random per install, stored in the local db. Never derived from the hostname. */
@@ -237,13 +304,17 @@ export async function postHeartbeat(
   return d as HeartbeatResponseBody;
 }
 
+/** How often a disabled scheduler looks at the config again. */
+export const DISABLED_RECHECK_MS = 30_000;
+
 export interface SchedulerOptions {
   now?: () => number;
   random?: () => number;
   config?: () => AgentConfig;
   send?: (cfg: AgentConfig, body: HeartbeatBody) => Promise<HeartbeatResponseBody>;
   log?: (line: string) => void;
-  enabled?: () => boolean;
+  /** Whether to beat for this config. Default: `heartbeatDecision(cfg).enabled`. */
+  enabled?: (cfg: AgentConfig) => boolean;
 }
 
 export type TickResult =
@@ -273,7 +344,10 @@ export class HeartbeatScheduler {
       config: opts.config ?? readConfig,
       send: opts.send ?? ((cfg, body) => postHeartbeat(cfg, body)),
       log: opts.log ?? (() => {}),
-      enabled: opts.enabled ?? (() => heartbeatEnabled()),
+      enabled:
+        opts.enabled ??
+        // Unlinked stays "unlinked" unless the env switch is off.
+        ((cfg) => (cfg.apiKey ? heartbeatDecision(cfg).enabled : heartbeatEnabled())),
     };
   }
 
@@ -284,9 +358,13 @@ export class HeartbeatScheduler {
   async tick(): Promise<TickResult> {
     const now = this.o.now();
     try {
-      if (!this.o.enabled()) return { kind: "skipped", reason: "disabled" };
       if (now < this.nextAt) return { kind: "skipped", reason: "not_due" };
       const cfg = this.o.config();
+      if (!this.o.enabled(cfg)) {
+        // Re-check soon (a `heartbeat on` or a policy sync can change it) without reading the policy cache every loop.
+        this.nextAt = now + DISABLED_RECHECK_MS;
+        return { kind: "skipped", reason: "disabled" };
+      }
       if (!cfg.apiKey) return { kind: "skipped", reason: "unlinked" };
       if (this.rejectedKey !== null) {
         if (cfg.apiKey === this.rejectedKey) return { kind: "skipped", reason: "key_rejected" };
