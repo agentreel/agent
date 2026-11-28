@@ -46,6 +46,8 @@ export interface InitOptions {
   cursor?: boolean;
   claudeSettingsPath?: string;
   cursorHooksPath?: string;
+  /** System Cursor hooks file (default /etc/cursor/hooks.json); injectable for tests. */
+  systemCursorHooksPath?: string;
   cachePath?: string;
   guardConfigPath?: string;
 }
@@ -83,12 +85,16 @@ export async function initCommand(opts: InitOptions = {}): Promise<void> {
   const cursor =
     opts.cursor === false
       ? null
-      : installCursorHooks(prefix, opts.cursorHooksPath, { preExecTimeoutS });
+      : installCursorHooks(prefix, opts.cursorHooksPath, {
+          preExecTimeoutS,
+          ...(opts.systemCursorHooksPath ? { systemHooksPath: opts.systemCursorHooksPath } : {}),
+        });
 
-  if (result || cursor) {
+  const cursorInstalled = cursor && !cursor.skipped && !cursor.refused ? cursor : null;
+  if (result || cursorInstalled) {
     const nextTimeouts = { ...(cfg.installedHookTimeouts ?? {}) };
     if (result) nextTimeouts.claude = preExecTimeoutS;
-    if (cursor) nextTimeouts.cursor = preExecTimeoutS;
+    if (cursorInstalled) nextTimeouts.cursor = preExecTimeoutS;
     cfg.installedHookTimeouts = nextTimeouts;
     writeConfig(cfg);
   }
@@ -103,7 +109,15 @@ export async function initCommand(opts: InitOptions = {}): Promise<void> {
     );
     if (result.backup) console.log(pc.dim(`  (backup: ${result.backup})`));
   }
-  if (cursor) {
+  if (cursor?.skipped) {
+    console.log(
+      pc.green("✓") +
+        ` Cursor hooks are owned by the managed pack (${cursor.managedPath}); skipped ~/.cursor/hooks.json so nothing is captured twice`,
+    );
+    if (cursor.warning) console.log(pc.yellow("!") + ` ${cursor.warning}`);
+  } else if (cursor && cursor.refused === true) {
+    console.log(pc.yellow("!") + ` ${cursor.warning}`);
+  } else if (cursor) {
     console.log(
       pc.green("✓") +
         ` Installed ${cursor.installedEvents.length} Cursor hooks → ~/.cursor/hooks.json` +
@@ -112,7 +126,7 @@ export async function initCommand(opts: InitOptions = {}): Promise<void> {
     if (cursor.backup) console.log(pc.dim(`  (backup: ${cursor.backup})`));
   }
   console.log();
-  console.log(pc.dim("  Hook commands: ") + pc.dim(`${prefix} hook <Event>` + (cursor ? `, ${prefix} cursor-hook <event>` : "")));
+  console.log(pc.dim("  Hook commands: ") + pc.dim(`${prefix} hook <Event>` + (cursorInstalled ? `, ${prefix} cursor-hook <event>` : "")));
   if (mode === "npx") {
     console.log(
       pc.dim("  ") +
