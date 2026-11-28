@@ -3087,6 +3087,9 @@ describe("pause and AGENTREEL_DISABLE=1 keep enforcing org policy without captur
     });
 
     // 1. Forced bad block rule written directly to policy.json cache -> deny with reason invalid_rule
+    // A raw write is an edit the enforcement marker would flag; this test
+    // is about eval-time defense in depth, so drop the marker first.
+    cache.clearEnforcementMarker(cachePath);
     writeFileSync(
       cachePath,
       JSON.stringify({
@@ -3131,6 +3134,9 @@ describe("pause and AGENTREEL_DISABLE=1 keep enforcing org policy without captur
     expect(blockLogs.some((l) => l.includes("cust_cached_bad_block"))).toBe(true);
 
     // 2. Forced bad flag rule written directly to policy.json cache -> permit + recorded flag with invalid_rule
+    // A raw write is an edit the enforcement marker would flag; this test
+    // is about eval-time defense in depth, so drop the marker first.
+    cache.clearEnforcementMarker(cachePath);
     writeFileSync(
       cachePath,
       JSON.stringify({
