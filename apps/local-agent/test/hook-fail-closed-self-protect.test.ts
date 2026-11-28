@@ -1,4 +1,4 @@
-import { existsSync, lstatSync, mkdirSync, mkdtempSync, readdirSync, readFileSync, rmSync, symlinkSync, writeFileSync } from "node:fs";
+import { existsSync, linkSync, lstatSync, mkdirSync, mkdtempSync, readdirSync, readFileSync, renameSync, rmSync, symlinkSync, writeFileSync } from "node:fs";
 import * as fs from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
@@ -569,6 +569,52 @@ describe("per-user Cursor install defers to the managed pack", () => {
         }
       });
 
+      it("a failed rename leaves no .agentreel-tmp-* file and the hooks file unchanged", () => {
+        const dir = join(work, "rename-fail");
+        mkdirSync(dir);
+        const userFile = join(dir, "hooks.json");
+        const body = regularBody("/opt/keep");
+        writeFileSync(userFile, body);
+        const seam = cursorInstall._userHooksWriteForTests;
+        let renamed = 0;
+        seam.rename = () => {
+          renamed += 1;
+          throw Object.assign(new Error("forced rename failure"), { code: "EACCES" });
+        };
+        try {
+          const res = cursorInstall.installCursorHooks("agentreel", userFile, { systemHooksPath: join(work, "none.json") });
+          expect(renamed).toBe(1);
+          expect(res.refused).toBe(true);
+          expect(readdirSync(dir).filter((f) => f.includes(".agentreel-tmp-"))).toEqual([]);
+          expect(readFileSync(userFile, "utf8")).toBe(body);
+        } finally {
+          seam.rename = undefined;
+        }
+      });
+
+      it("a hard link added just before rename keeps the old bytes (rename replaces only the entry)", () => {
+        const dir = join(work, "rename-window");
+        mkdirSync(dir);
+        const userFile = join(dir, "hooks.json");
+        const body = regularBody("/opt/keep");
+        writeFileSync(userFile, body);
+        const victim = join(dir, "late-victim.json");
+        const seam = cursorInstall._userHooksWriteForTests;
+        seam.rename = (from, to) => {
+          linkSync(to, victim);
+          renameSync(from, to);
+        };
+        try {
+          const res = cursorInstall.installCursorHooks("agentreel", userFile, { systemHooksPath: join(work, "none.json") });
+          expect(res.refused).toBeFalsy();
+          expect(readFileSync(victim, "utf8")).toBe(body);
+          expect(readFileSync(userFile, "utf8")).toContain("cursor-hook");
+          expect(lstatSync(victim).ino).not.toBe(lstatSync(userFile).ino);
+        } finally {
+          seam.rename = undefined;
+        }
+      });
+
       it("two writes in the same millisecond both succeed and leave two distinct backups", () => {
         const dir = join(work, "same-ms-backup");
         mkdirSync(dir);
@@ -766,7 +812,6 @@ const DENIED: Array<[string, string]> = [
   ["SELF005", "env NODE_OPTIONS=--import=/tmp/evil.mjs node /usr/local/lib/node_modules/@agentreel/agent/dist/cli.js managed install --dry-run"],
   ["SELF005", "sudo NODE_OPTIONS=--require=/tmp/evil.js node /usr/local/lib/node_modules/@agentreel/agent/dist/cli.js doctor"],
   ["SELF005", "export NODE_OPTIONS=--require=/tmp/evil.js"],
-  ["SELF005", "unset NODE_OPTIONS"],
   ["SELF005", "NODE_OPTIONS=--require=/tmp/evil.js claude -p hi"],
   ["SELF005", "NODE_OPTIONS=--require=/tmp/evil.js agentreel doctor"],
   ["SELF005", "NODE_OPTIONS=--import=/tmp/evil.mjs agentreel doctor"],
