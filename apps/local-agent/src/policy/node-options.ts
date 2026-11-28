@@ -448,7 +448,7 @@ const WRAPPERS = new Set(["sudo", "doas", "env", "command", "exec", "nohup", "ni
 const SHELLS = new Set(["sh", "bash", "zsh", "dash", "ksh", "mksh", "ash", "eval", "su"]);
 
 /** Shells that will run stdin as a script when there is no -c. */
-const STDIN_SHELLS = new Set(["sh", "bash", "zsh", "dash", "ksh", "mksh", "ash"]);
+const STDIN_SHELLS = new Set(["sh", "bash", "zsh", "dash", "ksh", "mksh", "ash", "fish", "csh", "tcsh"]);
 
 /**
  * Programs whose arguments are never run or assigned, so `echo NODE_OPTIONS=x`
@@ -677,8 +677,8 @@ function pipelineIntoShellIsDisallowed(stmts: Statement[], shellIndex: number, d
  */
 function shellHereInputIsDisallowed(stmt: Statement, depth: number): boolean {
   const v = viewOf(stmt);
-  const isShell = v.program !== null && STDIN_SHELLS.has(v.program);
-  if (!isShell) return false;
+  // busybox sh/ash is a stdin shell too; STDIN_SHELLS.has(program) would miss it.
+  if (!v.bareStdinShell) return false;
   if (stmt.hereDocMissing) return true;
   if (stmt.hereString) {
     if (stmt.hereString.dynamic) return true;
@@ -692,6 +692,499 @@ function shellHereInputIsDisallowed(stmt: Statement, depth: number): boolean {
 }
 
 /**
+ * Raw-text backstop (primary rule): if the literal NODE_OPTIONS appears
+ * anywhere and we cannot prove every occurrence is a safe set, a proven
+ * read, a proven unset, or non-executed TEXT_ONLY data, deny. The
+ * structured parse above is the prove-safe path and still runs first so
+ * known forms keep a precise check; this backstop catches constructs the
+ * splitter does not model (subshell groups, process substitution, xargs).
+ */
+const NODE_OPTIONS_LIT = "NODE_OPTIONS";
+
+function isIdentChar(c: string | undefined): boolean {
+  return c !== undefined && /[A-Za-z0-9_]/.test(c);
+}
+
+function skipSpacesRaw(cmd: string, i: number): number {
+  while (i < cmd.length && (cmd[i] === " " || cmd[i] === "\t")) i++;
+  return i;
+}
+
+/** Index just after the `)` that matches `cmd[openAt] === "("`. */
+function skipToMatchingParen(cmd: string, openAt: number): number {
+  let depth = 1;
+  let i = openAt + 1;
+  let quote: "'" | '"' | "`" | null = null;
+  while (i < cmd.length && depth > 0) {
+    const c = cmd[i]!;
+    if (quote) {
+      if (quote !== "'" && c === "\\" && i + 1 < cmd.length) {
+        i += 2;
+        continue;
+      }
+      if (c === quote) quote = null;
+      i++;
+      continue;
+    }
+    if (c === "'" || c === '"' || c === "`") {
+      quote = c;
+      i++;
+      continue;
+    }
+    if (c === "\\") {
+      i += 2;
+      continue;
+    }
+    if (c === "(") depth++;
+    else if (c === ")") depth--;
+    i++;
+  }
+  return i;
+}
+
+function collectRanges(
+  cmd: string,
+  from: number,
+  to: number,
+  proc: Array<[number, number]>,
+  pipedGroup: Array<[number, number]>,
+): void {
+  let i = from;
+
+  let quote: "'" | '"' | "`" | null = null;
+  while (i < to) {
+    const c = cmd[i]!;
+
+    if (quote) {
+      if (quote !== "'" && c === "\\" && i + 1 < cmd.length) {
+        i += 2;
+        continue;
+      }
+      if (c === quote) quote = null;
+      i++;
+      continue;
+    }
+    if (c === "'" || c === '"' || c === "`") {
+      quote = c;
+      i++;
+      continue;
+    }
+    if (c === "\\") {
+      i += 2;
+      continue;
+    }
+    if ((c === "<" || c === ">") && cmd[i + 1] === "(") {
+      const start = i;
+      const after = skipToMatchingParen(cmd, i + 1);
+      proc.push([start, after]);
+      collectRanges(cmd, i + 2, after - 1, proc, pipedGroup);
+      i = after;
+      continue;
+    }
+    if (c === "(") {
+      const start = i;
+      const after = skipToMatchingParen(cmd, i);
+      const j = skipSpacesRaw(cmd, after);
+      if (cmd[j] === "|") pipedGroup.push([start, after]);
+      collectRanges(cmd, i + 1, after - 1, proc, pipedGroup);
+      i = after;
+      continue;
+    }
+    i++;
+  }
+}
+
+function inRanges(ranges: Array<[number, number]>, index: number): boolean {
+  return ranges.some(([a, b]) => index >= a && index < b);
+}
+
+function readRawWord(cmd: string, i: number, end: number): { text: string; next: number } {
+  let text = "";
+  while (i < end && (cmd[i] === " " || cmd[i] === "\t")) i++;
+  while (i < end) {
+    const c = cmd[i]!;
+    if (c === " " || c === "\t" || c === "\n" || c === ";" || c === "|" || c === "&" || c === "(" || c === ")" || c === "<" || c === ">") {
+      break;
+    }
+    if (c === "\\") {
+      if (i + 1 < end && cmd[i + 1] !== "\n") text += cmd[i + 1];
+      i += 2;
+      continue;
+    }
+    if (c === "'") {
+      const q = cmd.indexOf("'", i + 1);
+      if (q < 0 || q >= end) {
+        text += cmd.slice(i + 1, end);
+        return { text, next: end };
+      }
+      text += cmd.slice(i + 1, q);
+      i = q + 1;
+      continue;
+    }
+    if (c === '"') {
+      let j = i + 1;
+      while (j < end) {
+        const d = cmd[j]!;
+        if (d === "\\" && j + 1 < end) {
+          text += cmd[j + 1];
+          j += 2;
+          continue;
+        }
+        if (d === '"') break;
+        text += d;
+        j++;
+      }
+      i = j < end ? j + 1 : end;
+      continue;
+    }
+    text += c;
+    i++;
+  }
+  return { text, next: i };
+}
+
+/**
+ * Span of the statement that holds `index`, plus whether that statement is
+ * piped (`|` or `|&` after it, or `cmd <<EOF | sh` with the heredoc body).
+ */
+function statementSpan(cmd: string, index: number): { start: number; end: number; piped: boolean } {
+  let i = 0;
+  let quote: "'" | '"' | "`" | null = null;
+  let start = 0;
+  let paren = 0;
+  let pendingDelim: string | null = null;
+  let pendingQuoted = false;
+  let pendingStrip = false;
+  let bodyStart = -1;
+  let spanStart = 0;
+  let spanEnd = cmd.length;
+  let spanPiped = false;
+  let found = false;
+
+  const endStmt = (at: number, piped: boolean) => {
+    const end = at;
+    if (!found && index >= spanStart && index < end) {
+      found = true;
+      start = spanStart;
+      spanEnd = end;
+      spanPiped = piped;
+    }
+    spanStart = at;
+  };
+
+  while (i < cmd.length) {
+    const step = i;
+    const c = cmd[i]!;
+
+    if (pendingDelim !== null && quote === null && paren === 0 && c === "\n" && bodyStart < 0) {
+      bodyStart = i + 1;
+      i++;
+      continue;
+    }
+    if (pendingDelim !== null && bodyStart >= 0 && quote === null && c === "\n" || (pendingDelim !== null && bodyStart >= 0 && i === 0)) {
+      // handled below per line
+    }
+    if (pendingDelim !== null && bodyStart >= 0 && quote === null) {
+      // Check whether this line is the closer.
+      const nl = cmd.indexOf("\n", i);
+      const lineEnd = nl < 0 ? cmd.length : nl;
+      const line = cmd.slice(i, lineEnd);
+      const cmp = pendingStrip ? line.replace(/^\t+/, "") : line;
+      if (cmp === pendingDelim) {
+        pendingDelim = null;
+        bodyStart = -1;
+        i = nl < 0 ? cmd.length : nl + 1;
+        continue;
+      }
+      i = nl < 0 ? cmd.length : nl + 1;
+      continue;
+    }
+    if (quote) {
+      if (quote !== "'" && c === "\\" && i + 1 < cmd.length) {
+        i += 2;
+        continue;
+      }
+      if (c === quote) quote = null;
+      i++;
+      continue;
+    }
+    if (c === "'" || c === '"' || c === "`") {
+      quote = c;
+      i++;
+      continue;
+    }
+    if (c === "\\") {
+      i += 2;
+      continue;
+    }
+    if (c === "<" && cmd.startsWith("<<<", i)) {
+      i += 3;
+      const w = readRawWord(cmd, i, cmd.length);
+      i = w.next;
+      continue;
+    }
+    if (c === "<" && cmd.startsWith("<<", i)) {
+      i += 2;
+      pendingStrip = cmd[i] === "-";
+      if (pendingStrip) i++;
+      i = skipSpacesRaw(cmd, i);
+      if (cmd[i] === "'" || cmd[i] === '"') {
+        const q = cmd[i]!;
+        const end = cmd.indexOf(q, i + 1);
+        pendingQuoted = true;
+        pendingDelim = end < 0 ? cmd.slice(i + 1) : cmd.slice(i + 1, end);
+        i = end < 0 ? cmd.length : end + 1;
+      } else {
+        pendingQuoted = false;
+        const w = readRawWord(cmd, i, cmd.length);
+        pendingDelim = w.text;
+        i = w.next > i ? w.next : i + 1;
+      }
+      if (!pendingDelim) pendingDelim = null;
+      bodyStart = -1;
+      void pendingQuoted;
+      continue;
+    }
+    if ((c === "<" || c === ">") && cmd[i + 1] === "(") {
+      i = skipToMatchingParen(cmd, i + 1);
+      continue;
+    }
+    if (c === "<" || c === ">") {
+      i++;
+      if (cmd[i] === c) i++;
+      if (cmd[i] === "&") i++;
+      const w = readRawWord(cmd, i, cmd.length);
+      i = w.next;
+      continue;
+    }
+    if (c === "(") {
+      paren++;
+      i++;
+      continue;
+    }
+    if (c === ")") {
+      if (paren > 0) paren--;
+      i++;
+      continue;
+    }
+    if (paren === 0 && (c === "\n" || c === ";" || c === "|" || c === "&")) {
+      let piped = c === "|";
+      let next = i + 1;
+      if (c === "|" && cmd[i + 1] === "|") {
+        piped = false;
+        next = i + 2;
+      } else if (c === "|" && cmd[i + 1] === "&") {
+        piped = true;
+        next = i + 2;
+      } else if (c === "&" && cmd[i + 1] === "&") {
+        piped = false;
+        next = i + 2;
+      }
+      endStmt(i, piped);
+      i = next;
+      continue;
+    }
+    i++;
+    if (i <= step) i = step + 1;
+  }
+  if (!found) {
+    start = spanStart;
+    spanEnd = cmd.length;
+    spanPiped = false;
+  }
+  return { start, end: spanEnd, piped: spanPiped };
+}
+
+function firstProgram(cmd: string, start: number, end: number): string | null {
+  let i = start;
+  while (i < end) {
+    while (i < end && /[ \t\n]/.test(cmd[i]!)) i++;
+    if (i >= end) break;
+    if (cmd[i] === "(" || cmd[i] === ")" || cmd[i] === ";" || cmd[i] === "|" || cmd[i] === "&") {
+      i++;
+      continue;
+    }
+    if (cmd[i] === "<" || cmd[i] === ">") break;
+    const { text, next } = readRawWord(cmd, i, end);
+    if (next <= i) {
+      i++;
+      continue;
+    }
+    i = next;
+    if (!text) continue;
+    if (ASSIGN_WORD.test(text) || ANY_ASSIGN.test(text)) continue;
+    const base = text.slice(text.lastIndexOf("/") + 1);
+    if (WRAPPERS.has(base)) continue;
+    if (text.startsWith("-")) continue;
+    return base;
+  }
+  return null;
+}
+
+function wordsBefore(cmd: string, start: number, index: number): string[] {
+  const words: string[] = [];
+  let j = start;
+  while (j < index) {
+    while (j < index && /[ \t]/.test(cmd[j]!)) j++;
+    if (j >= index) break;
+    if (cmd[j] === "\n" || cmd[j] === ";" || cmd[j] === "|" || cmd[j] === "&" || cmd[j] === "(" || cmd[j] === ")") {
+      j++;
+      continue;
+    }
+    const { text, next } = readRawWord(cmd, j, index);
+    if (next === j) {
+      j++;
+      continue;
+    }
+    if (text) words.push(text);
+    j = next;
+  }
+  return words;
+}
+
+function parseUnquotedOrQuotedValue(cmd: string, eqAfter: number): string | null {
+  const j = eqAfter;
+  if (j >= cmd.length) return "";
+  if (cmd[j] === "'") {
+    const end = cmd.indexOf("'", j + 1);
+    if (end < 0) return null;
+    return cmd.slice(j + 1, end);
+  }
+  if (cmd[j] === '"') {
+    let k = j + 1;
+    let out = "";
+    while (k < cmd.length) {
+      const d = cmd[k]!;
+      if (d === "\\" && k + 1 < cmd.length) {
+        out += cmd[k + 1];
+        k += 2;
+        continue;
+      }
+      if (d === '"') return out;
+      if (d === "`" || d === "$") return null;
+      out += d;
+      k++;
+    }
+    return null;
+  }
+  let k = j;
+  while (k < cmd.length && !/[\s;|&()<>'"\\]/.test(cmd[k]!)) k++;
+  const v = cmd.slice(j, k);
+  if (/[$`]/.test(v)) return null;
+  return v;
+}
+
+/**
+ * True when the NODE_OPTIONS at `index` is proven safe: an allow-listed
+ * assignment, a plain read, an unset / env -u, or non-executed TEXT_ONLY data.
+ */
+function leadingProgram(words: string[]): { prog: string | null; rest: string[] } {
+  const named = new Set(["env", "unset", "printenv", "grep", "egrep", "fgrep", "rg"]);
+  let i = 0;
+  while (i < words.length) {
+    const base = words[i]!.slice(words[i]!.lastIndexOf("/") + 1);
+    if (named.has(base)) return { prog: base, rest: words.slice(i + 1) };
+    if (WRAPPERS.has(base) || base.startsWith("-")) {
+      i++;
+      continue;
+    }
+    return { prog: base, rest: words.slice(i + 1) };
+  }
+  return { prog: null, rest: [] };
+}
+
+function occurrenceIsProvenSafe(cmd: string, index: number, proc: Array<[number, number]>, pipedGroup: Array<[number, number]>): boolean {
+  const after = index + NODE_OPTIONS_LIT.length;
+  const gluedUnset =
+    (index >= 2 && cmd.slice(index - 2, index) === "-u") || cmd.slice(0, index).endsWith("--unset=");
+  // A longer identifier (NODE_OPTIONS_FOO, FOO_NODE_OPTIONS) is not this variable.
+  if (!gluedUnset && (isIdentChar(cmd[index - 1]) || isIdentChar(cmd[after]))) return true;
+
+  // $NODE_OPTIONS (not $NODE_OPTIONS_FOO)
+  if (cmd[index - 1] === "$" && !isIdentChar(cmd[after])) return true;
+
+  // ${NODE_OPTIONS} and ${NODE_OPTIONS...} parameter expansions
+  if (cmd[index - 2] === "$" && cmd[index - 1] === "{") {
+    const c = cmd[after];
+    if (c === "}") return true;
+    if (c === "=" || (c === ":" && cmd[after + 1] === "=")) {
+      const valStart = c === ":" ? after + 2 : after + 1;
+      const end = cmd.indexOf("}", valStart);
+      if (end < 0) return false;
+      return isAllowedNodeOptionsValue(cmd.slice(valStart, end));
+    }
+    if (c === ":" || c === "-" || c === "+" || c === "?" || c === "#" || c === "%" || c === "/" || c === "^" || c === ",") {
+      return true;
+    }
+    return false;
+  }
+
+  // --unset=NODE_OPTIONS or -uNODE_OPTIONS
+  if (cmd.slice(0, index).endsWith("--unset=")) return true;
+  if (index >= 2 && cmd.slice(index - 2, index) === "-u" && !isIdentChar(cmd[index - 3])) return true;
+
+  const span = statementSpan(cmd, index);
+  const words = wordsBefore(cmd, span.start, index).filter((w) => w !== "--");
+  const lead = leadingProgram(words);
+  const progWord = lead.prog ?? firstProgram(cmd, span.start, span.end);
+  const flags = lead.rest;
+
+  // unset NODE_OPTIONS, unset -v NODE_OPTIONS
+  if (progWord === "unset" && flags.every((w) => w.startsWith("-")) && !isIdentChar(cmd[after])) return true;
+  // env -u NODE_OPTIONS, env --unset NODE_OPTIONS
+  if (
+    progWord === "env" &&
+    flags.some((w) => w === "-u" || w === "--unset" || w.startsWith("--unset=") || /^-[a-zA-Z]*u$/.test(w) && w.includes("u")) &&
+    !isIdentChar(cmd[after]) &&
+    cmd[after] !== "="
+  ) {
+    return true;
+  }
+
+  // printenv NODE_OPTIONS
+  if (progWord === "printenv" && cmd[after] !== "=" && !isIdentChar(cmd[after])) return true;
+  // env | grep NODE_OPTIONS  (or egrep/fgrep/rg)
+  if (
+    (progWord === "grep" || progWord === "egrep" || progWord === "fgrep" || progWord === "rg") &&
+    cmd[after] !== "=" &&
+    !isIdentChar(cmd[after])
+  ) {
+    return true;
+  }
+
+  // NODE_OPTIONS=allow-listed-value (export/env/declare/bare, or inside quotes)
+  if (cmd[after] === "=" && cmd[after + 1] !== "+") {
+    if (cmd.startsWith("+=", after)) return false;
+    const value = parseUnquotedOrQuotedValue(cmd, after + 1);
+    if (value !== null && isAllowedNodeOptionsValue(value)) return true;
+    // A bad or dynamic value is only acceptable as non-executed TEXT_ONLY data.
+  } else if (cmd.startsWith("+=", after)) {
+    return false;
+  }
+
+  // Non-executed TEXT_ONLY data (unpiped echo/cat/printf, cat heredoc, ...).
+  if (inRanges(proc, index) || inRanges(pipedGroup, index)) return false;
+  if (span.piped) return false;
+  const program = firstProgram(cmd, span.start, span.end);
+  return program !== null && TEXT_ONLY.has(program);
+}
+
+/** Primary backstop: any unproven NODE_OPTIONS occurrence is SELF005. */
+function unprovenNodeOptionsBackstop(cmd: string): boolean {
+  const proc: Array<[number, number]> = [];
+  const pipedGroup: Array<[number, number]> = [];
+  collectRanges(cmd, 0, cmd.length, proc, pipedGroup);
+  let i = 0;
+  while (i < cmd.length) {
+    const at = cmd.indexOf(NODE_OPTIONS_LIT, i);
+    if (at < 0) return false;
+    if (!occurrenceIsProvenSafe(cmd, at, proc, pipedGroup)) return true;
+    i = at + NODE_OPTIONS_LIT.length;
+  }
+  return false;
+}
+
+/**
  * True when `cmd` sets NODE_OPTIONS to anything outside the allow list, or
  * in a way that cannot be checked. Every statement is checked (after ; && ||
  * & | and newlines), including a lone assignment with no program, export and
@@ -699,7 +1192,9 @@ function shellHereInputIsDisallowed(stmt: Statement, depth: number): boolean {
  * TEXT_ONLY command piped directly into a bare stdin shell with no -c (also
  * ksh, mksh, ash, and busybox sh/ash), a pipeline that places any stage
  * between that text and the shell, and a here-string or inline heredoc on
- * those shells, up to a fixed depth. Never throws.
+ * those shells, up to a fixed depth. After the structured parse, a raw-text
+ * backstop denies unless every NODE_OPTIONS occurrence is a proven-safe set,
+ * a proven read or unset, or non-executed TEXT_ONLY data. Never throws.
  */
 export function hasDisallowedNodeOptions(cmd: string, depth = 0): boolean {
   if (!cmd.includes("NODE_OPTIONS")) return false;
@@ -746,5 +1241,6 @@ export function hasDisallowedNodeOptions(cmd: string, depth = 0): boolean {
       if (badArgument(w, prev, setter, SHELLS.has(program), depth)) return true;
     }
   }
+  if (unprovenNodeOptionsBackstop(cmd)) return true;
   return false;
 }
