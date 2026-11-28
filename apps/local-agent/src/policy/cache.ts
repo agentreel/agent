@@ -11,9 +11,11 @@ import {
 import { dirname } from "node:path";
 import type { GuardConfig } from "../guard/types.js";
 import { guardConfigPath as defaultGuardConfigPath, policyPath } from "../paths.js";
+import { checkPolicyTrust } from "./trust.js";
 import {
   isValidSeverity,
   validateCachedPolicyFile,
+  validatePolicy,
   type BuiltinRuleOverride,
   type CachedPolicyFile,
   type Policy,
@@ -40,7 +42,8 @@ export type PolicyRejectionReason =
   | "unsupported_regex"
   | "invalid_policy"
   | "no_org_ignored"
-  | "org_mismatch_ignored";
+  | "org_mismatch_ignored"
+  | "invalid_signature";
 
 export interface PolicyRejectionRecord {
   ts: number;
@@ -57,6 +60,7 @@ const POLICY_REJECTION_REASONS = new Set<string>([
   "invalid_policy",
   "no_org_ignored",
   "org_mismatch_ignored",
+  "invalid_signature",
 ]);
 
 export function policyRejectionPath(cachePath: string = policyPath()): string {
@@ -183,10 +187,28 @@ export function readCachedPolicy(
     const raw = readFileSync(cachePath, "utf8");
     const parsed: unknown = JSON.parse(raw);
     const validated = validateCachedPolicyFile(parsed);
-    return validated.ok ? validated.value : null;
+    if (!validated.ok) return null;
+    return verifyCachedPolicy(validated.value);
   } catch {
     return null;
   }
+}
+
+/**
+ * Re-verifies a cached policy on every load. With a stored signed body the
+ * policy is rebuilt from that body (the normalized `policy` copy is not
+ * trusted) and its signature checked, so an edited cache fails. An enforcing
+ * org policy with no signed body is rejected. Returns null on any failure.
+ */
+function verifyCachedPolicy(entry: CachedPolicyFile): CachedPolicyFile | null {
+  if (entry.signed_body !== undefined) {
+    const rebuilt = validatePolicy(entry.signed_body, { skipRegexValidation: true });
+    if (!rebuilt.ok) return null;
+    const trust = checkPolicyTrust(rebuilt.value, entry.signed_body);
+    if (!trust.ok) return null;
+    return { ...entry, policy: rebuilt.value };
+  }
+  return checkPolicyTrust(entry.policy, undefined).ok ? entry : null;
 }
 
 /**

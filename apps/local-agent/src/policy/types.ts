@@ -255,6 +255,11 @@ export interface CachedPolicyFile {
   policy: Policy;
   etag: string;
   fetched_at: number;
+  /**
+   * The raw signed GET /api/v1/policy body, kept byte-for-byte as parsed so
+   * the Ed25519 signature can be re-verified on every load.
+   */
+  signed_body?: Record<string, unknown>;
 }
 
 export type ValidationResult<T> =
@@ -801,6 +806,9 @@ export function validateCachedPolicyFile(
       policy: validatedPolicy.value,
       etag: input.etag,
       fetched_at: input.fetched_at,
+      ...(isPlainObject(input.signed_body)
+        ? { signed_body: input.signed_body as Record<string, unknown> }
+        : {}),
     },
   };
 }
