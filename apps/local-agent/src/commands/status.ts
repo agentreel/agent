@@ -11,6 +11,7 @@ import { countEvents, getMeta, listHeldSessions, listRecentSessions, pendingByte
 import { isCaptureDisabledByEnv, readConfig } from "../config.js";
 import { nativeCursorHooksInstalled } from "../cursor/hook-runner.js";
 import { resolveHostnameMode } from "../attribution.js";
+import { countUnreportedGaps, getWatcherTotals, watcherHealth } from "../watcher/transcript.js";
 import {
   META_LAST_ERROR_AT,
   META_LAST_ERROR_MSG,
@@ -87,6 +88,9 @@ export async function statusCommand(): Promise<void> {
     "  daemon:        " +
       (d.running ? pc.green(`running (pid ${d.pid})`) : pc.dim("stopped")),
   );
+  if (existsSync(dbPath())) {
+    for (const line of watcherStatusLines(d.running)) console.log(line);
+  }
   console.log();
 
   if (!existsSync(dbPath())) {
@@ -153,4 +157,41 @@ function numMeta(key: string): number | null {
   if (!v) return null;
   const n = Number(v);
   return Number.isFinite(n) && n > 0 ? n : null;
+}
+
+/** Lines for `agentreel status` about the transcript watcher and hook gaps. */
+export function watcherStatusLines(daemonRunning: boolean, now = Date.now()): string[] {
+  const h = watcherHealth(now);
+  const totals = getWatcherTotals();
+  const lines: string[] = [];
+  if (h.freshness === "never") {
+    lines.push(
+      "  transcript watch: " +
+        (daemonRunning ? pc.dim("waiting for the first scan") : pc.dim("not running (start the daemon)")),
+    );
+  } else if (h.freshness === "stale") {
+    lines.push(
+      "  transcript watch: " +
+        pc.red(`stale, last scan ${fmtDuration(h.ageMs ?? 0)} ago`) +
+        pc.dim(daemonRunning ? " (daemon is up but not scanning)" : " (daemon is not running)"),
+    );
+  } else {
+    const st = h.status!;
+    const note = st.reason ? pc.dim(` (${st.reason})`) : "";
+    lines.push(
+      "  transcript watch: " +
+        (st.state === "running" ? pc.green("running") : pc.yellow(st.state)) +
+        pc.dim(` · ${st.files_watched} file(s)`) +
+        note,
+    );
+  }
+  const open = countUnreportedGaps();
+  if (totals.hook_gaps_total > 0) {
+    lines.push(
+      "  hook gaps:        " +
+        (open > 0 ? pc.red(`${open} unreported`) : pc.yellow("0 unreported")) +
+        pc.dim(` · ${totals.hook_gaps_total} total (tool calls the hooks never saw)`),
+    );
+  }
+  return lines;
 }

@@ -111,6 +111,13 @@ export async function uninstallCommand(): Promise<void> {
   console.log(pc.green("✓") + " Removed AgentReel hooks from ~/.claude/settings.json");
   if (backup) console.log(pc.dim(`  (backup: ${backup})`));
   const { uninstallCursorHooks } = await import("../cursor/hooks-install.js");
+  // The user removed the hooks on purpose, so the transcript watcher must not
+  // call every tool call a hook gap from now on.
+  const after = readConfig();
+  if (after.hooksInstalled) {
+    after.hooksInstalled = false;
+    writeConfig(after);
+  }
   const cur = uninstallCursorHooks();
   if (cur.refused) {
     console.log(pc.yellow("!") + ` ${cur.refused}`);
