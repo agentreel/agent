@@ -163,6 +163,22 @@ export function parseMaybeJson(v: unknown): unknown {
   }
 }
 
+/**
+ * A hook payload's command as a string. Arrays (argv style) are joined with
+ * spaces, and any other non-string value is serialized, so a malformed
+ * command still reaches the rules instead of being skipped.
+ */
+export function coerceCommand(v: unknown): string | undefined {
+  if (v === undefined || v === null) return undefined;
+  if (typeof v === "string") return v;
+  if (Array.isArray(v)) return v.map((x) => (typeof x === "string" ? x : JSON.stringify(x))).join(" ");
+  try {
+    return JSON.stringify(v);
+  } catch {
+    return String(v);
+  }
+}
+
 export function clip(v: unknown, max = MAX_FIELD_CHARS): unknown {
   if (typeof v === "string") {
     return v.length > max ? `${v.slice(0, max)}\n… [truncated ${v.length - max} chars]` : v;
