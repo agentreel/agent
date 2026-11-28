@@ -1,4 +1,4 @@
-import { randomBytes } from "node:crypto";
+import { createHash, randomBytes } from "node:crypto";
 import {
   chmodSync,
   existsSync,
@@ -9,10 +9,12 @@ import {
   writeFileSync,
 } from "node:fs";
 import { dirname } from "node:path";
+import { RULES } from "../guard/rules.js";
 import type { GuardConfig } from "../guard/types.js";
 import { guardConfigPath as defaultGuardConfigPath, policyPath } from "../paths.js";
 import { checkPolicyTrust } from "./trust.js";
 import {
+  isNoOrgPolicy,
   isValidSeverity,
   validateCachedPolicyFile,
   validatePolicy,
@@ -24,14 +26,23 @@ import {
 export const POLICY_REFRESH_INTERVAL_MS = 5 * 60_000;
 export const POLICY_STALE_MS = 24 * 60 * 60_000;
 
-export type PolicySource = "server_cache" | "local_fallback" | "none";
+export type PolicySource =
+  | "server_cache"
+  | "local_fallback"
+  | "none"
+  /** The org enforces, but its cached policy is missing, unreadable, invalid or edited. */
+  | "enforced_lockdown";
 
 export interface LoadedPolicy {
   source: PolicySource;
   policy: Policy | null;
   etag: string | null;
   fetchedAt: number | null;
+  /** Why the lockdown policy is in force (source "enforced_lockdown" only). */
+  lockdownReason?: LockdownReason;
 }
+
+export type LockdownReason = "policy_missing" | "policy_invalid" | "policy_edited";
 
 export interface PolicyAgeInfo {
   ageMs: number;
@@ -173,6 +184,144 @@ export function clearCachedPolicy(cachePath: string = policyPath()): void {
     // Never throw on cache cleanup.
   }
   clearPolicyRejection(cachePath);
+  clearEnforcementMarker(cachePath);
+}
+
+/**
+ * Sticky "this org enforces" marker, next to the policy cache. It is written
+ * whenever the agent itself caches an enforcing org policy and records a hash
+ * of that policy. While it exists, a missing, unreadable, invalid or edited
+ * policy.json loads a lockdown policy (every built-in rule blocks) instead of
+ * silently falling back to observe. Only explicit `auth`/`logout` (through
+ * clearCachedPolicy) or a fetched non-enforcing policy removes it.
+ */
+export interface EnforcementMarker {
+  version: 1;
+  org_id?: string | null;
+  workspace_id: string | null;
+  org_name?: string;
+  org_slug?: string;
+  policy_sha256: string;
+  since: number;
+}
+
+export function enforcementMarkerPath(cachePath: string = policyPath()): string {
+  return `${cachePath}.enforced.json`;
+}
+
+/** Stable JSON: object keys sorted, so the hash doesn't depend on key order. */
+function canonicalJson(v: unknown): string {
+  if (Array.isArray(v)) return `[${v.map(canonicalJson).join(",")}]`;
+  if (v && typeof v === "object") {
+    const o = v as Record<string, unknown>;
+    return `{${Object.keys(o)
+      .filter((k) => o[k] !== undefined)
+      .sort()
+      .map((k) => `${JSON.stringify(k)}:${canonicalJson(o[k])}`)
+      .join(",")}}`;
+  }
+  return JSON.stringify(v) ?? "null";
+}
+
+export function policySha256(policy: unknown): string {
+  return createHash("sha256").update(canonicalJson(policy)).digest("hex");
+}
+
+export function readEnforcementMarker(
+  cachePath: string = policyPath(),
+): EnforcementMarker | null {
+  try {
+    const p = enforcementMarkerPath(cachePath);
+    if (!existsSync(p)) return null;
+    const parsed = JSON.parse(readFileSync(p, "utf8")) as Record<string, unknown>;
+    if (
+      !parsed ||
+      typeof parsed !== "object" ||
+      typeof parsed.policy_sha256 !== "string"
+    ) {
+      // A marker file that exists but can't be read still means "enforcing":
+      // treat it as a marker whose hash matches nothing.
+      return { version: 1, workspace_id: "unknown", policy_sha256: "", since: 0 };
+    }
+    return parsed as unknown as EnforcementMarker;
+  } catch {
+    return existsSync(enforcementMarkerPath(cachePath))
+      ? { version: 1, workspace_id: "unknown", policy_sha256: "", since: 0 }
+      : null;
+  }
+}
+
+export function clearEnforcementMarker(cachePath: string = policyPath()): void {
+  try {
+    const p = enforcementMarkerPath(cachePath);
+    if (existsSync(p)) unlinkSync(p);
+  } catch {
+    // Never throw on marker cleanup.
+  }
+}
+
+function isEnforcingOrgPolicy(policy: Policy): boolean {
+  return policy.mode === "enforce" && !isNoOrgPolicy(policy);
+}
+
+function writeEnforcementMarkerAtomic(policy: Policy, rawPolicy: unknown, cachePath: string): void {
+  const existing = readEnforcementMarker(cachePath);
+  const marker: EnforcementMarker = {
+    version: 1,
+    ...(policy.org_id !== undefined ? { org_id: policy.org_id } : {}),
+    workspace_id: policy.workspace_id,
+    ...(policy.org_name !== undefined ? { org_name: policy.org_name } : {}),
+    ...(policy.org_slug !== undefined ? { org_slug: policy.org_slug } : {}),
+    policy_sha256: policySha256(rawPolicy),
+    since: existing && existing.since > 0 ? existing.since : Date.now(),
+  };
+  const target = enforcementMarkerPath(cachePath);
+  const tmp = `${target}.tmp.${process.pid}.${randomBytes(6).toString("hex")}`;
+  try {
+    writeFileSync(tmp, JSON.stringify(marker, null, 2) + "\n", { encoding: "utf8", mode: 0o600 });
+    renameSync(tmp, target);
+  } catch (err) {
+    try {
+      unlinkSync(tmp);
+    } catch {
+      // Ignore cleanup failures.
+    }
+    throw err;
+  }
+}
+
+/** Keeps the marker in step with a policy the agent itself just cached. */
+function syncEnforcementMarker(policy: Policy, cachePath: string): void {
+  if (isEnforcingOrgPolicy(policy)) {
+    writeEnforcementMarkerAtomic(policy, policy, cachePath);
+  } else {
+    clearEnforcementMarker(cachePath);
+  }
+}
+
+/**
+ * The policy used while the org enforces but its cached policy can't be
+ * trusted: every built-in Guard rule enabled with action "block", no custom
+ * rules and no allow-list, in enforce mode. `agentreel auth` fetches a fresh
+ * policy and lifts it.
+ */
+export function lockdownPolicy(marker: EnforcementMarker): Policy {
+  const builtin: Record<string, BuiltinRuleOverride> = {};
+  for (const rule of RULES) builtin[rule.id] = { enabled: true, action: "block" };
+  return {
+    version: 1,
+    etag: "enforced-lockdown",
+    workspace_id: marker.workspace_id,
+    ...(marker.org_id ? { org_id: marker.org_id } : {}),
+    ...(marker.org_name ? { org_name: marker.org_name } : {}),
+    ...(marker.org_slug ? { org_slug: marker.org_slug } : {}),
+    updated_at: 0,
+    mode: "enforce",
+    offline: "last_known",
+    builtin,
+    custom: [],
+    allow: { commands: [], paths: [], repos: [] },
+  };
 }
 
 /**
@@ -191,6 +340,16 @@ export function readCachedPolicy(
     return verifyCachedPolicy(validated.value);
   } catch {
     return null;
+  }
+}
+
+/** The raw `policy` object in the cache file, as written (for hashing). */
+function rawCachedPolicy(cachePath: string): unknown {
+  try {
+    const parsed = JSON.parse(readFileSync(cachePath, "utf8")) as { policy?: unknown };
+    return parsed?.policy;
+  } catch {
+    return undefined;
   }
 }
 
@@ -232,6 +391,7 @@ export function writeCachedPolicyAtomic(
       // Non-Unix filesystem without mode bits: best effort.
     }
     renameSync(tmpPath, cachePath);
+    syncEnforcementMarker(entry.policy, cachePath);
   } catch (err) {
     try {
       unlinkSync(tmpPath);
@@ -326,6 +486,30 @@ export function loadEffectivePolicy(
   const guardConfigPath = opts.guardConfigPath ?? defaultGuardConfigPath();
 
   const cached = readCachedPolicy(cachePath);
+  const marker = readEnforcementMarker(cachePath);
+  if (marker) {
+    const lockdown = (lockdownReason: LockdownReason): LoadedPolicy => ({
+      source: "enforced_lockdown",
+      policy: lockdownPolicy(marker),
+      etag: null,
+      fetchedAt: null,
+      lockdownReason,
+    });
+    if (!cached) {
+      return lockdown(existsSync(cachePath) ? "policy_invalid" : "policy_missing");
+    }
+    if (policySha256(rawCachedPolicy(cachePath)) !== marker.policy_sha256) {
+      return lockdown("policy_edited");
+    }
+  } else if (cached && isEnforcingOrgPolicy(cached.policy)) {
+    // First load of an enforcing policy cached before this agent version
+    // wrote markers: record it now (trust on first use).
+    try {
+      writeEnforcementMarkerAtomic(cached.policy, rawCachedPolicy(cachePath), cachePath);
+    } catch {
+      // Best effort; the next policy refresh writes it too.
+    }
+  }
   if (cached) {
     return {
       source: "server_cache",
