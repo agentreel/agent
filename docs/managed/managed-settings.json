@@ -1,0 +1,132 @@
+{
+  "$schema": "https://json.schemastore.org/claude-code-settings.json",
+  "allowManagedHooksOnly": true,
+  "permissions": {
+    "disableBypassPermissionsMode": "disable"
+  },
+  "sandbox": {
+    "enabled": true,
+    "failIfUnavailable": true,
+    "allowUnsandboxedCommands": false
+  },
+  "hooks": {
+    "SessionStart": [
+      {
+        "matcher": ".*",
+        "__agentreel": "agentreel:v1",
+        "hooks": [
+          {
+            "type": "command",
+            "command": "/usr/local/bin/agentreel hook SessionStart",
+            "timeout": 5
+          }
+        ]
+      }
+    ],
+    "SessionEnd": [
+      {
+        "matcher": ".*",
+        "__agentreel": "agentreel:v1",
+        "hooks": [
+          {
+            "type": "command",
+            "command": "/usr/local/bin/agentreel hook SessionEnd",
+            "timeout": 5
+          }
+        ]
+      }
+    ],
+    "UserPromptSubmit": [
+      {
+        "matcher": ".*",
+        "__agentreel": "agentreel:v1",
+        "hooks": [
+          {
+            "type": "command",
+            "command": "/usr/local/bin/agentreel hook UserPromptSubmit",
+            "timeout": 5
+          }
+        ]
+      }
+    ],
+    "PreToolUse": [
+      {
+        "matcher": ".*",
+        "__agentreel": "agentreel:v1",
+        "hooks": [
+          {
+            "type": "command",
+            "command": "/usr/local/bin/agentreel hook PreToolUse",
+            "timeout": 130,
+            "onFailure": "block"
+          }
+        ]
+      }
+    ],
+    "PostToolUse": [
+      {
+        "matcher": ".*",
+        "__agentreel": "agentreel:v1",
+        "hooks": [
+          {
+            "type": "command",
+            "command": "/usr/local/bin/agentreel hook PostToolUse",
+            "timeout": 5
+          }
+        ]
+      }
+    ],
+    "Notification": [
+      {
+        "matcher": ".*",
+        "__agentreel": "agentreel:v1",
+        "hooks": [
+          {
+            "type": "command",
+            "command": "/usr/local/bin/agentreel hook Notification",
+            "timeout": 5
+          }
+        ]
+      }
+    ],
+    "Stop": [
+      {
+        "matcher": ".*",
+        "__agentreel": "agentreel:v1",
+        "hooks": [
+          {
+            "type": "command",
+            "command": "/usr/local/bin/agentreel hook Stop",
+            "timeout": 5
+          }
+        ]
+      }
+    ],
+    "SubagentStop": [
+      {
+        "matcher": ".*",
+        "__agentreel": "agentreel:v1",
+        "hooks": [
+          {
+            "type": "command",
+            "command": "/usr/local/bin/agentreel hook SubagentStop",
+            "timeout": 5
+          }
+        ]
+      }
+    ],
+    "PreCompact": [
+      {
+        "matcher": ".*",
+        "__agentreel": "agentreel:v1",
+        "hooks": [
+          {
+            "type": "command",
+            "command": "/usr/local/bin/agentreel hook PreCompact",
+            "timeout": 5
+          }
+        ]
+      }
+    ]
+  }
+}
