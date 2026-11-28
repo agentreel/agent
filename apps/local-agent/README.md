@@ -87,10 +87,10 @@ sqlite3 ~/.agentreel/sessions.db "SELECT payload FROM events LIMIT 5;" | grep -E
 
 ## License
 
-Apache License 2.0, Copyright 2026 Black Highlights Consulting Inc. See [LICENSE](./LICENSE) and [NOTICE](./NOTICE).
+Apache License 2.0, Copyright 2026 Navjot Singh. See [LICENSE](./LICENSE) and [NOTICE](./NOTICE).
 
 Apache License 2.0 applies from **v0.2.1** onward. Versions **0.2.0 and earlier** were released under the [MIT License](https://opensource.org/licenses/MIT).
 
 ---
 
-Built by [Black Highlights Consulting Inc.](https://blackhighlights.com). Source: [github.com/agentreel/agent](https://github.com/agentreel/agent).
+Built by Navjot Singh. Source: [github.com/agentreel/agent](https://github.com/agentreel/agent).
