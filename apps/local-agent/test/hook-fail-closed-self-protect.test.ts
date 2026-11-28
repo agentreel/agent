@@ -1,4 +1,4 @@
-import { mkdirSync, mkdtempSync, readFileSync, rmSync, writeFileSync, existsSync } from "node:fs";
+import { existsSync, lstatSync, mkdirSync, mkdtempSync, readdirSync, readFileSync, rmSync, symlinkSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
@@ -113,6 +113,91 @@ describe("per-user Cursor install defers to the managed pack", () => {
     expect(JSON.stringify(file)).not.toContain("cursor-hook");
   });
 
+  describe("never writes through a symlink or a non-regular user hooks file", () => {
+    const managedBody = JSON.stringify({
+      version: 1,
+      hooks: {
+        beforeShellExecution: [{ command: "/usr/local/bin/agentreel cursor-hook beforeShellExecution", failClosed: true }],
+        preToolUse: [{ command: "/usr/local/bin/agentreel cursor-hook preToolUse", failClosed: true }],
+      },
+    }, null, 2) + "\n";
+    const run = (userPath: string) =>
+      cursorInstall.installCursorHooks("agentreel", userPath, { systemHooksPath: systemCursorHooks });
+    const noBackups = (dir: string) => readdirSync(dir).filter((f) => f.includes("backup"));
+
+    it("~/.cursor/hooks.json symlinked to the managed file: managed bytes unchanged, warning returned", () => {
+      writeFileSync(systemCursorHooks, managedBody);
+      const userDir = join(work, "dot-cursor");
+      mkdirSync(userDir);
+      const userFile = join(userDir, "hooks.json");
+      symlinkSync(systemCursorHooks, userFile);
+      const res = run(userFile);
+      expect(res.skipped).toBe(true);
+      expect(res.skipped && res.removed).toBe(0);
+      expect(res.skipped && res.backup).toBeNull();
+      expect(res.skipped && res.warning).toMatch(/symlink/);
+      expect(readFileSync(systemCursorHooks, "utf8")).toBe(managedBody);
+      expect(lstatSync(userFile).isSymbolicLink()).toBe(true);
+      expect(noBackups(userDir)).toEqual([]);
+      expect(noBackups(work)).toEqual([]);
+    });
+
+    it("direct removeUserAgentreelCursorHooks on the symlink also refuses", () => {
+      writeFileSync(systemCursorHooks, managedBody);
+      const userFile = join(work, "link-hooks.json");
+      symlinkSync(systemCursorHooks, userFile);
+      const res = cursorInstall.removeUserAgentreelCursorHooks(userFile);
+      expect(res.removed).toBe(0);
+      expect(res.refused).toBeTruthy();
+      expect(readFileSync(systemCursorHooks, "utf8")).toBe(managedBody);
+    });
+
+    it("~/.cursor itself symlinked to a directory holding the managed file: target bytes unchanged", () => {
+      const realDir = join(work, "etc-cursor");
+      mkdirSync(realDir);
+      const managed = join(realDir, "hooks.json");
+      writeFileSync(managed, managedBody);
+      const linkDir = join(work, "dot-cursor-link");
+      symlinkSync(realDir, linkDir);
+      const res = cursorInstall.installCursorHooks("agentreel", join(linkDir, "hooks.json"), { systemHooksPath: managed });
+      expect(res.skipped).toBe(true);
+      expect(res.skipped && res.removed).toBe(0);
+      expect(res.skipped && res.warning).toMatch(/symlink/);
+      expect(readFileSync(managed, "utf8")).toBe(managedBody);
+      expect(noBackups(realDir)).toEqual([]);
+    });
+
+    it("a non-regular file at the hooks path is left alone", () => {
+      writeFileSync(systemCursorHooks, managedBody);
+      const userFile = join(work, "hooks-is-a-dir");
+      mkdirSync(userFile);
+      writeFileSync(join(userFile, "keep.txt"), "keep");
+      const res = run(userFile);
+      expect(res.skipped && res.removed).toBe(0);
+      expect(res.skipped && res.warning).toBeTruthy();
+      expect(readdirSync(userFile)).toEqual(["keep.txt"]);
+      expect(readFileSync(systemCursorHooks, "utf8")).toBe(managedBody);
+    });
+
+    it("a dangling symlink is not written through", () => {
+      writeFileSync(systemCursorHooks, managedBody);
+      const userFile = join(work, "dangling-hooks.json");
+      const target = join(work, "does-not-exist.json");
+      symlinkSync(target, userFile);
+      const res = run(userFile);
+      expect(res.skipped && res.removed).toBe(0);
+      expect(existsSync(target)).toBe(false);
+    });
+
+    it("control: a regular user file is still cleaned", () => {
+      writeFileSync(systemCursorHooks, managedBody);
+      writeFileSync(cursorHooks, JSON.stringify({ version: 1, hooks: { preToolUse: [{ command: "agentreel cursor-hook preToolUse" }] } }));
+      const res = run(cursorHooks);
+      expect(res.skipped && res.removed).toBe(1);
+      expect(res.skipped && res.warning).toBeUndefined();
+    });
+  });
+
   it("doctor reports managed hooks instead of telling the user to run agentreel init", () => {
     writeFileSync(systemCursorHooks, JSON.stringify({
       version: 1,
@@ -216,6 +301,25 @@ const DENIED: Array<[string, string]> = [
   ["SELF005", "export HOME=/tmp/empty"],
   ["SELF005", "HOME=/tmp/empty claude -p hi"],
   ["SELF005", "CLAUDE_CONFIG_DIR=/tmp/c claude"],
+  ["SELF003", "node /usr/local/lib/node_modules/@agentreel/agent/dist/cli.js managed install --hook-command /tmp/evil"],
+  ["SELF003", "sudo node /usr/local/lib/node_modules/@agentreel/agent/dist/cli.js managed install --root /"],
+  ["SELF003", "sudo node /usr/local/lib/node_modules/@agentreel/agent/dist/cli.js uninstall"],
+  ["SELF003", "node /usr/local/lib/node_modules/@agentreel/agent/dist/cli.js pause"],
+  ["SELF001", "node -e \"require('fs').rmSync('/usr/local/lib/node_modules/@agentreel/agent/dist/cli.js')\""],
+  ["SELF001", "node -e 'x' /usr/local/lib/node_modules/@agentreel/agent/dist/cli.js"],
+  ["SELF001", "node -p 1 /usr/local/lib/node_modules/@agentreel/agent/dist/cli.js doctor"],
+  ["SELF001", "node -r /tmp/evil.js /usr/local/lib/node_modules/@agentreel/agent/dist/cli.js doctor"],
+  ["SELF001", "node --require=/tmp/evil.js /usr/local/lib/node_modules/@agentreel/agent/dist/cli.js doctor"],
+  ["SELF001", "node --import /tmp/evil.mjs /usr/local/lib/node_modules/@agentreel/agent/dist/cli.js doctor"],
+  ["SELF001", "node /tmp/evil.js /usr/local/lib/node_modules/@agentreel/agent/dist/cli.js"],
+  ["SELF001", "node /tmp/script.js /etc/cursor/hooks.json"],
+  ["SELF001", "node /usr/local/lib/node_modules/@agentreel/agent/dist/cli.js doctor /etc/cursor/hooks.json"],
+  ["SELF001", "node /usr/local/lib/node_modules/@agentreel/agent/dist/cli.js doctor > /etc/cursor/hooks.json"],
+  ["SELF001", "node /usr/local/lib/node_modules/@agentreel/agent/dist/cli.js doctor; rm -rf /usr/local/lib/node_modules/@agentreel/agent"],
+  ["SELF001", "node /tmp/x/../node_modules/@agentreel/agent/dist/cli.js doctor"],
+  ["SELF001", "node /tmp/node_modules/@agentreel/agent/dist/other.js doctor"],
+  ["SELF001", "cat /usr/local/lib/node_modules/@agentreel/agent/dist/cli.js > /tmp/x"],
+  ["SELF001", "cp /tmp/evil.js /usr/local/lib/node_modules/@agentreel/agent/dist/cli.js"],
 ];
 
 const ALLOWED = [
@@ -239,6 +343,13 @@ const ALLOWED = [
   "rm ./my-agentreel-notes.txt",
   "agentreel init",
   "agentreel status",
+  "node /usr/local/lib/node_modules/@agentreel/agent/dist/cli.js doctor",
+  "node /usr/local/lib/node_modules/@agentreel/agent/dist/cli.js managed install --dry-run",
+  "sudo node /usr/local/lib/node_modules/@agentreel/agent/dist/cli.js managed install --dry-run",
+  "nodejs /usr/local/lib/node_modules/@agentreel/agent/dist/cli.js status",
+  "/usr/bin/node /usr/local/lib/node_modules/@agentreel/agent/dist/cli.js doctor",
+  "node --no-warnings /usr/local/lib/node_modules/@agentreel/agent/dist/cli.js doctor",
+  "cat /usr/local/lib/node_modules/@agentreel/agent/dist/cli.js",
 ];
 
 describe("(d) self-protect matcher", () => {
