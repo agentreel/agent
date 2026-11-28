@@ -388,8 +388,22 @@ function toStringArray(v: unknown): string[] {
 /**
  * Converts a local guard-config.json object into an observe-mode Policy.
  */
+/**
+ * Converts local guard-config.json into a policy.
+ *
+ * policyMode "warn" (the default) keeps observe mode: listed rules only flag.
+ * policyMode "block" makes the local config actually block: the policy runs in
+ * enforce mode and every built-in rule is set to block unless the config
+ * disables it (built-ins missing from `rules` stay enabled).
+ */
 export function guardConfigToPolicy(guardConfig: Partial<GuardConfig>): Policy {
+  const blocking = guardConfig.policyMode === "block";
   const builtin: Record<string, BuiltinRuleOverride> = {};
+  if (blocking) {
+    for (const rule of RULES) {
+      builtin[rule.id] = { enabled: true, action: "block" };
+    }
+  }
   if (
     guardConfig.rules &&
     typeof guardConfig.rules === "object" &&
@@ -400,7 +414,7 @@ export function guardConfigToPolicy(guardConfig: Partial<GuardConfig>): Policy {
       if (typeof ruleCfg.enabled !== "boolean") continue;
       builtin[ruleId] = {
         enabled: ruleCfg.enabled,
-        action: "flag",
+        action: blocking ? "block" : "flag",
         ...(isValidSeverity(ruleCfg.severity)
           ? { severity: ruleCfg.severity }
           : {}),
@@ -410,11 +424,12 @@ export function guardConfigToPolicy(guardConfig: Partial<GuardConfig>): Policy {
 
   return {
     version: 1,
-    etag: "local-guard-config",
+    etag: blocking ? "local-guard-config-block" : "local-guard-config",
     workspace_id: "local",
     updated_at: 0,
-    mode: "observe",
+    mode: blocking ? "enforce" : "observe",
     offline: "last_known",
+    ...(blocking ? { org_name: "your local Guard config" } : {}),
     builtin,
     custom: [],
     allow: {
