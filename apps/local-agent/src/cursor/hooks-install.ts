@@ -48,7 +48,9 @@ export const _userHooksLstatForTests = { lstatSync: fs.lstatSync };
 export const _userHooksWriteForTests: {
   noFollow: number | undefined;
   beforeOpen: ((path: string) => void) | undefined;
-} = { noFollow: fs.constants.O_NOFOLLOW, beforeOpen: undefined };
+  /** Override the next backup path. Tests use this to force an EEXIST retry. */
+  nextBackupPath: ((path: string) => string) | undefined;
+} = { noFollow: fs.constants.O_NOFOLLOW, beforeOpen: undefined, nextBackupPath: undefined };
 
 const OPEN_REFUSAL_CODES = new Set(["ELOOP", "EMLINK"]);
 
@@ -56,6 +58,7 @@ let backupSeq = 0;
 
 /** Unique backup path: timestamp, pid, a monotonic counter and a short random suffix. */
 function nextBackupPath(path: string): string {
+  if (_userHooksWriteForTests.nextBackupPath) return _userHooksWriteForTests.nextBackupPath(path);
   backupSeq += 1;
   const ts = new Date().toISOString().replace(/[:.]/g, "-");
   const rand = randomBytes(6).toString("hex");
@@ -78,11 +81,14 @@ function backup(path: string): string | null {
   try {
     if (noFollow === undefined) {
       const st = _userHooksLstatForTests.lstatSync(path);
-      if (st.isSymbolicLink() || !st.isFile()) return null;
+      if (st.isSymbolicLink() || !st.isFile() || st.nlink !== 1) return null;
     }
     fd = fs.openSync(path, fs.constants.O_RDONLY | (noFollow ?? 0) | (fs.constants.O_NONBLOCK ?? 0));
     const st = fs.fstatSync(fd);
-    if (!st.isFile()) return null;
+    // nlink !== 1: a hard link to another name. Reading it is safe, but we
+    // refuse so a later write cannot be mistaken for a successful backup of
+    // a unique file, and so install/cleanup/uninstall abort instead.
+    if (!st.isFile() || st.nlink !== 1) return null;
     const data = fs.readFileSync(fd);
     const mode = st.mode & 0o777;
     for (let attempt = 0; attempt < 8; attempt++) {
@@ -121,28 +127,40 @@ type UserHooksWrite = { ok: true; backup: string | null } | { ok: false; warning
  *     write if the file exists and the backup could not be made;
  *  3. re-lstat the parent directory right before the open and refuse a
  *     symlink (a swap since step 1);
- *  4. write through one fd opened with O_WRONLY|O_CREAT|O_TRUNC|O_NOFOLLOW,
- *     keeping the existing mode (0600 for a new file). ELOOP is a refusal.
- *     Without O_NOFOLLOW (Windows) the file is lstat-ed immediately before
- *     the open instead.
+ *  4. if the file exists, open it with O_WRONLY|O_NOFOLLOW|O_NONBLOCK (no
+ *     O_TRUNC, no O_CREAT), fstat, and refuse unless it is a regular file
+ *     with nlink === 1 (a hard link to another name is never written
+ *     through);
+ *  5. write a temp file in the same directory (O_WRONLY|O_CREAT|O_EXCL,
+ *     the original's mode, or 0600 for a new file), fsync it, then
+ *     renameSync it over the destination. rename replaces a directory
+ *     entry and does not write through a hard link or a symlink. ELOOP
+ *     on the open is a refusal. Without O_NOFOLLOW (Windows) the file is
+ *     lstat-ed immediately before the open instead.
  *
- * Never throws. A same-user swap in the few instructions between the last
- * check and the open is closed for the file by O_NOFOLLOW; for the parent
- * directory it narrows to the gap between its lstat and the open.
+ * Never throws. A same-user swap of the file in the few instructions
+ * between the last check and the open is closed by O_NOFOLLOW. A swap of
+ * the parent directory still has a residual window between its lstat and
+ * the open or rename; that is tracked as a follow-up (openat / O_DIRECTORY).
  */
 function writeUserHooksFile(path: string, content: string): UserHooksWrite {
   const fail = (why: string): UserHooksWrite => ({
     ok: false,
     warning: `${path} or its directory is a symlink or not a regular file, or could not be inspected (${why}), so it was left untouched.`,
   });
-  let fd: number | null = null;
+  let origFd: number | null = null;
+  let tmpFd: number | null = null;
+  let tmpPath: string | null = null;
   try {
     const refused = refuseUnsafeUserHooksFile(path);
     if (refused) return { ok: false, warning: refused };
 
     let existingMode: number | null = null;
     try {
-      existingMode = _userHooksLstatForTests.lstatSync(path).mode & 0o777;
+      const st = _userHooksLstatForTests.lstatSync(path);
+      if (st.isSymbolicLink() || !st.isFile()) return fail("not a regular file");
+      if (st.nlink !== 1) return fail("hard link");
+      existingMode = st.mode & 0o777;
     } catch (err) {
       if ((err as NodeJS.ErrnoException).code !== "ENOENT") return fail((err as NodeJS.ErrnoException).code ?? "lstat");
     }
@@ -163,36 +181,75 @@ function writeUserHooksFile(path: string, content: string): UserHooksWrite {
     if (parent.isSymbolicLink() || !parent.isDirectory()) return fail("directory changed");
 
     const noFollow = _userHooksWriteForTests.noFollow;
+    const c = fs.constants;
+    // Re-check the destination after beforeOpen: a swap to a symlink or a
+    // hard link must be refused even when the path was missing at step 1.
     if (noFollow === undefined) {
       try {
         const st = _userHooksLstatForTests.lstatSync(path);
         if (st.isSymbolicLink() || !st.isFile()) return fail("not a regular file");
+        if (st.nlink !== 1) return fail("hard link");
+        existingMode = st.mode & 0o777;
       } catch (err) {
         if ((err as NodeJS.ErrnoException).code !== "ENOENT") return fail((err as NodeJS.ErrnoException).code ?? "lstat");
       }
     }
-    const c = fs.constants;
     try {
-      fd = fs.openSync(
-        path,
-        c.O_WRONLY | c.O_CREAT | c.O_TRUNC | (noFollow ?? 0) | (c.O_NONBLOCK ?? 0),
-        existingMode ?? 0o600,
-      );
+      origFd = fs.openSync(path, c.O_WRONLY | (noFollow ?? 0) | (c.O_NONBLOCK ?? 0));
+      const st = fs.fstatSync(origFd);
+      if (!st.isFile() || st.nlink !== 1) return fail(st.nlink !== 1 ? "hard link" : "not a regular file");
+      existingMode = st.mode & 0o777;
     } catch (err) {
       const code = (err as NodeJS.ErrnoException).code ?? "open";
-      return fail(OPEN_REFUSAL_CODES.has(code) ? "symlink" : code);
+      if (code === "ENOENT") {
+        // New file: write the temp and rename into place below.
+        existingMode = existingMode ?? 0o600;
+      } else {
+        return fail(OPEN_REFUSAL_CODES.has(code) ? "symlink" : code);
+      }
     }
-    if (!fs.fstatSync(fd).isFile()) return fail("not a regular file");
-    fs.writeFileSync(fd, content, "utf8");
+
+    const mode = existingMode ?? 0o600;
+    tmpPath = `${path}.agentreel-tmp-${process.pid}-${randomBytes(6).toString("hex")}`;
+    try {
+      tmpFd = fs.openSync(tmpPath, c.O_WRONLY | c.O_CREAT | c.O_EXCL, mode);
+    } catch (err) {
+      return fail((err as NodeJS.ErrnoException).code ?? "open");
+    }
+    try {
+      fs.fchmodSync(tmpFd, mode);
+    } catch {
+      // Non-Unix filesystems without mode bits: best effort.
+    }
+    fs.writeFileSync(tmpFd, content, "utf8");
+    fs.fsyncSync(tmpFd);
+    fs.closeSync(tmpFd);
+    tmpFd = null;
+    fs.renameSync(tmpPath, path);
+    tmpPath = null;
     return { ok: true, backup: b };
   } catch (err) {
     return fail((err as NodeJS.ErrnoException).code ?? "error");
   } finally {
-    if (fd !== null) {
+    if (origFd !== null) {
       try {
-        fs.closeSync(fd);
+        fs.closeSync(origFd);
       } catch {
         // Ignore close failures.
+      }
+    }
+    if (tmpFd !== null) {
+      try {
+        fs.closeSync(tmpFd);
+      } catch {
+        // Ignore close failures.
+      }
+    }
+    if (tmpPath !== null) {
+      try {
+        fs.unlinkSync(tmpPath);
+      } catch {
+        // Already renamed or never created.
       }
     }
   }
@@ -354,7 +411,8 @@ export type InstallCursorHooksResult =
       preExecTimeoutS: number;
       backup: string | null;
       removed: number;
-      /** Set when the user file was a symlink or not a regular file and was left untouched. */
+      refused?: true;
+      /** Set when the user file was a symlink, a hard link, or not a regular file and was left untouched. */
       warning?: string;
     };
 
@@ -382,7 +440,7 @@ export function installCursorHooks(
       preExecTimeoutS,
       backup: cleaned.backup,
       removed: cleaned.removed,
-      ...(cleaned.refused ? { warning: cleaned.refused } : {}),
+      ...(cleaned.refused ? { refused: true as const, warning: cleaned.refused } : {}),
     };
   }
   const refused = refuseUnsafeUserHooksFile(path);
