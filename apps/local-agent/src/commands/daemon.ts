@@ -16,7 +16,8 @@ import { pendingByteSize } from "../db.js";
 import { flushOnce, nextAttemptAt } from "../upload/flush.js";
 import { MAX_BATCH_BYTES } from "../upload/queue.js";
 import { IngestError } from "../upload/client.js";
-import { readConfig } from "../config.js";
+import { isCapturePaused, readConfig } from "../config.js";
+import { TranscriptWatcher, getWatcherTotals } from "../watcher/transcript.js";
 import {
   fetchPolicy,
   POLICY_REFRESH_INTERVAL_MS,
@@ -44,6 +45,32 @@ export function createPolicyRefresher(
       return null;
     }
   };
+}
+
+/**
+ * One transcript-watcher pass for the daemon loop. Never throws: a watcher
+ * problem must not stop uploads or policy refresh. Returns the number of hook
+ * gaps found in this pass.
+ */
+export function runTranscriptScan(
+  watcher: TranscriptWatcher,
+  log: (line: string) => void = (l) => console.log(l),
+): number {
+  try {
+    const before = getWatcherTotals().hook_gaps_total;
+    watcher.scan();
+    const found = getWatcherTotals().hook_gaps_total - before;
+    if (found > 0) {
+      log(
+        pc.dim(`  [${ts()}]`) +
+          pc.yellow(" ! ") +
+          `${found} tool call(s) in the transcript had no hook event (hook gap)`,
+      );
+    }
+    return found;
+  } catch {
+    return 0;
+  }
 }
 
 export interface DaemonOpts {
@@ -92,14 +119,21 @@ export async function daemonCommand(opts: DaemonOpts = {}): Promise<void> {
   console.log(pc.dim("  Ctrl-C to stop"));
 
   const maybeRefreshPolicy = createPolicyRefresher();
+  const transcriptWatcher = new TranscriptWatcher({
+    isPaused: () => isCapturePaused(),
+    hooksExpected: () => readConfig().hooksInstalled === true,
+  });
 
   // Loop until killed. Each iteration:
+  //   0. scan transcripts for tool calls the hooks never saw (hook gaps)
   //   1. refresh cached org policy every 5 minutes (quiet on failure)
   //   2. honor backoff (next_attempt_at) before uploading
   //   3. drain the queue in batches as long as moreAvailable
   //   4. sleep up to 30s, but wake early if pending bytes cross 1 MB
   for (;;) {
     if (stopping) return;
+
+    runTranscriptScan(transcriptWatcher);
 
     const policyRes = await maybeRefreshPolicy();
     if (policyRes?.status === "updated") {

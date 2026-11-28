@@ -12,6 +12,7 @@ import { ensureAgentreelDir, logPath } from "../paths.js";
 import { scrubAny, scrubString } from "../redact/scrubber.js";
 import { readSqlFileReferences } from "./sql-file-refs.js";
 import { isPolicyCacheStale, loadEffectivePolicy } from "./cache.js";
+import { matchSelfProtect } from "./self-protect.js";
 import {
   EVAL_TIMEOUT_REASON,
   evaluatePolicy,
@@ -45,6 +46,7 @@ export {
   repoSlugFromRemoteUrl,
 };
 export const STALE_FAIL_OPEN_REASON = "policy stale, fail_open";
+export const SELF_PROTECT_REASON = "self_protect";
 export const HOOK_TIMEOUT_TOO_SHORT_REASON = "hook_timeout_too_short";
 
 export function formatHookTimeoutTooShortMessage(ruleName: string): string {
@@ -423,6 +425,51 @@ export async function enforcePreExec(
         enforced: false,
         downgraded: false,
       };
+    }
+
+    // Self-protection: under an enforcing org policy the agent may not turn
+    // AgentReel off (hook and policy files, uninstall, disableAllHooks, env).
+    if (loaded.policy.mode === "enforce") {
+      const self = matchSelfProtect({
+        toolName: req.toolName,
+        command: req.command,
+        file_path: req.file_path,
+        toolInput: req.toolInput,
+      });
+      if (self) {
+        const cfg = deps.config ?? readConfig();
+        const ts = req.ts ?? nowFn();
+        const record: PolicyDecisionRecord = {
+          id: computeDecisionId({
+            sessionId: req.sessionId,
+            ruleId: self.rule_id,
+            tool: req.tool,
+            toolUseId: req.toolUseId,
+            summary: buildActionSummary(req),
+          }),
+          ts,
+          session_id: req.sessionId,
+          rule_id: self.rule_id,
+          rule_ids: [self.rule_id],
+          action: "block",
+          enforced: true,
+          downgraded: false,
+          policy_etag: loaded.etag,
+          tool: req.tool,
+          tool_name: req.toolName,
+          reason: SELF_PROTECT_REASON,
+        };
+        persistDecisionEvent(record, req.cwd, recordDecision, log);
+        return {
+          permitted: false,
+          action: "block",
+          enforced: true,
+          downgraded: false,
+          reason: SELF_PROTECT_REASON,
+          message: formatBlockMessage(`self-protection, ${self.name}`, loaded.policy, cfg),
+          decision: record,
+        };
+      }
     }
 
     const evalInput: PolicyEvalInput = {
