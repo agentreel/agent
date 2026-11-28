@@ -11,6 +11,7 @@ import { countEvents, getMeta, listHeldSessions, listRecentSessions, pendingByte
 import { isCaptureDisabledByEnv, readConfig } from "../config.js";
 import { nativeCursorHooksInstalled } from "../cursor/hook-runner.js";
 import { resolveHostnameMode } from "../attribution.js";
+import { heartbeatHealth } from "../heartbeat/heartbeat.js";
 import { countUnreportedGaps, getWatcherTotals, watcherHealth } from "../watcher/transcript.js";
 import {
   META_LAST_ERROR_AT,
@@ -185,6 +186,7 @@ export function watcherStatusLines(daemonRunning: boolean, now = Date.now()): st
         note,
     );
   }
+  lines.push(...heartbeatStatusLines(daemonRunning, now));
   const open = countUnreportedGaps();
   if (totals.hook_gaps_total > 0) {
     lines.push(
@@ -194,4 +196,21 @@ export function watcherStatusLines(daemonRunning: boolean, now = Date.now()): st
     );
   }
   return lines;
+}
+
+/** Lines for `agentreel status` about the daemon heartbeat. */
+export function heartbeatStatusLines(daemonRunning: boolean, now = Date.now()): string[] {
+  const h = heartbeatHealth(now);
+  const label = "  heartbeat:        ";
+  if (h.liveness === "never") {
+    return [label + pc.dim(daemonRunning ? "none sent yet" : "never sent (start the daemon)")];
+  }
+  const ago = fmtDuration(h.ageMs ?? 0) + " ago";
+  if (h.liveness === "live") {
+    return [label + pc.green(`ok, last ${ago}`) + (h.failures > 0 ? pc.dim(` · ${h.failures} failed since`) : "")];
+  }
+  const why = daemonRunning ? "daemon is up but the server is unreachable or rejecting" : "daemon is not running";
+  const out = [label + pc.red(`${h.liveness}, last ok ${ago}`) + pc.dim(` (${why}; the server shows this device as uncovered)`)];
+  if (h.lastError) out.push(pc.dim(`                    last error: ${h.lastError}`));
+  return out;
 }
