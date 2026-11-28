@@ -90,7 +90,7 @@ export async function initCommand(opts: InitOptions = {}): Promise<void> {
           ...(opts.systemCursorHooksPath ? { systemHooksPath: opts.systemCursorHooksPath } : {}),
         });
 
-  const cursorInstalled = cursor && !cursor.skipped ? cursor : null;
+  const cursorInstalled = cursor && !cursor.skipped && !cursor.refused ? cursor : null;
   if (result || cursorInstalled) {
     const nextTimeouts = { ...(cfg.installedHookTimeouts ?? {}) };
     if (result) nextTimeouts.claude = preExecTimeoutS;
@@ -115,6 +115,8 @@ export async function initCommand(opts: InitOptions = {}): Promise<void> {
         ` Cursor hooks are owned by the managed pack (${cursor.managedPath}); skipped ~/.cursor/hooks.json so nothing is captured twice`,
     );
     if (cursor.warning) console.log(pc.yellow("!") + ` ${cursor.warning}`);
+  } else if (cursor && cursor.refused === true) {
+    console.log(pc.yellow("!") + ` ${cursor.warning}`);
   } else if (cursor) {
     console.log(
       pc.green("✓") +
