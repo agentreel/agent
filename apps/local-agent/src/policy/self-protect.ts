@@ -2,6 +2,7 @@ import { readFileSync } from "node:fs";
 import { systemCursorHooksPath } from "../cursor/hooks-install.js";
 import { hookCommandBinaryPath } from "../managed/hook-path.js";
 import { claudeSettingsPath, cursorHooksPath } from "../paths.js";
+import { hasDisallowedNodeOptions } from "./node-options.js";
 
 /**
  * Self-protection: while an org policy is enforcing, block the agent from
@@ -76,7 +77,7 @@ const WRAPPERS = new Set(["sudo", "doas", "command", "exec", "nohup", "time", "n
 
 const READ_TOOLS = /^(read|read_file|readfile|view|cat|beforereadfile|grep|glob|ls|list_dir|search)$/i;
 
-const ENV_NAMES = /^(HOME|CLAUDE_CONFIG_DIR|CLAUDECODE|CLAUDE_CODE_CHILD_SESSION|CURSOR_AGENT|NODE_OPTIONS|AGENTREEL_[A-Z0-9_]*)$/;
+const ENV_NAMES = /^(HOME|CLAUDE_CONFIG_DIR|CLAUDECODE|CLAUDE_CODE_CHILD_SESSION|CURSOR_AGENT|AGENTREEL_[A-Z0-9_]*)$/;
 
 /** NFKC, then drop quotes and backslash escapes (keeping the escaped char). */
 export function dequoteShell(s: string): string {
@@ -359,6 +360,11 @@ function nodeAgentreelScriptIndex(toks: string[], pi: number): number {
 }
 
 function checkCommand(command: string): SelfProtectMatch | null {
+  // NODE_OPTIONS can preload code into the hook binary and the CLI. Any
+  // assignment (bare, env, sudo, sudo -E env, export, sh -c, eval) must use
+  // only the allow list in node-options.ts; anything else is SELF005.
+  // Checked on the quoted text, before quotes are stripped.
+  if (hasDisallowedNodeOptions(command.normalize("NFKC"))) return m("SELF005");
   const clean = rewriteWhichAgentreel(dequoteShell(command));
   const segs = shellSegments(clean);
   for (const seg of segs) {
@@ -372,12 +378,6 @@ function checkCommand(command: string): SelfProtectMatch | null {
     const cliIdx = nodeAgentreelScriptIndex(toks, pi);
 
     // SELF005: env tampering.
-    // Any NODE_OPTIONS= assignment before the program (bare, env, sudo,
-    // sudo -E env) is SELF005, whatever the program: it can preload
-    // (--require, --import) into agentreel, npx, node and the rest.
-    if (pi >= 0 && toks.slice(0, pi).some((t) => /^NODE_OPTIONS=/i.test(t))) {
-      return m("SELF005");
-    }
     if (prog === "unset" && args.some((a) => ENV_NAMES.test(a))) return m("SELF005");
     if (prog === "export" || prog === "declare" || prog === "typeset") {
       if (args.some((a) => ENV_NAMES.test(a.split("=")[0]!) && a.includes("="))) return m("SELF005");
