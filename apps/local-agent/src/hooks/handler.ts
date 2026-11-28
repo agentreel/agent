@@ -10,15 +10,22 @@ import {
 } from "../config.js";
 import { recomputeSessionCost } from "../cost/transcript.js";
 import { isCursorPayload, nativeCursorHooksInstalled, recordCursorHook } from "../cursor/hook-runner.js";
+import { coerceCommand, cursorSessionId, parseMaybeJson } from "../cursor/hook-normalize.js";
 import { insertEvent, upsertSession } from "../db.js";
 import { logPath, ensureAgentreelDir } from "../paths.js";
 import {
+  enforcementExpected,
   enforcePreExec,
+  failClosedOutcome,
+  INTERNAL_ERROR_REASON,
+  MALFORMED_INPUT_REASON,
   repoSlugFromRemoteUrl,
   type PreExecDeps,
   type PreExecOutcome,
   type PreExecRequest,
 } from "../policy/enforce.js";
+
+export { coerceCommand };
 import { computeHookDeadlineMs } from "../policy/types.js";
 import { scrubAny } from "../redact/scrubber.js";
 import {
@@ -70,12 +77,14 @@ export function extractClaudePreExecRequest(
   attribution?: Attribution | null,
 ): PreExecRequest {
   const toolName = input.tool_name ?? "unknown";
+  // tool_input may arrive as a JSON string; parse it rather than skip it.
+  const toolInput = parseMaybeJson(input.tool_input);
   const ti =
-    input.tool_input && typeof input.tool_input === "object" && !Array.isArray(input.tool_input)
-      ? (input.tool_input as Record<string, unknown>)
+    toolInput && typeof toolInput === "object" && !Array.isArray(toolInput)
+      ? (toolInput as Record<string, unknown>)
       : undefined;
 
-  const command = typeof ti?.command === "string" ? ti.command : undefined;
+  const command = coerceCommand(ti?.command);
   const filePath = [ti?.file_path, ti?.path, ti?.notebook_path, ti?.target_file, ti?.filePath, ti?.file].find(
     (v): v is string => typeof v === "string" && v.length > 0,
   );
@@ -97,7 +106,7 @@ export function extractClaudePreExecRequest(
     file_path: filePath,
     url,
     mcp_tool: mcpTool,
-    toolInput: input.tool_input,
+    toolInput,
     repo: repoSlugFromRemoteUrl(attribution?.git?.remote_url),
     branch: attribution?.git?.branch_end ?? attribution?.git?.branch_start,
     member: attribution?.git?.user_email ?? attribution?.os_user,
@@ -138,6 +147,16 @@ export async function handleClaudeHookInput(
     } catch (err) {
       logError(err);
       stdout = null;
+      const { expected, policy } = enforcementExpected(deps);
+      if (expected) {
+        outcome = failClosedOutcome(
+          INTERNAL_ERROR_REASON,
+          "the policy check failed",
+          policy,
+          deps.config ?? readConfig(),
+        );
+        stdout = formatClaudePreToolUseDeny(outcome.message!);
+      }
     }
   }
 
@@ -215,27 +234,116 @@ export interface RunHookOptions {
   writeStdout?: (text: string) => void;
 }
 
+function isPlainObject(v: unknown): v is object {
+  return typeof v === "object" && v !== null && !Array.isArray(v);
+}
+
+/**
+ * The deny line for a PreToolUse hook whose input we couldn't use, when an
+ * enforcing org policy is in effect. Null otherwise (fail open, as before).
+ */
+export function claudeFailClosedDeny(
+  eventArg: string | undefined,
+  reason: string,
+  what: string,
+  deps: PreExecDeps = {},
+): string | null {
+  if (eventArg !== "PreToolUse") return null;
+  const { expected, policy } = enforcementExpected(deps);
+  if (!expected) return null;
+  let cfg;
+  try {
+    cfg = deps.config ?? readConfig();
+  } catch {
+    cfg = {} as NonNullable<PreExecDeps["config"]>;
+  }
+  logError(new Error(`PreToolUse failing closed (${reason}): ${what}`));
+  return formatClaudePreToolUseDeny(failClosedOutcome(reason, what, policy, cfg).message!);
+}
+
+/**
+ * Cursor runs Claude Code hooks too ("third-party imports"). Those payloads
+ * carry cursor_version. When the native Cursor hooks are not installed, this
+ * is the only hook that sees the call, so it has to enforce.
+ */
+async function enforceCursorPayloadOnClaudePath(
+  eventArg: string | undefined,
+  input: ClaudeCodeHookInput,
+  deps: PreExecDeps,
+): Promise<string | null> {
+  const hookEventName = input.hook_event_name ?? eventArg;
+  if (hookEventName !== "PreToolUse") return null;
+  try {
+    const sessionId = cursorSessionId(input as never);
+    const ts = deps.now ? deps.now() : Date.now();
+    const req = { ...extractClaudePreExecRequest(input, sessionId, ts, null), tool: "cursor" as const };
+    const outcome = await enforcePreExec(req, deps);
+    return !outcome.permitted && outcome.message ? formatClaudePreToolUseDeny(outcome.message) : null;
+  } catch (err) {
+    logError(err);
+    return claudeFailClosedDeny("PreToolUse", INTERNAL_ERROR_REASON, "the policy check failed", deps);
+  }
+}
+
 export async function runHook(
   eventArg?: string,
   opts: RunHookOptions = {},
 ): Promise<void> {
-  // Hooks must never block or fail Claude Code on internal errors. Wrap everything.
+  // Hooks never block Claude Code on internal errors unless an enforcing org
+  // policy is in effect, in which case a PreToolUse hook fails closed.
   const hookStartMs = opts.hookStartMs ?? Date.now();
   const readInput = opts.readStdin ?? readStdin;
   const writeOutput = opts.writeStdout ?? ((s: string) => process.stdout.write(s));
+  let wrote = false;
+  const write = (line: string) => {
+    wrote = true;
+    writeOutput(line + "\n");
+  };
   try {
     const cfg = readConfig();
     const raw = await readInput();
-    if (!raw.trim()) return;
-    const input = JSON.parse(raw) as ClaudeCodeHookInput;
+    let parsed: unknown;
+    let parseError = false;
+    if (raw.trim()) {
+      try {
+        parsed = JSON.parse(raw);
+      } catch {
+        parseError = true;
+      }
+    }
+    if (!isPlainObject(parsed)) {
+      const what = parseError
+        ? "the hook input is not valid JSON"
+        : raw.trim()
+          ? "the hook input is not a JSON object"
+          : "the hook input is empty";
+      const deny = claudeFailClosedDeny(eventArg, MALFORMED_INPUT_REASON, what, { config: cfg });
+      if (deny) write(deny);
+      return;
+    }
+    const input = parsed as ClaudeCodeHookInput;
 
     // Cursor runs Claude Code hooks from ~/.claude/settings.json too
     // ("Third-party imports", on by default). Those payloads carry
-    // cursor_version. Record them as Cursor, or skip them when the native
-    // Cursor hooks are installed so nothing is captured twice.
+    // cursor_version. Enforce them here unless the native Cursor hooks are
+    // installed (they enforce), then record them as Cursor.
     if (isCursorPayload(input)) {
-      if (!isCapturePaused(cfg) && !nativeCursorHooksInstalled()) {
-        recordCursorHook(eventArg, input as never);
+      const native = nativeCursorHooksInstalled();
+      if (!native) {
+        const installedTimeoutS = getInstalledPreExecTimeoutS(cfg, "cursor");
+        const deny = await enforceCursorPayloadOnClaudePath(eventArg, input, {
+          config: cfg,
+          hookDeadlineMs: computeHookDeadlineMs(installedTimeoutS, hookStartMs),
+          installedTimeoutS,
+        });
+        if (deny) write(deny);
+      }
+      if (!isCapturePaused(cfg) && !native) {
+        try {
+          recordCursorHook(eventArg, input as never);
+        } catch (err) {
+          logError(err);
+        }
       }
       return;
     }
@@ -248,9 +356,13 @@ export async function runHook(
       installedTimeoutS,
     });
     if (result.stdout) {
-      writeOutput(result.stdout + "\n");
+      write(result.stdout);
     }
   } catch (err) {
     logError(err);
+    if (!wrote) {
+      const deny = claudeFailClosedDeny(eventArg, INTERNAL_ERROR_REASON, "the hook failed");
+      if (deny) write(deny);
+    }
   }
 }
