@@ -9,6 +9,9 @@ const statusCode = Number(process.argv[2] ?? "200");
 const home = process.argv[3] ?? mkdtempSync(join(tmpdir(), "agentreel-telemetry-cli-"));
 const outPath = process.argv[4];
 const keepState = process.argv[5] === "keep";
+const cliArgs = process.argv.slice(6);
+const argv = cliArgs.length > 0 ? cliArgs : ["--version"];
+const delayMs = Number(process.env.AGENTREEL_TEST_STUB_DELAY_MS ?? "0");
 
 if (!keepState) {
   rmSync(join(home, ".agentreel"), { recursive: true, force: true });
@@ -23,8 +26,15 @@ const server = createServer((req, res) => {
     if (raw) {
       requests.push(JSON.parse(raw));
     }
-    res.writeHead(statusCode, { "content-type": "application/json" });
-    res.end("{}");
+    const respond = () => {
+      res.writeHead(statusCode, { "content-type": "application/json" });
+      res.end("{}");
+    };
+    if (delayMs > 0) {
+      setTimeout(respond, delayMs);
+    } else {
+      respond();
+    }
   });
 });
 
@@ -49,7 +59,7 @@ childEnv.HOME = home;
 childEnv.NODE_ENV = "production";
 childEnv.AGENTREEL_TEST_TELEMETRY_ORIGIN = origin;
 
-const child = spawn(process.execPath, ["--import", redirectPreload, cliPath, "--version"], {
+const child = spawn(process.execPath, ["--import", redirectPreload, cliPath, ...argv], {
   env: childEnv,
   stdio: ["ignore", "pipe", "pipe"],
 });
@@ -59,9 +69,10 @@ const exit = await new Promise((resolve, reject) => {
   child.once("exit", (code, signal) => resolve({ code, signal }));
 });
 
-if (exit.signal || exit.code !== 0) {
+const expectZeroExit = argv.length === 1 && argv[0] === "--version";
+if (exit.signal || (expectZeroExit && exit.code !== 0)) {
   throw new Error(
-    `built CLI --version exited with code ${exit.code} signal ${exit.signal}`,
+    `built CLI ${argv.join(" ")} exited with code ${exit.code} signal ${exit.signal}`,
   );
 }
 
@@ -71,9 +82,9 @@ const telemetry = existsSync(telemetryPath)
   : null;
 
 if (outPath) {
-  writeFileSync(outPath, JSON.stringify({ requests, telemetry }) + "\n", "utf8");
+  writeFileSync(outPath, JSON.stringify({ requests, telemetry, exit }) + "\n", "utf8");
 } else {
-  process.stdout.write(JSON.stringify({ requests, telemetry }) + "\n");
+  process.stdout.write(JSON.stringify({ requests, telemetry, exit }) + "\n");
 }
 
 await new Promise((resolve, reject) => {
