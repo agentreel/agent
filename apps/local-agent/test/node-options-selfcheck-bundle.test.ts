@@ -139,12 +139,16 @@ function runHost(
   let r;
   if (process.platform === "win32") {
     if (isPowerShellHookCommand(command)) {
-      r = spawnSync(windowsPowerShell(), ["-NoProfile", "-ExecutionPolicy", "Bypass", "-Command", command], {
-        env,
-        input,
-        encoding: "utf8",
-        timeout: 15_000,
-      });
+      // powershell -Command does not bind $input or inherit stdin reliably
+      // (it hangs). Write the installed command to a script and run it with
+      // -File so stdin reaches $input | and the hook process.
+      const ps1 = join(home, "agentreel-hook-command.ps1");
+      writeFileSync(ps1, `\uFEFF${command}`, "utf8");
+      r = spawnSync(
+        windowsPowerShell(),
+        ["-NoProfile", "-NonInteractive", "-NoLogo", "-ExecutionPolicy", "Bypass", "-File", ps1],
+        { env, input, encoding: "utf8", timeout: 15_000 },
+      );
     } else {
       const bash = windowsGitBash();
       const gitRoot = dirname(dirname(bash));
