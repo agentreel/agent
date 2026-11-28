@@ -52,3 +52,18 @@ jobs:
 
       - name: Build
         run: pnpm build
+
+      # Pack the published package and audit only its production tree, matching
+      # what `npm i @agentreel/agent` installs. Fails the job on high or critical.
+      - name: Audit published production dependencies
+        run: |
+          set -euo pipefail
+          pack_dir="${RUNNER_TEMP}/agentreel-pack"
+          audit_dir="${RUNNER_TEMP}/agentreel-audit"
+          mkdir -p "$pack_dir" "$audit_dir"
+          pnpm --filter @agentreel/agent pack --pack-destination "$pack_dir"
+          tarball="$(ls "$pack_dir"/agentreel-agent-*.tgz)"
+          cd "$audit_dir"
+          npm init -y
+          npm install "$tarball"
+          npm audit --omit=dev --audit-level=high
