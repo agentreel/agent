@@ -7,6 +7,7 @@ import * as fs from "node:fs";
 import { randomBytes } from "node:crypto";
 import { dirname } from "node:path";
 import { cursorHooksPath } from "../paths.js";
+import { buildHookCommand, isScrubbedHookCommand } from "../hooks/hook-command.js";
 import {
   DEFAULT_HOOK_TIMEOUT_S,
   DEFAULT_PRE_EXEC_HOOK_TIMEOUT_S,
@@ -229,6 +230,11 @@ function writeUserHooksFile(path: string, content: string): UserHooksWrite {
     fs.fsyncSync(tmpFd);
     fs.closeSync(tmpFd);
     tmpFd = null;
+    // Windows refuses to replace a file that still has an open handle.
+    if (origFd !== null) {
+      fs.closeSync(origFd);
+      origFd = null;
+    }
     (_userHooksWriteForTests.rename ?? fs.renameSync)(tmpPath, path);
     tmpPath = null;
     return { ok: true, backup: b };
@@ -421,7 +427,8 @@ export type InstallCursorHooksResult =
     };
 
 /**
- * Add `<prefix> cursor-hook <event>` to ~/.cursor/hooks.json for every hook.
+ * Add a NODE_OPTIONS-scrubbed `<prefix> cursor-hook <event>` (POSIX env -u,
+ * Windows PowerShell form; see hooks/hook-command.ts) to ~/.cursor/hooks.json.
  * Pre-exec hooks receive the longer approval timeout (in seconds); other hooks
  * keep the default 5s timeout. Re-running replaces our previous entries idempotently.
  */
@@ -466,7 +473,7 @@ export function installCursorHooks(
   for (const ev of CURSOR_HOOK_EVENTS) {
     const kept = (file.hooks[ev] ?? []).filter((d) => !isOurs(d));
     kept.push({
-      command: `${prefix} ${CURSOR_HOOK_SUBCOMMAND} ${ev}`,
+      command: buildHookCommand(prefix, CURSOR_HOOK_SUBCOMMAND, ev),
       timeout: cursorHookTimeoutForEvent(ev, preExecTimeoutS),
       // Pre-exec hooks only: a crash, timeout or missing binary denies the
       // action instead of allowing it (Cursor defaults to fail-open).
@@ -553,5 +560,32 @@ export function inspectCursorPreExecHooks(
         failClosed: false,
       })),
     };
+  }
+}
+
+export interface CursorHookScrubCheck {
+  /** AgentReel hook entries found in the hooks file. */
+  entries: number;
+  /** Entries whose command does not drop NODE_OPTIONS first (installed before the scrub existed). */
+  unscrubbed: number;
+}
+
+/** Counts AgentReel-managed Cursor hook commands that do not scrub NODE_OPTIONS. */
+export function inspectCursorHookScrub(path: string = cursorHooksPath()): CursorHookScrubCheck {
+  if (!existsSync(path)) return { entries: 0, unscrubbed: 0 };
+  try {
+    const file = read(path);
+    let entries = 0;
+    let unscrubbed = 0;
+    for (const defs of Object.values(file.hooks ?? {})) {
+      for (const d of Array.isArray(defs) ? defs : []) {
+        if (!isOurs(d)) continue;
+        entries += 1;
+        if (!isScrubbedHookCommand(d.command)) unscrubbed += 1;
+      }
+    }
+    return { entries, unscrubbed };
+  } catch {
+    return { entries: 0, unscrubbed: 0 };
   }
 }

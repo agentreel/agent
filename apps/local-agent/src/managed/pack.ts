@@ -11,6 +11,7 @@
  *   Linux and WSL: /etc/cursor/hooks.json
  *   macOS:         /Library/Application Support/Cursor/hooks.json
  */
+import { buildHookCommand, buildHookInvocation, type HookPlatform } from "../hooks/hook-command.js";
 import { claudeHookTimeoutForEvent, CLAUDE_HOOK_MARKER } from "../hooks/install.js";
 import { cursorHookTimeoutForEvent } from "../cursor/hooks-install.js";
 import {
@@ -63,6 +64,7 @@ export const CLAUDE_SETTINGS_SCHEMA_URL = "https://json.schemastore.org/claude-c
 export interface ClaudeManagedHookEntry {
   type: "command";
   command: string;
+  shell?: "bash" | "powershell";
   timeout: number;
   onFailure?: "block";
 }
@@ -83,6 +85,15 @@ export interface BuildOptions {
   /** Absolute, root-owned path to the agentreel binary (quoted if it has spaces). */
   hookCommand: string;
   preExecTimeoutS?: number;
+  /**
+   * How to wrap hook commands to drop NODE_OPTIONS before Node starts.
+   * linux and darwin use `env -u NODE_OPTIONS -u npm_config_node_options`.
+   * win32 Claude uses that POSIX form with `shell: "bash"`; win32 Cursor
+   * uses the PowerShell form. Defaults to process.platform. `agentreel
+   * managed install` still supports only linux and darwin, and always
+   * passes that platform explicitly so the templates stay POSIX.
+   */
+  platform?: HookPlatform;
 }
 
 /** Hook groups for the managed Claude Code file. Pre-exec hooks block on failure. */
@@ -90,10 +101,12 @@ export function buildClaudeManagedHooks(opts: BuildOptions): Record<string, Clau
   const preExecTimeoutS = opts.preExecTimeoutS ?? DEFAULT_PRE_EXEC_HOOK_TIMEOUT_S;
   const hooks: Record<string, ClaudeManagedHookGroup[]> = {};
   for (const event of MANAGED_CLAUDE_HOOK_EVENTS) {
+    const invocation = buildHookInvocation(opts.hookCommand, "hook", event, opts.platform, "claude");
     const entry: ClaudeManagedHookEntry = {
       type: "command",
-      command: `${opts.hookCommand} hook ${event}`,
+      command: invocation.command,
       timeout: claudeHookTimeoutForEvent(event, preExecTimeoutS),
+      ...(invocation.shell ? { shell: invocation.shell } : {}),
     };
     // onFailure "block" (Claude Code v2.1.295+) turns a crash, timeout or
     // missing binary into a block instead of a silent allow.
@@ -109,7 +122,7 @@ export function buildCursorManagedHooks(opts: BuildOptions): Record<string, Curs
   const hooks: Record<string, CursorManagedHookDef[]> = {};
   for (const event of CURSOR_HOOK_EVENTS) {
     const def: CursorManagedHookDef = {
-      command: `${opts.hookCommand} ${CURSOR_HOOK_SUBCOMMAND} ${event}`,
+      command: buildHookCommand(opts.hookCommand, CURSOR_HOOK_SUBCOMMAND, event, opts.platform, "cursor"),
       timeout: cursorHookTimeoutForEvent(event, preExecTimeoutS),
     };
     if (isCursorPreExecHook(event)) def.failClosed = true;

@@ -392,6 +392,10 @@ describe("telemetry first-run delivery", () => {
 
 describe("telemetry opt-out never fetches", () => {
   const cliPath = join(dirname(fileURLToPath(import.meta.url)), "../dist/cli.js");
+  const launcher = join(
+    dirname(fileURLToPath(import.meta.url)),
+    "fixtures/run-cli-with-preload.mjs",
+  );
   const fetchSuccessPreload = join(
     dirname(fileURLToPath(import.meta.url)),
     "fixtures/telemetry-fetch-success.mjs",
@@ -416,9 +420,10 @@ describe("telemetry opt-out never fetches", () => {
       AGENTREEL_TELEMETRY: "0",
       AGENTREEL_TELEMETRY_FETCH_LOG: logPath,
     };
-    // Preload via argv --import. NODE_OPTIONS=--import is denied by the runtime self-check.
+    // The runtime self-check denies a preload from NODE_OPTIONS or execArgv, so
+    // the mock is imported by a launcher in the same process instead.
     delete env.NODE_OPTIONS;
-    const out = execFileSync("node", ["--import", fetchSuccessPreload, cliPath, "--version"], {
+    const out = execFileSync("node", [launcher, fetchSuccessPreload, cliPath, "--version"], {
       env,
       encoding: "utf8",
       stdio: ["pipe", "pipe", "pipe"],
@@ -444,7 +449,7 @@ describe("telemetry opt-out never fetches", () => {
       AGENTREEL_TELEMETRY_FETCH_LOG: logPath,
     };
     delete env.NODE_OPTIONS;
-    execFileSync("node", ["--import", fetchSuccessPreload, cliPath, "--version"], {
+    execFileSync("node", [launcher, fetchSuccessPreload, cliPath, "--version"], {
       env,
       encoding: "utf8",
       stdio: ["pipe", "pipe", "pipe"],
@@ -546,6 +551,10 @@ describe("telemetry CLI integration", () => {
 
 describe("telemetry CLI exit code", () => {
   const cliPath = join(dirname(fileURLToPath(import.meta.url)), "../dist/cli.js");
+  const launcher = join(
+    dirname(fileURLToPath(import.meta.url)),
+    "fixtures/run-cli-with-preload.mjs",
+  );
   const fetchMockPreload = join(
     dirname(fileURLToPath(import.meta.url)),
     "fixtures/telemetry-fetch-mock.mjs",
@@ -564,7 +573,7 @@ describe("telemetry CLI exit code", () => {
         VITEST_WORKER_ID: "",
       };
       delete env.NODE_OPTIONS;
-      execFileSync("node", ["--import", fetchMockPreload, cliPath, "--version"], {
+      execFileSync("node", [launcher, fetchMockPreload, cliPath, "--version"], {
         env,
         encoding: "utf8",
         stdio: ["pipe", "pipe", "pipe"],

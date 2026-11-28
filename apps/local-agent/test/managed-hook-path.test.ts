@@ -14,6 +14,7 @@ import {
   type RealpathFn,
   type StatPath,
 } from "../src/managed/hook-path.js";
+import { buildHookCommand } from "../src/hooks/hook-command.js";
 import { defaultHookCommand, managedInstallCommand } from "../src/commands/managed.js";
 
 const BIN = "/usr/local/bin/agentreel";
@@ -170,6 +171,15 @@ describe("inspectHookCommandPath", () => {
     expect(result.missing).toBe(true);
     expect(result.issues[0]!.reason).toContain("not an absolute path");
     expect(hookCommandBinaryPath('"/usr/local/bin/agent reel" hook')).toBe("/usr/local/bin/agent reel");
+    expect(hookCommandBinaryPath(buildHookCommand("/usr/local/bin/agentreel", "hook", "PreToolUse", "linux"))).toBe(
+      "/usr/local/bin/agentreel",
+    );
+    expect(hookCommandBinaryPath(buildHookCommand("/usr/local/bin/agentreel", "hook", "PreToolUse", "win32"))).toBe(
+      "/usr/local/bin/agentreel",
+    );
+    expect(
+      hookCommandBinaryPath(buildHookCommand("/usr/local/bin/agentreel", "cursor-hook", "beforeShellExecution", "win32")),
+    ).toBe("/usr/local/bin/agentreel");
   });
 });
 

@@ -1,4 +1,5 @@
 import { afterAll, beforeAll, describe, expect, it } from "vitest";
+import { buildHookCommand } from "../src/hooks/hook-command.js";
 import { execFileSync } from "node:child_process";
 import { mkdirSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
@@ -158,6 +159,10 @@ describe("recordCursorHook (fixture session into SQLite)", () => {
   });
 });
 
+// Installed commands start by dropping NODE_OPTIONS (hooks/hook-command.ts).
+const scrubbed = (sub: string, ev: string): string =>
+  buildHookCommand("/usr/local/bin/agentreel", sub, ev);
+
 describe("hooks.json install", () => {
   it("adds our hooks, keeps others, is idempotent and uninstalls cleanly", () => {
     const dir = join(home, "cur");
@@ -174,17 +179,17 @@ describe("hooks.json install", () => {
     expect(Object.keys(f.hooks).sort()).toEqual([...norm.CURSOR_HOOK_EVENTS].sort());
     expect(f.hooks.afterFileEdit).toEqual([
       { command: "./hooks/format.sh" },
-      { command: "/usr/local/bin/agentreel cursor-hook afterFileEdit", timeout: 5 },
+      { command: scrubbed("cursor-hook", "afterFileEdit"), timeout: 5 },
     ]);
     expect(f.hooks.postToolUse).toHaveLength(1);
     // pre-exec hooks get the long approval timeout (130s); other hooks keep 5s
     for (const k of ["preToolUse", "beforeShellExecution", "beforeMCPExecution", "beforeReadFile"]) {
       expect(f.hooks[k]).toEqual([
-        { command: `/usr/local/bin/agentreel cursor-hook ${k}`, timeout: 130, failClosed: true },
+        { command: scrubbed("cursor-hook", k), timeout: 130, failClosed: true },
       ]);
     }
     expect(f.hooks.beforeSubmitPrompt).toEqual([
-      { command: "/usr/local/bin/agentreel cursor-hook beforeSubmitPrompt", timeout: 5 },
+      { command: scrubbed("cursor-hook", "beforeSubmitPrompt"), timeout: 5 },
     ]);
     expect(runner.nativeCursorHooksInstalled(path)).toBe(true);
     const { removed } = install.uninstallCursorHooks(path);

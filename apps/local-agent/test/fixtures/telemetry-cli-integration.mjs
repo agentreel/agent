@@ -3,7 +3,7 @@ import { createServer } from "node:http";
 import { existsSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { dirname, join } from "node:path";
-import { fileURLToPath, pathToFileURL } from "node:url";
+import { fileURLToPath } from "node:url";
 
 const statusCode = Number(process.argv[2] ?? "200");
 const home = process.argv[3] ?? mkdtempSync(join(tmpdir(), "agentreel-telemetry-cli-"));
@@ -46,7 +46,8 @@ const address = server.address();
 const origin = `http://127.0.0.1:${address.port}`;
 const fixtureDir = dirname(fileURLToPath(import.meta.url));
 const cliPath = join(fixtureDir, "../../dist/cli.js");
-const redirectPreload = pathToFileURL(join(fixtureDir, "telemetry-cli-redirect.mjs")).href;
+const redirectPreload = join(fixtureDir, "telemetry-cli-redirect.mjs");
+const launcher = join(fixtureDir, "run-cli-with-preload.mjs");
 
 const childEnv = { ...process.env };
 delete childEnv.AGENTREEL_TELEMETRY;
@@ -59,7 +60,7 @@ childEnv.HOME = home;
 childEnv.NODE_ENV = "production";
 childEnv.AGENTREEL_TEST_TELEMETRY_ORIGIN = origin;
 
-const child = spawn(process.execPath, ["--import", redirectPreload, cliPath, ...argv], {
+const child = spawn(process.execPath, [launcher, redirectPreload, cliPath, ...argv], {
   env: childEnv,
   stdio: ["ignore", "pipe", "pipe"],
 });
