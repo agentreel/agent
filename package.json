@@ -2,7 +2,7 @@
   "name": "agentreel-agent-monorepo",
   "version": "0.0.0",
   "private": true,
-  "description": "AgentReel local agent — captures Claude Code and Cursor sessions on your machine.",
+  "description": "AgentReel local agent that captures coding-agent sessions on your machine.",
   "scripts": {
     "build": "pnpm -r build",
     "agent": "pnpm --filter @agentreel/agent",
