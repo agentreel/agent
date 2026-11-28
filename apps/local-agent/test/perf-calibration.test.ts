@@ -1,5 +1,6 @@
 import { describe, expect, it } from "vitest";
 import {
+  calibratedFactor,
   describeBound,
   MAX_ENV_MULTIPLIER,
   MAX_FACTOR,
@@ -7,6 +8,7 @@ import {
   parseEnvMultiplier,
   perfFactor,
   PERF_MULTIPLIER_ENV,
+  REFERENCE_BASELINE_MS,
   scaledBound,
 } from "./perf-calibration.js";
 
@@ -17,6 +19,41 @@ describe("perf calibration helper", () => {
     expect(pf.baselineMs).toBeGreaterThan(0);
     expect(pf.factor).toBeGreaterThanOrEqual(MIN_FACTOR);
     expect(pf.factor).toBeLessThanOrEqual(MAX_FACTOR);
+  });
+
+  it("clamps a very slow baseline (100x the reference) to a factor of exactly 4", () => {
+    const baselineMs = REFERENCE_BASELINE_MS * 100;
+    expect(calibratedFactor(baselineMs)).toBe(4);
+    expect(perfFactor({}, baselineMs)).toEqual({
+      factor: 4,
+      source: "calibrated",
+      baselineMs,
+    });
+  });
+
+  it("clamps a very fast baseline to a factor of exactly 1", () => {
+    const baselineMs = REFERENCE_BASELINE_MS / 100;
+    expect(calibratedFactor(baselineMs)).toBe(1);
+    expect(perfFactor({}, baselineMs)).toEqual({
+      factor: 1,
+      source: "calibrated",
+      baselineMs,
+    });
+  });
+
+  it("clamps AGENTREEL_PERF_MULTIPLIER=1000 to exactly 10 and 0.5 to exactly 1", () => {
+    expect(parseEnvMultiplier("1000")).toBe(10);
+    expect(perfFactor({ [PERF_MULTIPLIER_ENV]: "1000" })).toEqual({
+      factor: 10,
+      source: "env",
+      baselineMs: null,
+    });
+    expect(parseEnvMultiplier("0.5")).toBe(1);
+    expect(perfFactor({ [PERF_MULTIPLIER_ENV]: "0.5" })).toEqual({
+      factor: 1,
+      source: "env",
+      baselineMs: null,
+    });
   });
 
   it("uses a valid AGENTREEL_PERF_MULTIPLIER, clamped to [1, 10]", () => {

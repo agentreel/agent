@@ -81,15 +81,23 @@ export function parseEnvMultiplier(raw: string | undefined): number | null {
   return clamp(n, MIN_FACTOR, MAX_ENV_MULTIPLIER);
 }
 
+/** Calibrated factor from a measured (or injected) baseline, clamped to [1, 4]. */
+export function calibratedFactor(baselineMs: number): number {
+  return clamp(baselineMs / REFERENCE_BASELINE_MS, MIN_FACTOR, MAX_FACTOR);
+}
+
 /** Runner-speed factor: the env override if set, otherwise measured now and clamped to [1, 4]. */
-export function perfFactor(env: NodeJS.ProcessEnv = process.env): PerfFactor {
+export function perfFactor(
+  env: NodeJS.ProcessEnv = process.env,
+  baselineMs?: number,
+): PerfFactor {
   const fromEnv = parseEnvMultiplier(env[PERF_MULTIPLIER_ENV]);
   if (fromEnv !== null) return { factor: fromEnv, source: "env", baselineMs: null };
-  const baselineMs = measureBaselineMs();
+  const measured = baselineMs ?? measureBaselineMs();
   return {
-    factor: clamp(baselineMs / REFERENCE_BASELINE_MS, MIN_FACTOR, MAX_FACTOR),
+    factor: calibratedFactor(measured),
     source: "calibrated",
-    baselineMs,
+    baselineMs: measured,
   };
 }
 
