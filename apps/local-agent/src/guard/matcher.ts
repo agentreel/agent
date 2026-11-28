@@ -2,6 +2,7 @@ import type { Rule, MatchContext, Finding } from "./types.js";
 import type { GuardConfig } from "./types.js";
 import { scrubString, scrubAny } from "../redact/scrubber.js";
 import { runWithTimeout } from "../policy/regex.js";
+import { commandVariants } from "./shell-normalize.js";
 
 export function matchRule(rule: Rule, context: MatchContext): Finding | null {
   if (!rule.enabled) return null;
@@ -71,6 +72,35 @@ export function matchRule(rule: Rule, context: MatchContext): Finding | null {
   } catch (err) {
     return null;
   }
+}
+
+/**
+ * matchRule, then the same rule on each normalized or synthetic variant of
+ * the command (see shell-normalize.ts), so quoting, indirection, encodings
+ * and equivalent tools do not evade command rules. The finding always
+ * reports the original command. Sequence and content rules (file paths,
+ * transcripts) are matched once, as before. matchRule itself is unchanged,
+ * which keeps the linear-matcher equivalence checks meaningful.
+ */
+export function matchRuleNormalized(rule: Rule, context: MatchContext): Finding | null {
+  const direct = matchRule(rule, context);
+  if (direct || !rule.enabled) return direct;
+  const type = rule.matcher.type;
+  if (type !== "command" && type !== "db-operation") return null;
+  const cmd = context.command;
+  if (!cmd) return null;
+  for (const variant of commandVariants(cmd)) {
+    const hit = matchRule(rule, { ...context, command: variant });
+    if (hit) {
+      const scrubbed = scrubString(cmd);
+      return {
+        ...hit,
+        evidence: scrubbed.slice(0, 500),
+        context: { ...hit.context, command: scrubbed },
+      };
+    }
+  }
+  return null;
 }
 
 function extractEvidence(context: MatchContext): string {

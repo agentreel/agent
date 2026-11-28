@@ -185,13 +185,18 @@ export function maybePrintTelemetryNotice(
 export async function flushCliTelemetry(capMs: number = TELEMETRY_EXIT_AWAIT_MS): Promise<void> {
   const current = inFlightTelemetry;
   if (!current) return;
+  let timer: ReturnType<typeof setTimeout> | undefined;
   try {
     await Promise.race([
       current,
-      new Promise<void>((resolve) => setTimeout(resolve, capMs)),
+      new Promise<void>((resolve) => {
+        timer = setTimeout(resolve, capMs);
+      }),
     ]);
   } catch {
     // telemetry must never affect the CLI
+  } finally {
+    if (timer !== undefined) clearTimeout(timer);
   }
 }
 
